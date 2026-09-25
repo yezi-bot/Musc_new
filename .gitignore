@@ -1,0 +1,12 @@
+datasets/
+data/
+__pycache__/
+*.py[cod]
+musc/
+venv/
+.env/
+output/
+*.kmodel
+*.mud
+*.pth
+*.pt
