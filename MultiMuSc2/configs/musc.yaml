@@ -12,6 +12,7 @@ models:
   feature_layers: [5, 11, 17, 23]
   r_list: [1, 3, 5]
   r_list2: [1, 3, 5]
+  use_dynamic_model: True
 device: 0
 testing:
   output_dir: 'output'

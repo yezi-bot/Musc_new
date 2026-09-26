@@ -1,3 +1,4 @@
+from sympy import print_gtk
 import os
 import sys
 import numpy as np
@@ -19,6 +20,8 @@ import models.backbone._backbones as _backbones
 from models.modules._LNAMD import LNAMD
 from models.modules._MSM import MSM,MSM2
 from models.modules._RsCIN import RsCIN
+from models.modules._CHANNEL import Channel, ChannelMemory
+# from models.modules._CHANNEL import _CHANNEL
 from utils.metrics import compute_metrics
 from openpyxl import Workbook
 from tqdm import tqdm
@@ -58,6 +61,7 @@ class MuSc():
         self.model_name2 = cfg['models']['backbone_name2']
         self.image_size = cfg['datasets']['img_resize']
         self.batch_size = cfg['models']['batch_size']
+        self.use_dynamic_model = cfg['models']['use_dynamic_model']
         self.pretrained = cfg['models']['pretrained']
         self.features_list = [l+1 for l in cfg['models']['feature_layers']]
         self.divide_num = cfg['datasets']['divide_num']
@@ -182,6 +186,7 @@ class MuSc():
 
 
     def make_category_data(self, category):
+        
         print(category)
         torch.cuda.reset_max_memory_allocated()
         # divide sub-datasets
@@ -362,20 +367,32 @@ class MuSc():
                 print('LNAMD1-{}: {}ms per image'.format(r, (end_time-start_time)*1000/subset_num))
 
 
-
                 # MSM
                 anomaly_maps_l = torch.tensor([]).double()
                 start_time = time.time()
+                channel_memory = ChannelMemory(max_ttl=5)
                 for l in Z_layers2.keys():
                     # different layers
                     #当前特征层的局部特征
                     Z1 = torch.cat(Z_layers1[l], dim=0).to(self.device) # (N, L, C)
-                    
+                    if int(l)==3 and self.use_dynamic_model:
+                        for image_id in range(Z1.shape[0]):
+                            current_features = Z1[image_id]
+                            if image_id == 0 :
+                               channel_memory.initialize(features=current_features, image_id=image_id)
+                               print("initial channel",len(channel_memory.channels))
+                            else:
+                                channel_memory.update(features=current_features, image_id=image_id)
+                                print("update channel",len(channel_memory.channels))
+
+                         
+
                     #从 Z1 中取出“可信正常图片”的 DINO 局部特征
                     Z11 = Z1[lowest_indices]
 
                     Z2 = torch.cat(Z_layers2[l], dim=0).to(self.device)  # (N, L, C)
                     Z22 = Z2[lowest_indices]
+            
 
                     train_samples = []
                     image_num, patch_num, c = Z11.shape
