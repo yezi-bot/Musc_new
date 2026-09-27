@@ -2,6 +2,7 @@ from sympy import print_gtk
 import os
 import sys
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from sklearn import linear_model
@@ -62,6 +63,7 @@ class MuSc():
         self.image_size = cfg['datasets']['img_resize']
         self.batch_size = cfg['models']['batch_size']
         self.use_dynamic_model = cfg['models']['use_dynamic_model']
+        self.debug_channel_analysis=cfg['models']['debug_channel_analysis']
         self.pretrained = cfg['models']['pretrained']
         self.features_list = [l+1 for l in cfg['models']['feature_layers']]
         self.divide_num = cfg['datasets']['divide_num']
@@ -369,6 +371,7 @@ class MuSc():
 
                 # MSM
                 anomaly_maps_l = torch.tensor([]).double()
+                contamination_history = []
                 start_time = time.time()
                 channel_memory = ChannelMemory(max_ttl=5)
                 for l in Z_layers2.keys():
@@ -382,10 +385,55 @@ class MuSc():
                                channel_memory.initialize(features=current_features, image_id=image_id)
                                print("initial channel",len(channel_memory.channels))
                             else:
-                                channel_memory.update(features=current_features, image_id=image_id)
-                                print("update channel",len(channel_memory.channels))
+                                density_score=channel_memory.compute_knn_density( k=5, span_threshold=3)
+                               
+                            
+                            # 统计成熟的channel
+                            channel_memory.update(features=current_features, image_id=image_id)
+                            mature_channels,mature_density = channel_memory.compute_knn_density(k=5, span_threshold=3)
+                            print("update channel",len(channel_memory.channels))
+                           
 
-                         
+                            normal_patch_seeded = 0
+                            anomaly_patch_seeded = 0
+                            if self.debug_channel_analysis :
+                             for channel in mature_channels:
+                                 seed_image_id = channel.image_id[0]
+                                 seed_patch_id = channel.patch_id[0]
+                                 # 计算anomoly_seed是否真的来自异常区域，GTmask
+                                 row = seed_patch_id // 37
+                                 col = seed_patch_id % 37
+                                 mask = img_masks[seed_image_id].squeeze().float()
+                                 mask_37 = torch.nn.functional.interpolate(
+                                  mask.unsqueeze(0).unsqueeze(0),
+                                        size=(37, 37),
+                                        mode="nearest" ).squeeze()
+                                 if mask_37[row, col] > 0:
+                                   anomaly_patch_seeded += 1
+                                 else:
+                                   normal_patch_seeded += 1  
+                             contamination_ratio = (
+                              anomaly_patch_seeded / len(mature_channels)
+                              if len(mature_channels) > 0
+                              else 0.0)  
+                             contamination_history.append(contamination_ratio)     
+                             print("========== Mature Channel Statistics ==========")
+                             print("total mature channels:", len(mature_channels))
+                             print("normal-seeded channels:", normal_patch_seeded)
+                             print("anomaly-seeded channels:", anomaly_patch_seeded)
+                             print("contamination ratio:", contamination_ratio)
+                             if self.debug_channel_analysis:
+                                plt.figure()
+                                plt.plot(
+                                    range(len(contamination_history)),
+                                    contamination_history )
+                                plt.xlabel("Image index")
+                                plt.ylabel("Mature channel contamination ratio")
+                                plt.title(f"{category} - Channel contamination")
+                                save_path = os.path.join(self.output_dir,
+                                 f"{category}_r{r}_channel_contamination.png")
+                                plt.savefig(save_path, dpi=300, bbox_inches="tight")
+                                plt.close()
 
                     #从 Z1 中取出“可信正常图片”的 DINO 局部特征
                     Z11 = Z1[lowest_indices]
@@ -414,6 +462,7 @@ class MuSc():
                     anomaly_maps_msm = MSM2(Z=Z1,Z11=Z11,Z2=Z2,Z22=Z22,detect_fuser=self.detect_fuser, device=self.device, topmin_min=0.02, topmin_max=0.3)
                     anomaly_maps_l = torch.cat((anomaly_maps_l, anomaly_maps_msm.unsqueeze(0).cpu()), dim=0)
                     torch.cuda.empty_cache()
+                
                 anomaly_maps_l = torch.mean(anomaly_maps_l, 0)
                 anomaly_maps_r = torch.cat((anomaly_maps_r, anomaly_maps_l.unsqueeze(0)), dim=0)
                 end_time = time.time()
