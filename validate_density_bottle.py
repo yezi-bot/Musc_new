@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import math
+import random
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -917,6 +918,175 @@ def run_stage12_image_support(
     return summary
 
 
+def compute_dino_msm_image_scores(features, device, reference_chunk_size=8):
+    """Reproduce the original DINO MSM score and reduce each patch map by max."""
+    stacked = torch.stack(features).float().to(device)
+    image_count, patch_count, _ = stacked.shape
+    scores = []
+    for image_id in range(image_count):
+        reference_ids = [index for index in range(image_count) if index != image_id]
+        patch_to_image = []
+        current = stacked[image_id]
+        for start in range(0, len(reference_ids), reference_chunk_size):
+            chunk_ids = reference_ids[start : start + reference_chunk_size]
+            reference = stacked[chunk_ids].reshape(-1, stacked.shape[-1])
+            distances = torch.cdist(current, reference)
+            distances = distances.reshape(patch_count, len(chunk_ids), patch_count).amin(dim=2)
+            patch_to_image.append(distances)
+        patch_to_image = torch.cat(patch_to_image, dim=1)
+        k_max = max(1, int(patch_to_image.shape[1] * 0.3))
+        patch_scores = torch.topk(
+            patch_to_image, k=k_max, dim=1, largest=False, sorted=False
+        ).values.mean(dim=1)
+        scores.append(float(patch_scores.max().cpu()))
+    del stacked
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return scores
+
+
+def run_stage13_online_support(
+    features,
+    samples,
+    device,
+    output_dir,
+    ttl=5,
+    density_k=5,
+    alpha=0.5,
+    threshold_quantile=0.7,
+    stream_seeds=(0, 1, 2),
+    msm_chunk_size=8,
+):
+    """Compute leak-free online Channel support over shuffled image streams."""
+    grid_size = int(math.sqrt(features[0].shape[0]))
+    ms_scores = compute_dino_msm_image_scores(
+        features, device=device, reference_chunk_size=msm_chunk_size
+    )
+    records = []
+    for stream_seed in stream_seeds:
+        order = list(range(len(samples)))
+        random.Random(stream_seed).shuffle(order)
+        memories = {
+            "global": ChannelMemory(
+                max_ttl=ttl, density_k=density_k, device=device, position_radius=None
+            ),
+            "local": ChannelMemory(
+                max_ttl=ttl, density_k=density_k, device=device, position_radius=1
+            ),
+        }
+        distance_history = {"global": [], "local": []}
+        for stream_step, image_id in enumerate(order):
+            current = features[image_id]
+            for method, memory in memories.items():
+                mature = memory.weighted_mature_channels()
+                threshold = None
+                support = None
+                current_distances = None
+                if mature:
+                    seeds = torch.stack([channel.seed for channel in mature]).to(device)
+                    current_distances = torch.cdist(
+                        current.float().to(device), seeds.float()
+                    ).amin(dim=1).cpu()
+                    if distance_history[method]:
+                        threshold = float(
+                            np.quantile(distance_history[method], threshold_quantile)
+                        )
+                        support = float((current_distances <= threshold).float().mean())
+                records.append(
+                    {
+                        "stream_seed": stream_seed,
+                        "stream_step": stream_step,
+                        "image_id": image_id,
+                        "image_type": samples[image_id]["kind"],
+                        "method": method,
+                        "reliable_mature_channels": len(mature),
+                        "online_threshold": threshold,
+                        "channel_support": support,
+                        "ms_score": ms_scores[image_id],
+                        "ms_score_source": "DINO MSM top-30%-minimum patch distance, image max",
+                    }
+                )
+                if current_distances is not None:
+                    distance_history[method].extend(current_distances.tolist())
+                _, patch_weights = memory.patch_reliability(
+                    current, grid_size, reliability_mode="rank"
+                )
+                soft_weights = alpha + (1.0 - alpha) * patch_weights
+                memory.update(
+                    current,
+                    image_id,
+                    patch_densities=None,
+                    patch_reliabilities=soft_weights,
+                )
+
+    def stats(values):
+        values = np.asarray(values, dtype=np.float64)
+        if not values.size:
+            return {"count": 0, "mean": None, "median": None, "q25": None, "q75": None}
+        return {
+            "count": int(values.size),
+            "mean": float(values.mean()),
+            "median": float(np.median(values)),
+            "q25": float(np.quantile(values, 0.25)),
+            "q75": float(np.quantile(values, 0.75)),
+        }
+
+    summary = {
+        "stage": 13,
+        "stream_seeds": list(stream_seeds),
+        "threshold": {
+            "quantile": threshold_quantile,
+            "source": "strictly prior finite NN distances within each stream and method",
+        },
+        "ms_score": {
+            "available": True,
+            "source": "original DINO MSM formula with topmin_min=0 and topmin_max=0.3",
+            "image_reduction": "maximum patch score",
+        },
+        "methods": {},
+    }
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True, sharey=True)
+    bins = np.linspace(0.0, 1.0, 21)
+    for axis, method in zip(axes, ("global", "local")):
+        available = [
+            row for row in records if row["method"] == method and row["channel_support"] is not None
+        ]
+        normal = [row["channel_support"] for row in available if row["image_type"] == "good"]
+        anomaly = [row["channel_support"] for row in available if row["image_type"] != "good"]
+        pairwise = [
+            float(normal_value > anomaly_value) + 0.5 * float(normal_value == anomaly_value)
+            for normal_value in normal
+            for anomaly_value in anomaly
+        ]
+        summary["methods"][method] = {
+            "available_records": len(available),
+            "unavailable_warmup_records": len(stream_seeds) * len(samples) - len(available),
+            "normal": stats(normal),
+            "anomaly": stats(anomaly),
+            "normal_minus_anomaly_mean": (
+                float(np.mean(normal) - np.mean(anomaly)) if normal and anomaly else None
+            ),
+            "support_separation_auc": float(np.mean(pairwise)) if pairwise else None,
+        }
+        if normal:
+            axis.hist(normal, bins=bins, alpha=0.65, density=True, label="normal")
+        if anomaly:
+            axis.hist(anomaly, bins=bins, alpha=0.65, density=True, label="anomaly")
+        axis.set_title(f"{method.title()} online support")
+        axis.set_xlabel("image-level Channel support")
+        if normal or anomaly:
+            axis.legend()
+    axes[0].set_ylabel("density")
+    fig.tight_layout()
+    fig.savefig(output_dir / "stage13_online_support_distributions.png", dpi=200)
+    plt.close(fig)
+    write_csv(output_dir / "stage13_online_image_support.csv", records)
+    (output_dir / "stage13_online_image_support_summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return summary
+
+
 def run_weighted_span(features, samples, device, ttl=5, density_k=5):
     """Scheme B: local position matching plus soft patch reliability."""
     grid_size = int(math.sqrt(features[0].shape[0]))
@@ -1096,6 +1266,8 @@ def main():
     parser.add_argument("--ablation-summary", type=str, default=None)
     parser.add_argument("--coverage-by-image", type=str, default=None)
     parser.add_argument("--image-records", type=str, default=None)
+    parser.add_argument("--stream-seeds", type=str, default="0,1,2")
+    parser.add_argument("--msm-chunk-size", type=int, default=8)
     parser.add_argument("--scheme-b-only", action="store_true")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--stage", type=int, default=0)
@@ -1569,6 +1741,21 @@ def main():
             args.image_records,
             output_dir,
             quantile=0.7,
+        )
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return
+
+    if args.stage == 13:
+        stream_seeds = tuple(int(value) for value in args.stream_seeds.split(","))
+        summary = run_stage13_online_support(
+            features,
+            samples,
+            device,
+            output_dir,
+            ttl=args.ttl,
+            threshold_quantile=0.7,
+            stream_seeds=stream_seeds,
+            msm_chunk_size=args.msm_chunk_size,
         )
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return
