@@ -571,6 +571,105 @@ def run_stage7_semantic_audit(
     return rows, channel_records
 
 
+def run_stage9_nn_distance_audit(
+    features, samples, device, ttl=5, density_k=5, alpha=0.5
+):
+    """Compare global/local reliable mature Channel coverage by NN distance."""
+    memories = {
+        "global": ChannelMemory(
+            max_ttl=ttl, density_k=density_k, device=device, position_radius=None
+        ),
+        "local": ChannelMemory(
+            max_ttl=ttl, density_k=density_k, device=device, position_radius=1
+        ),
+    }
+    image_rows = []
+    patch_records = []
+    grid_size = int(math.sqrt(features[0].shape[0]))
+
+    def nearest_distances(memory, current):
+        mature = memory.weighted_mature_channels()
+        if not mature:
+            return torch.full((current.shape[0],), float("nan"))
+        seeds = torch.stack([channel.seed for channel in mature]).to(device)
+        return torch.cdist(current.float().to(device), seeds.float()).min(dim=1).values.cpu()
+
+    def finite_mean(values):
+        values = np.asarray(values, dtype=np.float64)
+        values = values[np.isfinite(values)]
+        return float(values.mean()) if values.size else None
+
+    def finite_median(values):
+        values = np.asarray(values, dtype=np.float64)
+        values = values[np.isfinite(values)]
+        return float(np.median(values)) if values.size else None
+
+    for image_id, current in enumerate(features):
+        distances = {
+            name: nearest_distances(memory, current) for name, memory in memories.items()
+        }
+        normal_global = []
+        normal_local = []
+        anomaly_global = []
+        anomaly_local = []
+        for patch_id in range(current.shape[0]):
+            anomaly = patch_is_anomalous(samples, image_id, patch_id, grid_size)
+            global_distance = float(distances["global"][patch_id])
+            local_distance = float(distances["local"][patch_id])
+            if anomaly:
+                anomaly_global.append(global_distance)
+                anomaly_local.append(local_distance)
+            else:
+                normal_global.append(global_distance)
+                normal_local.append(local_distance)
+            patch_records.append(
+                {
+                    "image_id": image_id,
+                    "patch_id": patch_id,
+                    "row": patch_id // grid_size,
+                    "col": patch_id % grid_size,
+                    "is_anomaly": int(anomaly),
+                    "nearest_global_distance": global_distance,
+                    "nearest_local_distance": local_distance,
+                }
+            )
+
+        for name, memory in memories.items():
+            _, patch_weights = memory.patch_reliability(current, grid_size, reliability_mode="rank")
+            soft_weights = alpha + (1.0 - alpha) * patch_weights
+            memory.update(
+                current,
+                image_id,
+                patch_densities=None,
+                patch_reliabilities=soft_weights,
+            )
+
+        global_mature = memories["global"].weighted_mature_channels()
+        local_mature = memories["local"].weighted_mature_channels()
+        image_rows.append(
+            {
+                "image_id": image_id,
+                "image_path": str(samples[image_id]["path"]),
+                "image_type": samples[image_id]["kind"],
+                "global_reliable_mature_channels": len(global_mature),
+                "local_reliable_mature_channels": len(local_mature),
+                "global_mean_nn_distance": finite_mean(distances["global"]),
+                "global_median_nn_distance": finite_median(distances["global"]),
+                "local_mean_nn_distance": finite_mean(distances["local"]),
+                "local_median_nn_distance": finite_median(distances["local"]),
+                "normal_global_mean": finite_mean(normal_global),
+                "normal_local_mean": finite_mean(normal_local),
+                "normal_global_median": finite_median(normal_global),
+                "normal_local_median": finite_median(normal_local),
+                "anomaly_global_mean": finite_mean(anomaly_global),
+                "anomaly_local_mean": finite_mean(anomaly_local),
+                "anomaly_global_median": finite_median(anomaly_global),
+                "anomaly_local_median": finite_median(anomaly_local),
+            }
+        )
+    return image_rows, patch_records
+
+
 def run_weighted_span(features, samples, device, ttl=5, density_k=5):
     """Scheme B: local position matching plus soft patch reliability."""
     grid_size = int(math.sqrt(features[0].shape[0]))
@@ -1106,6 +1205,67 @@ def main():
             },
         }
         (output_dir / "stage8_channel_ablations_summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return
+
+    if args.stage == 9:
+        image_rows, patch_records = run_stage9_nn_distance_audit(
+            features, samples, device, ttl=args.ttl, alpha=0.5
+        )
+        write_csv(output_dir / "stage9_nn_distance_by_image.csv", image_rows)
+        write_csv(output_dir / "stage9_nn_distance_by_patch.csv", patch_records)
+
+        def values(key, rows):
+            result = [row[key] for row in rows if row[key] is not None]
+            return np.asarray(result, dtype=np.float64)
+
+        summary = {
+            "stage": 9,
+            "sample_count": len(samples),
+            "matching": {
+                "global": "global matching",
+                "local": "3x3 position matching",
+            },
+            "reliability": "rank",
+            "alpha": 0.5,
+            "maturity": "effective_span>=3",
+            "coverage_threshold": None,
+            "distance_summary": {},
+        }
+        for name in ("global", "local"):
+            mean_values = values(f"{name}_mean_nn_distance", image_rows)
+            median_values = values(f"{name}_median_nn_distance", image_rows)
+            normal_values = values(f"normal_{name}_mean", image_rows)
+            anomaly_values = values(f"anomaly_{name}_mean", image_rows)
+            summary["distance_summary"][name] = {
+                "mean_image_nn_distance": float(mean_values.mean()) if mean_values.size else None,
+                "median_image_nn_distance": float(np.median(median_values)) if median_values.size else None,
+                "normal_patch_mean_distance": float(normal_values.mean()) if normal_values.size else None,
+                "anomaly_patch_mean_distance": float(anomaly_values.mean()) if anomaly_values.size else None,
+                "mean_reliable_mature_channels": float(
+                    np.mean([row[f"{name}_reliable_mature_channels"] for row in image_rows])
+                ),
+            }
+        normal_global = values("normal_global_mean", image_rows)
+        normal_local = values("normal_local_mean", image_rows)
+        anomaly_global = values("anomaly_global_mean", image_rows)
+        anomaly_local = values("anomaly_local_mean", image_rows)
+
+        def safe_difference(left, right):
+            return float(left.mean() - right.mean()) if left.size and right.size else None
+
+        def safe_lower_fraction(left, right):
+            return float(np.mean(left < right)) if left.size and right.size else None
+
+        summary["comparison"] = {
+            "normal_local_minus_global_mean_distance": safe_difference(normal_local, normal_global),
+            "anomaly_local_minus_global_mean_distance": safe_difference(anomaly_local, anomaly_global),
+            "normal_local_lower_fraction": safe_lower_fraction(normal_local, normal_global),
+            "anomaly_local_lower_fraction": safe_lower_fraction(anomaly_local, anomaly_global),
+        }
+        (output_dir / "stage9_nn_distance_summary.json").write_text(
             json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         print(json.dumps(summary, indent=2, ensure_ascii=False))
