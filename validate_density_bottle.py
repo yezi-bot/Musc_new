@@ -835,6 +835,88 @@ def run_stage11_final_comparison(
     return summary
 
 
+def run_stage12_image_support(
+    coverage_by_image_path, image_records_path, output_dir, quantile=0.7
+):
+    """Promote patch coverage to an image-level Channel support variable."""
+    with Path(coverage_by_image_path).open("r", newline="", encoding="utf-8") as handle:
+        coverage_rows = list(csv.DictReader(handle))
+    with Path(image_records_path).open("r", newline="", encoding="utf-8") as handle:
+        image_rows = list(csv.DictReader(handle))
+    image_types = {int(row["image_id"]): row["image_type"] for row in image_rows}
+    selected = [row for row in coverage_rows if float(row["quantile"]) == quantile]
+    support_rows = []
+    for row in selected:
+        image_id = int(row["image_id"])
+        image_type = image_types[image_id]
+        support_rows.append(
+            {
+                "image_id": image_id,
+                "image_type": image_type,
+                "method": row["method"],
+                "coverage_quantile": quantile,
+                "coverage_threshold": float(row["threshold"]),
+                "channel_support": float(row["coverage"]),
+                "ms_score": None,
+            }
+        )
+
+    def group_stats(values):
+        values = np.asarray(values, dtype=np.float64)
+        return {
+            "count": int(values.size),
+            "mean": float(values.mean()),
+            "median": float(np.median(values)),
+            "q25": float(np.quantile(values, 0.25)),
+            "q75": float(np.quantile(values, 0.75)),
+        }
+
+    summary = {
+        "stage": 12,
+        "definition": "channel_support = covered patches / 1369",
+        "coverage_quantile": quantile,
+        "ms_score_available": False,
+        "ms_score_note": "The DINO-only validation path does not run MSM, CLIP, or RsCIN.",
+        "methods": {},
+    }
+    for method in ("global", "local"):
+        method_rows = [row for row in support_rows if row["method"] == method]
+        normal = [row["channel_support"] for row in method_rows if row["image_type"] == "good"]
+        anomaly = [row["channel_support"] for row in method_rows if row["image_type"] != "good"]
+        pairwise = [
+            float(normal_value > anomaly_value) + 0.5 * float(normal_value == anomaly_value)
+            for normal_value in normal
+            for anomaly_value in anomaly
+        ]
+        summary["methods"][method] = {
+            "normal": group_stats(normal),
+            "anomaly": group_stats(anomaly),
+            "normal_minus_anomaly_mean": float(np.mean(normal) - np.mean(anomaly)),
+            "support_separation_auc": float(np.mean(pairwise)),
+        }
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True, sharey=True)
+    bins = np.linspace(0.0, 1.0, 21)
+    for axis, method in zip(axes, ("global", "local")):
+        method_rows = [row for row in support_rows if row["method"] == method]
+        normal = [row["channel_support"] for row in method_rows if row["image_type"] == "good"]
+        anomaly = [row["channel_support"] for row in method_rows if row["image_type"] != "good"]
+        axis.hist(normal, bins=bins, alpha=0.65, density=True, label="normal")
+        axis.hist(anomaly, bins=bins, alpha=0.65, density=True, label="anomaly")
+        axis.set_title(f"{method.title()} Channel support")
+        axis.set_xlabel("image-level Channel support")
+        axis.legend()
+    axes[0].set_ylabel("density")
+    fig.tight_layout()
+    fig.savefig(output_dir / "stage12_support_distributions.png", dpi=200)
+    plt.close(fig)
+    write_csv(output_dir / "stage12_image_channel_support.csv", support_rows)
+    (output_dir / "stage12_image_channel_support_summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return summary
+
+
 def run_weighted_span(features, samples, device, ttl=5, density_k=5):
     """Scheme B: local position matching plus soft patch reliability."""
     grid_size = int(math.sqrt(features[0].shape[0]))
@@ -1012,6 +1094,8 @@ def main():
     parser.add_argument("--distance-summary", type=str, default=None)
     parser.add_argument("--coverage-summary", type=str, default=None)
     parser.add_argument("--ablation-summary", type=str, default=None)
+    parser.add_argument("--coverage-by-image", type=str, default=None)
+    parser.add_argument("--image-records", type=str, default=None)
     parser.add_argument("--scheme-b-only", action="store_true")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--stage", type=int, default=0)
@@ -1465,6 +1549,24 @@ def main():
             args.distance_summary,
             args.coverage_summary,
             args.ablation_summary,
+            output_dir,
+            quantile=0.7,
+        )
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return
+
+    if args.stage == 12:
+        required = {
+            "--coverage-by-image": args.coverage_by_image,
+            "--image-records": args.image_records,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise ValueError(f"missing required arguments for --stage 12: {', '.join(missing)}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        summary = run_stage12_image_support(
+            args.coverage_by_image,
+            args.image_records,
             output_dir,
             quantile=0.7,
         )
