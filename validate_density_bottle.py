@@ -770,6 +770,71 @@ def run_stage10_coverage_sweep(distance_records_path, output_dir):
     }
 
 
+def run_stage11_final_comparison(
+    distance_summary_path, coverage_summary_path, ablation_summary_path, output_dir, quantile=0.7
+):
+    """Combine contamination, Channel count, distance, and coverage at one threshold."""
+    distance_summary = json.loads(Path(distance_summary_path).read_text(encoding="utf-8"))
+    coverage_summary = json.loads(Path(coverage_summary_path).read_text(encoding="utf-8"))
+    ablation_summary = json.loads(Path(ablation_summary_path).read_text(encoding="utf-8"))
+    coverage_rows = [
+        row for row in coverage_summary["summary"] if float(row["quantile"]) == quantile
+    ]
+    coverage_by_method = {row["method"]: row for row in coverage_rows}
+    ablation = ablation_summary["ablations"]
+    comparison = []
+    for method in ("global", "local"):
+        ablation_key = f"{method}_soft_effective_span"
+        comparison.append(
+            {
+                "method": method,
+                "mean_contamination": ablation[ablation_key]["mean_contamination"],
+                "mean_mature_channels": ablation[ablation_key]["mean_mature_channels"],
+                "normal_patch_nn_distance": distance_summary["distance_summary"][method][
+                    "normal_patch_mean_distance"
+                ],
+                "normal_patch_coverage": coverage_by_method[method][
+                    "mean_normal_patch_coverage"
+                ],
+                "all_patch_coverage": coverage_by_method[method]["mean_coverage"],
+                "anomaly_patch_coverage": coverage_by_method[method][
+                    "mean_anomaly_patch_coverage"
+                ],
+            }
+        )
+    by_method = {row["method"]: row for row in comparison}
+    summary = {
+        "stage": 11,
+        "threshold_quantile": quantile,
+        "threshold": coverage_by_method["global"]["threshold"],
+        "definitions": {
+            "global": "global matching + rank reliability + alpha=0.5 + effective_span>=3",
+            "local": "3x3 position matching + rank reliability + alpha=0.5 + effective_span>=3",
+        },
+        "comparison": comparison,
+        "local_minus_global": {
+            "mean_contamination": by_method["local"]["mean_contamination"]
+            - by_method["global"]["mean_contamination"],
+            "mean_mature_channels": by_method["local"]["mean_mature_channels"]
+            - by_method["global"]["mean_mature_channels"],
+            "normal_patch_nn_distance": by_method["local"]["normal_patch_nn_distance"]
+            - by_method["global"]["normal_patch_nn_distance"],
+            "normal_patch_coverage": by_method["local"]["normal_patch_coverage"]
+            - by_method["global"]["normal_patch_coverage"],
+        },
+        "source_files": {
+            "distance_summary": str(distance_summary_path),
+            "coverage_summary": str(coverage_summary_path),
+            "ablation_summary": str(ablation_summary_path),
+        },
+    }
+    write_csv(output_dir / "stage11_final_comparison.csv", comparison)
+    (output_dir / "stage11_final_comparison.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return summary
+
+
 def run_weighted_span(features, samples, device, ttl=5, density_k=5):
     """Scheme B: local position matching plus soft patch reliability."""
     grid_size = int(math.sqrt(features[0].shape[0]))
@@ -944,6 +1009,9 @@ def main():
     parser.add_argument("--ttl", type=int, default=5)
     parser.add_argument("--features-cache", type=str, default=None)
     parser.add_argument("--distance-records", type=str, default=None)
+    parser.add_argument("--distance-summary", type=str, default=None)
+    parser.add_argument("--coverage-summary", type=str, default=None)
+    parser.add_argument("--ablation-summary", type=str, default=None)
     parser.add_argument("--scheme-b-only", action="store_true")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--stage", type=int, default=0)
@@ -1379,6 +1447,26 @@ def main():
         summary = run_stage10_coverage_sweep(args.distance_records, output_dir)
         (output_dir / "stage10_coverage_summary.json").write_text(
             json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return
+
+    if args.stage == 11:
+        required = {
+            "--distance-summary": args.distance_summary,
+            "--coverage-summary": args.coverage_summary,
+            "--ablation-summary": args.ablation_summary,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise ValueError(f"missing required arguments for --stage 11: {', '.join(missing)}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        summary = run_stage11_final_comparison(
+            args.distance_summary,
+            args.coverage_summary,
+            args.ablation_summary,
+            output_dir,
+            quantile=0.7,
         )
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return
