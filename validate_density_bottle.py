@@ -670,6 +670,106 @@ def run_stage9_nn_distance_audit(
     return image_rows, patch_records
 
 
+def run_stage10_coverage_sweep(distance_records_path, output_dir):
+    """Evaluate unsupervised coverage thresholds from saved NN distances."""
+    with Path(distance_records_path).open("r", newline="", encoding="utf-8") as handle:
+        records = list(csv.DictReader(handle))
+    methods = ("global", "local")
+    distances = {
+        method: np.asarray(
+            [
+                float(row[f"nearest_{method}_distance"])
+                for row in records
+                if row[f"nearest_{method}_distance"] not in ("", "nan", "NaN")
+            ],
+            dtype=np.float64,
+        )
+        for method in methods
+    }
+    pooled = np.concatenate([values for values in distances.values() if values.size])
+    quantiles = (0.50, 0.70, 0.80, 0.90)
+    image_rows = []
+    summary_rows = []
+    patch_rows = []
+    for quantile in quantiles:
+        threshold = float(np.quantile(pooled, quantile))
+        for method in methods:
+            distance_key = f"nearest_{method}_distance"
+            for row in records:
+                value_text = row[distance_key]
+                value = float(value_text) if value_text not in ("", "nan", "NaN") else float("nan")
+                patch_rows.append(
+                    {
+                        "quantile": quantile,
+                        "threshold": threshold,
+                        "method": method,
+                        "image_id": int(row["image_id"]),
+                        "patch_id": int(row["patch_id"]),
+                        "is_anomaly": int(row["is_anomaly"]),
+                        "distance": value,
+                        "has_reference": int(np.isfinite(value)),
+                        "covered": int(np.isfinite(value) and value <= threshold),
+                    }
+                )
+            for image_id in sorted({int(row["image_id"]) for row in records}):
+                image_records = [row for row in records if int(row["image_id"]) == image_id]
+                stats = {"all": [], "normal": [], "anomaly": []}
+                for row in image_records:
+                    value_text = row[distance_key]
+                    value = float(value_text) if value_text not in ("", "nan", "NaN") else float("nan")
+                    covered = float(np.isfinite(value) and value <= threshold)
+                    stats["all"].append(covered)
+                    stats["anomaly" if int(row["is_anomaly"]) else "normal"].append(covered)
+
+                def rate(values):
+                    return float(np.mean(values)) if values else None
+
+                image_rows.append(
+                    {
+                        "quantile": quantile,
+                        "threshold": threshold,
+                        "method": method,
+                        "image_id": image_id,
+                        "coverage": rate(stats["all"]),
+                        "normal_patch_coverage": rate(stats["normal"]),
+                        "anomaly_patch_coverage": rate(stats["anomaly"]),
+                    }
+                )
+
+            method_images = [
+                row for row in image_rows if row["quantile"] == quantile and row["method"] == method
+            ]
+
+            def mean_or_none(values):
+                values = [value for value in values if value is not None]
+                return float(np.mean(values)) if values else None
+
+            summary_rows.append(
+                {
+                    "quantile": quantile,
+                    "threshold": threshold,
+                    "method": method,
+                    "mean_coverage": mean_or_none([row["coverage"] for row in method_images]),
+                    "mean_normal_patch_coverage": mean_or_none(
+                        [row["normal_patch_coverage"] for row in method_images]
+                    ),
+                    "mean_anomaly_patch_coverage": mean_or_none(
+                        [row["anomaly_patch_coverage"] for row in method_images]
+                    ),
+                }
+            )
+    write_csv(output_dir / "stage10_coverage_sweep_summary.csv", summary_rows)
+    write_csv(output_dir / "stage10_coverage_by_image.csv", image_rows)
+    write_csv(output_dir / "stage10_coverage_by_patch.csv", patch_rows)
+    return {
+        "stage": 10,
+        "source_distance_records": str(distance_records_path),
+        "threshold_definition": "pooled finite global/local NN distances; no GT used",
+        "quantiles": list(quantiles),
+        "summary": summary_rows,
+    }
+
+
 def run_weighted_span(features, samples, device, ttl=5, density_k=5):
     """Scheme B: local position matching plus soft patch reliability."""
     grid_size = int(math.sqrt(features[0].shape[0]))
@@ -843,6 +943,7 @@ def main():
     parser.add_argument("--layer-index", type=int, default=23)
     parser.add_argument("--ttl", type=int, default=5)
     parser.add_argument("--features-cache", type=str, default=None)
+    parser.add_argument("--distance-records", type=str, default=None)
     parser.add_argument("--scheme-b-only", action="store_true")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--stage", type=int, default=0)
@@ -1266,6 +1367,17 @@ def main():
             "anomaly_local_lower_fraction": safe_lower_fraction(anomaly_local, anomaly_global),
         }
         (output_dir / "stage9_nn_distance_summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return
+
+    if args.stage == 10:
+        if args.distance_records is None:
+            raise ValueError("--distance-records is required for --stage 10")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        summary = run_stage10_coverage_sweep(args.distance_records, output_dir)
+        (output_dir / "stage10_coverage_summary.json").write_text(
             json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         print(json.dumps(summary, indent=2, ensure_ascii=False))
