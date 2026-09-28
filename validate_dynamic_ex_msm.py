@@ -14,36 +14,52 @@ from torchvision import transforms
 from validate_density_bottle import ChannelMemory, extract_features, load_samples, write_csv
 
 
-def compute_dino_msm_image_scores(features, device, reference_chunk_size=8):
-    """Compute the single-layer DINO MSM-style score and reduce patches by max."""
-    if len(features) < 2:
-        raise ValueError("DINO MSM scoring requires at least two images")
+def compute_online_dino_msm_image_score(
+    current, reference_features, device, reference_chunk_size=8
+):
+    """Score one image against strictly earlier images in the current stream."""
     if reference_chunk_size < 1:
         raise ValueError("reference_chunk_size must be at least 1")
+    if not reference_features:
+        return None
 
-    stacked = torch.stack(features).float().to(device)
-    image_count, patch_count, _ = stacked.shape
-    scores = []
-    for image_id in range(image_count):
-        reference_ids = [index for index in range(image_count) if index != image_id]
-        patch_to_image = []
-        current = stacked[image_id]
-        for start in range(0, len(reference_ids), reference_chunk_size):
-            chunk_ids = reference_ids[start : start + reference_chunk_size]
-            reference = stacked[chunk_ids].reshape(-1, stacked.shape[-1])
-            distances = torch.cdist(current, reference)
-            distances = distances.reshape(patch_count, len(chunk_ids), patch_count).amin(dim=2)
-            patch_to_image.append(distances)
-        patch_to_image = torch.cat(patch_to_image, dim=1)
-        k_max = max(1, int(patch_to_image.shape[1] * 0.3))
-        patch_scores = torch.topk(
-            patch_to_image, k=k_max, dim=1, largest=False, sorted=False
-        ).values.mean(dim=1)
-        scores.append(float(patch_scores.max().cpu()))
-    del stacked
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return scores
+    current = current.float().to(device)
+    patch_count = current.shape[0]
+    patch_to_image = []
+    for start in range(0, len(reference_features), reference_chunk_size):
+        chunk = torch.stack(
+            reference_features[start : start + reference_chunk_size]
+        ).float().to(device)
+        distances = torch.cdist(current, chunk.reshape(-1, chunk.shape[-1]))
+        distances = distances.reshape(patch_count, chunk.shape[0], patch_count).amin(dim=2)
+        patch_to_image.append(distances)
+    patch_to_image = torch.cat(patch_to_image, dim=1)
+    k_max = max(1, int(patch_to_image.shape[1] * 0.3))
+    patch_scores = torch.topk(
+        patch_to_image, k=k_max, dim=1, largest=False, sorted=False
+    ).values.mean(dim=1)
+    return float(patch_scores.max().cpu())
+
+
+def compute_patch_channel_distances(
+    current, mature_channels, grid_size, device, position_radius=None
+):
+    """Return each patch's nearest mature seed distance under an optional position window."""
+    seeds = torch.stack([channel.seed for channel in mature_channels]).float().to(device)
+    distances = torch.cdist(current.float().to(device), seeds)
+    if position_radius is not None:
+        patch_ids = torch.arange(current.shape[0], device=device)
+        channel_ids = torch.tensor(
+            [channel.patch_ids[-1] for channel in mature_channels], device=device
+        )
+        patch_rows = patch_ids[:, None] // grid_size
+        patch_cols = patch_ids[:, None] % grid_size
+        channel_rows = channel_ids[None, :] // grid_size
+        channel_cols = channel_ids[None, :] % grid_size
+        valid = (patch_rows - channel_rows).abs() <= position_radius
+        valid &= (patch_cols - channel_cols).abs() <= position_radius
+        distances = distances.masked_fill(~valid, float("inf"))
+    return distances.amin(dim=1).cpu()
 
 
 def summarize(values):
@@ -73,9 +89,6 @@ def run_stage1_image_support(
 ):
     """Measure online Channel support before every Channel memory update."""
     grid_size = int(math.sqrt(features[0].shape[0]))
-    ms_scores = compute_dino_msm_image_scores(
-        features, device=device, reference_chunk_size=msm_chunk_size
-    )
     records = []
     for stream_seed in stream_seeds:
         order = list(range(len(samples)))
@@ -89,18 +102,28 @@ def run_stage1_image_support(
             ),
         }
         distance_history = {"global": [], "local": []}
+        reference_features = []
         for stream_step, image_id in enumerate(order):
             current = features[image_id]
+            ms_score = compute_online_dino_msm_image_score(
+                current,
+                reference_features,
+                device=device,
+                reference_chunk_size=msm_chunk_size,
+            )
             for method, memory in memories.items():
                 mature = memory.weighted_mature_channels()
                 threshold = None
                 support = None
                 current_distances = None
                 if mature:
-                    seeds = torch.stack([channel.seed for channel in mature]).to(device)
-                    current_distances = torch.cdist(
-                        current.float().to(device), seeds.float()
-                    ).amin(dim=1).cpu()
+                    current_distances = compute_patch_channel_distances(
+                        current,
+                        mature,
+                        grid_size,
+                        device,
+                        position_radius=memory.position_radius,
+                    )
                     if distance_history[method]:
                         threshold = float(
                             np.quantile(distance_history[method], threshold_quantile)
@@ -116,12 +139,13 @@ def run_stage1_image_support(
                         "reliable_mature_channels": len(mature),
                         "online_threshold": threshold,
                         "channel_support": support,
-                        "ms_score": ms_scores[image_id],
-                        "ms_score_source": "single-layer DINO MSM-style score, image max",
+                        "ms_score": ms_score,
+                        "ms_score_source": "single-layer online DINO MSM-style score, image max",
                     }
                 )
                 if current_distances is not None:
-                    distance_history[method].extend(current_distances.tolist())
+                    finite_distances = current_distances[torch.isfinite(current_distances)]
+                    distance_history[method].extend(finite_distances.tolist())
                 _, patch_weights = memory.patch_reliability(
                     current, grid_size, reliability_mode="rank"
                 )
@@ -132,6 +156,7 @@ def run_stage1_image_support(
                     patch_densities=None,
                     patch_reliabilities=soft_weights,
                 )
+            reference_features.append(current)
 
     summary = {
         "stage": 1,
@@ -142,8 +167,9 @@ def run_stage1_image_support(
         },
         "ms_score": {
             "available": True,
-            "source": "single-layer DINO MSM-style top-30%-minimum patch distance",
+            "source": "single-layer DINO MSM-style score against strictly prior stream images",
             "image_reduction": "maximum patch score",
+            "unavailable_warmup_images": len(stream_seeds),
         },
         "methods": {},
     }
