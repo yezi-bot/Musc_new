@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -36,6 +37,112 @@ def patience_from_gap(gap, base_ttl, max_ttl, multiplier):
     return min(max_ttl, max(base_ttl, int(math.ceil(gap * multiplier))))
 
 
+def normalized_channel_margin(channel_support, channel_threshold):
+    """Normalize Channel evidence without changing the tau=0 gate semantics."""
+    if channel_threshold <= 0.0:
+        return 1.0 if channel_support >= channel_threshold else 0.0
+    return min(channel_support / channel_threshold, 1.0)
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sample_keys(samples):
+    return [f"{sample['kind']}/{sample['path'].name}" for sample in samples]
+
+
+def validate_experiment_inputs(
+    samples, features, feature_metadata, stage1_records, admitted_experts
+):
+    """Validate that dataset, Stage 1, Stage 3, and feature indices agree."""
+    errors = []
+    warnings = []
+    sample_count = len(samples)
+    if sample_count == 0 or len(features) != sample_count:
+        errors.append(
+            f"sample/feature count mismatch: {sample_count} samples, {len(features)} features"
+        )
+    feature_shapes = {tuple(feature.shape) for feature in features}
+    if len(feature_shapes) != 1:
+        errors.append(f"feature shapes are inconsistent: {sorted(feature_shapes)}")
+    if any(not torch.isfinite(feature).all() for feature in features):
+        errors.append("feature cache contains non-finite values")
+
+    local_records = [row for row in stage1_records if row["method"] == "local"]
+    stream_seeds = sorted({row["stream_seed"] for row in local_records})
+    for stream_seed in stream_seeds:
+        rows = sorted(
+            (row for row in local_records if row["stream_seed"] == stream_seed),
+            key=lambda row: row["stream_step"],
+        )
+        steps = [row["stream_step"] for row in rows]
+        image_ids = [row["image_id"] for row in rows]
+        if steps != list(range(sample_count)):
+            errors.append(f"seed {stream_seed}: Stage 1 steps are not 0..{sample_count - 1}")
+        if sorted(image_ids) != list(range(sample_count)):
+            errors.append(f"seed {stream_seed}: Stage 1 image ids are not a permutation")
+        for row in rows:
+            image_id = row["image_id"]
+            if not 0 <= image_id < sample_count:
+                continue
+            if row["image_type"] != samples[image_id]["kind"]:
+                errors.append(
+                    f"seed {stream_seed} image {image_id}: Stage 1 image_type mismatch"
+                )
+                break
+
+    ids = [expert_id(expert) for expert in admitted_experts]
+    if len(ids) != len(set(ids)):
+        errors.append("Stage 3 expert ids are not unique")
+    for expert in admitted_experts:
+        image_id = expert["image_id"]
+        if expert["stream_seed"] not in stream_seeds:
+            errors.append(f"{expert_id(expert)}: stream seed is absent from Stage 1")
+        if not 0 <= image_id < sample_count:
+            errors.append(f"{expert_id(expert)}: image_id is outside the feature cache")
+            continue
+        if expert["image_type"] != samples[image_id]["kind"]:
+            errors.append(f"{expert_id(expert)}: Stage 3 image_type mismatch")
+
+    if not stream_seeds:
+        errors.append("no local Stage 1 streams found")
+    metadata_verified = False
+    if feature_metadata is None:
+        warnings.append(
+            "legacy feature cache has no embedded sample metadata; numerical Stage 1 "
+            "reproduction is used to bind it to this experiment"
+        )
+    else:
+        expected_keys = sample_keys(samples)
+        if feature_metadata.get("sample_count") != sample_count:
+            errors.append("feature metadata sample_count mismatch")
+        if feature_metadata.get("sample_keys") != expected_keys:
+            errors.append("feature metadata sample order mismatch")
+        if feature_metadata.get("sample_kinds") != [
+            sample["kind"] for sample in samples
+        ]:
+            errors.append("feature metadata sample kinds mismatch")
+        metadata_verified = not any(
+            error.startswith("feature metadata") for error in errors
+        )
+    return {
+        "errors": errors,
+        "warnings": warnings,
+        "sample_count": sample_count,
+        "feature_count": len(features),
+        "feature_shapes": [list(shape) for shape in sorted(feature_shapes)],
+        "stream_seeds": stream_seeds,
+        "expert_ids": sorted(ids),
+        "feature_metadata_available": feature_metadata is not None,
+        "feature_metadata_verified": metadata_verified,
+    }
+
+
 def precompute_online_signals(
     stage1_records,
     admitted_experts,
@@ -58,6 +165,7 @@ def precompute_online_signals(
     stream_seeds = sorted({row["stream_seed"] for row in local_records})
     signals = {}
     stream_rows_by_seed = {}
+    stage1_reproduction = []
 
     for stream_seed in stream_seeds:
         stream_rows = sorted(
@@ -138,6 +246,36 @@ def precompute_online_signals(
             if current_support is not None:
                 current_support_history.append(current_support)
 
+            threshold_matches = (
+                patch_threshold is None and row["online_threshold"] is None
+            ) or (
+                patch_threshold is not None
+                and row["online_threshold"] is not None
+                and math.isclose(
+                    patch_threshold, row["online_threshold"], rel_tol=1e-6, abs_tol=1e-7
+                )
+            )
+            support_matches = (
+                current_support is None and row["channel_support"] is None
+            ) or (
+                current_support is not None
+                and row["channel_support"] is not None
+                and math.isclose(
+                    current_support, row["channel_support"], rel_tol=1e-6, abs_tol=1e-7
+                )
+            )
+            stage1_reproduction.append(
+                {
+                    "stream_seed": stream_seed,
+                    "step": step,
+                    "image_id": row["image_id"],
+                    "mature_count_matches": len(mature)
+                    == row["reliable_mature_channels"],
+                    "threshold_matches": threshold_matches,
+                    "support_matches": support_matches,
+                }
+            )
+
             _, patch_weights = memory.patch_reliability(
                 current, grid_size, reliability_mode="rank"
             )
@@ -149,7 +287,20 @@ def precompute_online_signals(
                 patch_reliabilities=soft_weights,
             )
 
-    return signals, stream_rows_by_seed
+    mismatches = [
+        row
+        for row in stage1_reproduction
+        if not (
+            row["mature_count_matches"]
+            and row["threshold_matches"]
+            and row["support_matches"]
+        )
+    ]
+    return signals, stream_rows_by_seed, {
+        "checked_records": len(stage1_reproduction),
+        "mismatch_count": len(mismatches),
+        "mismatch_examples": mismatches[:10],
+    }
 
 
 def refresh_decision(variant, signal, similarity_threshold):
@@ -171,7 +322,7 @@ def refresh_decision(variant, signal, similarity_threshold):
     if channel_refresh is None:
         return None, similarity_refresh, channel_refresh, hybrid_score
     sim_margin = similarity / max(similarity_threshold, 1e-12)
-    channel_margin = channel_support / max(channel_threshold, 1e-12)
+    channel_margin = normalized_channel_margin(channel_support, channel_threshold)
     hybrid_score = beta * channel_margin + (1.0 - beta) * sim_margin
     return hybrid_score >= 1.0, similarity_refresh, channel_refresh, hybrid_score
 
@@ -197,12 +348,14 @@ def run_lifecycle_variant(
             if expert["stream_seed"] == stream_seed:
                 scheduled.setdefault(expert["admission_trigger_step"], []).append(expert)
         active = []
+        retired = []
         ever_admitted = False
 
         for row in stream_rows:
             step = row["stream_step"]
             deletion_slots = max(0, len(active) - committee_floor)
             survivors = []
+            newly_retired = []
             ordered_active = sorted(
                 active,
                 key=lambda state: (state["last_supported_step"], state["support_count"]),
@@ -239,6 +392,7 @@ def run_lifecycle_variant(
                 deleted = expired and deletion_slots > 0
                 if deleted:
                     state["ttl"] = 0
+                    state["deletion_step"] = step
                     event = "deleted"
                     deletion_slots -= 1
                 elif expired:
@@ -266,8 +420,10 @@ def run_lifecycle_variant(
                         "ttl_after": state["ttl"],
                         "patience": state["patience"],
                         "age": state["age"],
+                        "deletion_step": state.get("deletion_step"),
                         "similarity_refresh": similarity_refresh,
                         "channel_refresh": channel_refresh,
+                        "refresh_applied": event == "ttl_refreshed",
                         "alive": not deleted,
                         "deleted_this_step": deleted,
                         "event": event,
@@ -275,6 +431,8 @@ def run_lifecycle_variant(
                 )
                 if not deleted:
                     survivors.append(state)
+                else:
+                    newly_retired.append(state)
             active = survivors
 
             for expert in scheduled.get(step, []):
@@ -291,6 +449,7 @@ def run_lifecycle_variant(
                     "max_support_gap": gap,
                     "last_supported_step": step,
                     "support_count": expert["cluster_support_at_admission"],
+                    "deletion_step": None,
                 }
                 active.append(state)
                 ever_admitted = True
@@ -316,13 +475,53 @@ def run_lifecycle_variant(
                         "ttl_after": initial_ttl,
                         "patience": initial_ttl,
                         "age": 0,
+                        "deletion_step": None,
                         "similarity_refresh": False,
                         "channel_refresh": False,
+                        "refresh_applied": False,
                         "alive": True,
                         "deleted_this_step": False,
                         "event": "admitted",
                     }
                 )
+
+            for state in retired:
+                signal = signals[(state["expert_id"], step)]
+                _, similarity_gate, channel_gate, hybrid_score = refresh_decision(
+                    variant, signal, similarity_threshold
+                )
+                state["age"] += 1
+                timeline_rows.append(
+                    {
+                        "step": step,
+                        "variant": variant,
+                        "committee_floor": committee_floor,
+                        "expert_id": state["expert_id"],
+                        "stream_seed": stream_seed,
+                        "expert_image_id": state["image_id"],
+                        "gt_debug": state["image_type"],
+                        "support_similarity": signal["support_similarity"],
+                        "channel_support": signal["channel_support"],
+                        "similarity_threshold": similarity_threshold,
+                        "channel_threshold": signal["channel_threshold"],
+                        "patch_distance_threshold": signal[
+                            "patch_distance_threshold"
+                        ],
+                        "hybrid_score": hybrid_score,
+                        "ttl_before": 0,
+                        "ttl_after": 0,
+                        "patience": state["patience"],
+                        "age": state["age"],
+                        "deletion_step": state["deletion_step"],
+                        "similarity_refresh": False,
+                        "channel_refresh": False,
+                        "refresh_applied": False,
+                        "alive": False,
+                        "deleted_this_step": False,
+                        "event": "deleted_tombstone",
+                    }
+                )
+            retired.extend(newly_retired)
 
             committee_counts.append(
                 {
@@ -389,12 +588,27 @@ def read_deletion_signature(path):
         rows = list(csv.DictReader(handle))
     return sorted(
         (
-            int(row["stream_seed"]),
-            int(row["expert_index"]),
+            f"s{int(row['stream_seed'])}-e{int(row['expert_index'])}",
+            int(row["expert_image_id"]),
             int(row["stream_step"]),
         )
         for row in rows
         if row["event"] == "deleted"
+    )
+
+
+def read_final_committee_signature(path):
+    if path is None or not Path(path).exists():
+        return None
+    with Path(path).open("r", newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    return sorted(
+        (
+            f"s{int(row['stream_seed'])}-e{int(row['expert_index'])}",
+            int(row["image_id"]),
+            int(row["stream_seed"]),
+        )
+        for row in rows
     )
 
 
@@ -533,6 +747,136 @@ def plot_focus_experts(path, focus_ids, admitted_experts, signals, timeline):
     plt.close(fig)
 
 
+def build_normal_rescue_rows(admitted_experts, signals, timeline):
+    deleted = {
+        (row["variant"], row["expert_id"]): row["step"]
+        for row in timeline
+        if row["committee_floor"] == 0 and row["deleted_this_step"]
+    }
+    rescued_ids = sorted(
+        expert_id(expert)
+        for expert in admitted_experts
+        if expert["image_type"] == "good"
+        and ("similarity_ttl", expert_id(expert)) in deleted
+        and ("channel_ttl", expert_id(expert)) not in deleted
+    )
+    rows = []
+    for eid in rescued_ids:
+        points = [value for (key, _), value in signals.items() if key == eid]
+        available_channel = [
+            point
+            for point in points
+            if point["channel_support"] is not None
+            and point["channel_threshold"] is not None
+        ]
+        rows.append(
+            {
+                "expert_id": eid,
+                "gt_debug": next(
+                    expert["image_type"]
+                    for expert in admitted_experts
+                    if expert_id(expert) == eid
+                ),
+                "similarity_deletion_step": deleted[("similarity_ttl", eid)],
+                "channel_deletion_step": deleted.get(("channel_ttl", eid)),
+                "mean_support_similarity": float(
+                    np.mean([point["support_similarity"] for point in points])
+                ),
+                "similarity_gate_pass_rate": float(
+                    np.mean(
+                        [point["support_similarity"] >= 0.98 for point in points]
+                    )
+                ),
+                "mean_channel_support": float(
+                    np.mean([point["channel_support"] for point in available_channel])
+                ),
+                "channel_gate_pass_rate": float(
+                    np.mean(
+                        [
+                            point["channel_support"] >= point["channel_threshold"]
+                            for point in available_channel
+                        ]
+                    )
+                ),
+            }
+        )
+    return rows
+
+
+def plot_normal_rescue_cases(path, rescue_rows, signals, timeline):
+    if not rescue_rows:
+        return
+    fig, axes = plt.subplots(
+        len(rescue_rows), 1, figsize=(13, 4.2 * len(rescue_rows)), squeeze=False
+    )
+    for axis, rescue in zip(axes[:, 0], rescue_rows):
+        eid = rescue["expert_id"]
+        points = sorted(
+            ((step, value) for (key, step), value in signals.items() if key == eid),
+            key=lambda item: item[0],
+        )
+        steps = [step for step, _ in points]
+        axis.plot(
+            steps,
+            [value["support_similarity"] for _, value in points],
+            color="tab:blue",
+            label="S_sim",
+        )
+        axis.plot(
+            steps,
+            [value["channel_support"] for _, value in points],
+            color="tab:orange",
+            label="S_ch",
+        )
+        axis.plot(
+            steps,
+            [value["channel_threshold"] for _, value in points],
+            color="tab:orange",
+            linestyle="--",
+            label="channel q0.7",
+        )
+        axis.axhline(0.98, color="tab:blue", linestyle="--", linewidth=1)
+        ttl_axis = axis.twinx()
+        for variant, color in (
+            ("similarity_ttl", "tab:blue"),
+            ("channel_ttl", "tab:green"),
+        ):
+            rows = sorted(
+                (
+                    row
+                    for row in timeline
+                    if row["committee_floor"] == 0
+                    and row["variant"] == variant
+                    and row["expert_id"] == eid
+                ),
+                key=lambda row: row["step"],
+            )
+            ttl_axis.step(
+                [row["step"] for row in rows],
+                [row["ttl_after"] for row in rows],
+                where="post",
+                color=color,
+                alpha=0.45,
+                label=f"{variant} TTL",
+            )
+            for row in rows:
+                if row["deleted_this_step"]:
+                    axis.axvline(row["step"], color=color, linestyle=":", linewidth=2)
+        axis.set_ylim(0.0, 1.05)
+        ttl_axis.set_ylim(bottom=0)
+        axis.set_ylabel("support")
+        ttl_axis.set_ylabel("TTL")
+        axis.set_title(f"{eid}: normal expert rescued by Channel-TTL")
+        axis.grid(alpha=0.2)
+        handles1, labels1 = axis.get_legend_handles_labels()
+        handles2, labels2 = ttl_axis.get_legend_handles_labels()
+        axis.legend(handles1 + handles2, labels1 + labels2, ncol=5, fontsize=8)
+    axes[-1, 0].set_xlabel("stream step")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+
 def plot_comparison(path, summaries):
     fig, axes = plt.subplots(2, 2, figsize=(15, 9))
     variants = list(VARIANTS)
@@ -592,7 +936,15 @@ def plot_comparison(path, summaries):
     plt.close(fig)
 
 
-def validate_outputs(admitted_experts, timeline, summaries, baseline_signature):
+def validate_outputs(
+    admitted_experts,
+    timeline,
+    summaries,
+    stream_rows_by_seed,
+    final_signatures,
+    baseline_deletions,
+    baseline_final_committee,
+):
     ids = [expert_id(expert) for expert in admitted_experts]
     errors = []
     if len(ids) != len(set(ids)):
@@ -615,7 +967,9 @@ def validate_outputs(admitted_experts, timeline, summaries, baseline_signature):
             ):
                 errors.append("channel refresh violated threshold")
                 break
-        if row["event"] != "admitted" and row["variant"].startswith("hybrid_"):
+        if row["event"] not in ("admitted", "deleted_tombstone") and row[
+            "variant"
+        ].startswith("hybrid_"):
             available = row["channel_support"] is not None and row["channel_threshold"] is not None
             if not available:
                 if row["hybrid_score"] is not None or row["event"] != "signal_unavailable":
@@ -623,8 +977,8 @@ def validate_outputs(admitted_experts, timeline, summaries, baseline_signature):
                     break
             else:
                 beta = VARIANTS[row["variant"]]
-                expected_score = beta * (
-                    row["channel_support"] / max(row["channel_threshold"], 1e-12)
+                expected_score = beta * normalized_channel_margin(
+                    row["channel_support"], row["channel_threshold"]
                 ) + (1.0 - beta) * (
                     row["support_similarity"] / row["similarity_threshold"]
                 )
@@ -635,27 +989,68 @@ def validate_outputs(admitted_experts, timeline, summaries, baseline_signature):
                 if (row["event"] == "ttl_refreshed") != expected_refresh:
                     errors.append("hybrid refresh violated score threshold")
                     break
+        if row["event"] == "deleted_tombstone" and (
+            row["alive"]
+            or row["ttl_before"] != 0
+            or row["ttl_after"] != 0
+            or row["deletion_step"] is None
+        ):
+            errors.append(f"invalid tombstone row: {row['expert_id']} step {row['step']}")
+            break
     floor_one = [row for row in summaries if row["committee_floor"] == 1]
     if any(row["empty_committee_steps"] for row in floor_one):
         errors.append("committee_floor=1 produced an empty committee")
 
+    grouped = {}
+    for row in timeline:
+        key = (row["variant"], row["committee_floor"], row["expert_id"])
+        grouped.setdefault(key, []).append(row)
+    for expert in admitted_experts:
+        eid = expert_id(expert)
+        stream_steps = [
+            row["stream_step"]
+            for row in stream_rows_by_seed[expert["stream_seed"]]
+            if row["stream_step"] >= expert["admission_trigger_step"]
+        ]
+        for floor in (0, 1):
+            for variant in VARIANTS:
+                rows = grouped.get((variant, floor, eid), [])
+                observed_steps = [row["step"] for row in rows]
+                if observed_steps != stream_steps:
+                    errors.append(
+                        f"incomplete expert timeline: {variant} floor={floor} {eid}"
+                    )
+                    break
+
     actual_signature = sorted(
-        (row["stream_seed"], int(row["expert_id"].split("-e")[1]), row["step"])
+        (row["expert_id"], row["expert_image_id"], row["step"])
         for row in timeline
         if row["variant"] == "similarity_ttl"
         and row["committee_floor"] == 1
         and row["deleted_this_step"]
     )
     reproduction = {
-        "reference_available": baseline_signature is not None,
-        "reference_deletions": baseline_signature,
+        "reference_deletions_available": baseline_deletions is not None,
+        "reference_final_committee_available": baseline_final_committee is not None,
+        "reference_deletions": baseline_deletions,
         "ablation_deletions": actual_signature,
         "deletions_match": (
-            actual_signature == baseline_signature if baseline_signature is not None else None
+            actual_signature == baseline_deletions
+            if baseline_deletions is not None
+            else None
+        ),
+        "reference_final_committee": baseline_final_committee,
+        "ablation_final_committee": final_signatures[("similarity_ttl", 1)],
+        "final_committee_matches": (
+            final_signatures[("similarity_ttl", 1)] == baseline_final_committee
+            if baseline_final_committee is not None
+            else None
         ),
     }
-    if baseline_signature is not None and not reproduction["deletions_match"]:
+    if baseline_deletions is not None and not reproduction["deletions_match"]:
         errors.append("similarity_ttl floor=1 did not reproduce baseline deletions")
+    if baseline_final_committee is not None and not reproduction["final_committee_matches"]:
+        errors.append("similarity_ttl floor=1 did not reproduce the final committee")
     return errors, reproduction
 
 
@@ -667,6 +1062,7 @@ def main():
     parser.add_argument("--stage1-records", required=True)
     parser.add_argument("--stage3-experts", required=True)
     parser.add_argument("--baseline-events", default=None)
+    parser.add_argument("--baseline-final-committee", default=None)
     parser.add_argument("--channel-ttl", type=int, default=5)
     parser.add_argument("--density-k", type=int, default=5)
     parser.add_argument("--alpha", type=float, default=0.5)
@@ -681,16 +1077,31 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     samples = load_samples(args.data_root)
-    features = torch.load(args.features_cache, map_location="cpu", weights_only=False)
-    if not samples or len(features) != len(samples):
-        raise RuntimeError(
-            f"Sample/feature mismatch: {len(samples)} samples, {len(features)} features"
-        )
+    feature_payload = torch.load(
+        args.features_cache, map_location="cpu", weights_only=False
+    )
+    if isinstance(feature_payload, dict) and "features" in feature_payload:
+        features = feature_payload["features"]
+        feature_metadata = feature_payload.get("metadata")
+    else:
+        features = feature_payload
+        feature_metadata = None
     stage1_records = read_stage1_records(args.stage1_records)
     admitted_experts = read_stage3_experts(args.stage3_experts)
+    input_validation = validate_experiment_inputs(
+        samples,
+        features,
+        feature_metadata,
+        stage1_records,
+        admitted_experts,
+    )
+    if input_validation["errors"]:
+        raise RuntimeError(
+            "Input validation failed: " + "; ".join(input_validation["errors"])
+        )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    signals, stream_rows_by_seed = precompute_online_signals(
+    signals, stream_rows_by_seed, stage1_reproduction = precompute_online_signals(
         stage1_records,
         admitted_experts,
         features,
@@ -701,9 +1112,35 @@ def main():
         distance_quantile=args.distance_quantile,
         channel_quantile=args.channel_quantile,
     )
+    input_validation["stage1_numerical_reproduction"] = stage1_reproduction
+    if stage1_reproduction["mismatch_count"]:
+        raise RuntimeError(
+            "Feature cache did not reproduce Stage 1: "
+            f"{stage1_reproduction['mismatch_count']} mismatched records"
+        )
+
+    sample_order_json = json.dumps(
+        sample_keys(samples), ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    input_manifest = {
+        "sample_count": len(samples),
+        "sample_order_sha256": hashlib.sha256(sample_order_json).hexdigest(),
+        "feature_cache_sha256": file_sha256(args.features_cache),
+        "stage1_records_sha256": file_sha256(args.stage1_records),
+        "stage3_experts_sha256": file_sha256(args.stage3_experts),
+        "feature_metadata_verified": input_validation[
+            "feature_metadata_verified"
+        ],
+        "stage1_numerical_reproduction": stage1_reproduction,
+    }
+    experiment_payload = json.dumps(
+        input_manifest, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    input_manifest["experiment_id"] = hashlib.sha256(experiment_payload).hexdigest()
 
     all_timeline = []
     all_summaries = []
+    final_signatures = {}
     for floor in (0, 1):
         for variant in VARIANTS:
             timeline, final_experts, counts = run_lifecycle_variant(
@@ -718,6 +1155,14 @@ def main():
                 ttl_gap_multiplier=args.expert_ttl_gap_multiplier,
             )
             all_timeline.extend(timeline)
+            final_signatures[(variant, floor)] = sorted(
+                (
+                    state["expert_id"],
+                    state["image_id"],
+                    state["stream_seed"],
+                )
+                for state in final_experts
+            )
             all_summaries.append(
                 summarize_variant(
                     variant,
@@ -733,11 +1178,18 @@ def main():
     if baseline_path is None:
         candidate = Path(args.stage3_experts).parent / "stage4_expert_lifecycle_events.csv"
         baseline_path = candidate if candidate.exists() else None
+    baseline_final_path = args.baseline_final_committee
+    if baseline_final_path is None:
+        candidate = Path(args.stage3_experts).parent / "stage4_final_committee.csv"
+        baseline_final_path = candidate if candidate.exists() else None
     errors, reproduction = validate_outputs(
         admitted_experts,
         all_timeline,
         all_summaries,
+        stream_rows_by_seed,
+        final_signatures,
         read_deletion_signature(baseline_path),
+        read_final_committee_signature(baseline_final_path),
     )
 
     baseline_deleted_ids = sorted(
@@ -751,6 +1203,10 @@ def main():
     )
     write_csv(output_dir / "stage4_ablation_timeline.csv", all_timeline)
     write_csv(output_dir / "stage4_ablation_summary.csv", all_summaries)
+    rescue_rows = build_normal_rescue_rows(
+        admitted_experts, signals, all_timeline
+    )
+    write_csv(output_dir / "stage4_normal_rescue_cases.csv", rescue_rows)
     plot_signal_trajectories(
         output_dir / "stage4_signal_trajectories.png",
         admitted_experts,
@@ -765,10 +1221,20 @@ def main():
         all_timeline,
     )
     plot_comparison(output_dir / "stage4_ablation_comparison.png", all_summaries)
+    plot_normal_rescue_cases(
+        output_dir / "stage4_normal_rescue_cases.png",
+        rescue_rows,
+        signals,
+        all_timeline,
+    )
+    (output_dir / "stage4_ablation_input_manifest.json").write_text(
+        json.dumps(input_manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
     result = {
         "experiment": "Stage 4 lifecycle refresh-signal ablation",
         "device": str(device),
+        "experiment_id": input_manifest["experiment_id"],
         "expert_count": len(admitted_experts),
         "variants": VARIANTS,
         "committee_floors": [0, 1],
@@ -781,6 +1247,8 @@ def main():
             "timing": "expert support and decisions precede current-image ChannelMemory update",
         },
         "baseline_reproduction": reproduction,
+        "input_validation": input_validation,
+        "normal_rescue_cases": rescue_rows,
         "validation_errors": errors,
         "results": all_summaries,
     }
