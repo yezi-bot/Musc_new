@@ -101,6 +101,28 @@ def read_stage1_records(path):
     return records
 
 
+def read_stage2_candidates(path):
+    candidates = []
+    with Path(path).open("r", newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            candidates.append(
+                {
+                    "stream_seed": int(row["stream_seed"]),
+                    "stream_step": int(row["stream_step"]),
+                    "image_id": int(row["image_id"]),
+                    "image_type": row["image_type"],
+                    "ms_score": float(row["ms_score"]),
+                    "channel_support": float(row["channel_support"]),
+                    "ms_threshold": float(row["ms_threshold"]),
+                    "support_threshold": float(row["support_threshold"]),
+                    "is_candidate": row["is_candidate"].lower() == "true",
+                    "expert_admitted": row["expert_admitted"].lower() == "true",
+                    "candidate_index": int(row["candidate_index"]),
+                }
+            )
+    return candidates
+
+
 def run_stage2_candidate_buffer(
     stage1_records,
     output_dir,
@@ -248,7 +270,209 @@ def run_stage2_candidate_buffer(
     (output_dir / "stage2_candidate_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    return summary
+    return summary, candidate_buffer
+
+
+def run_stage3_expert_admission(
+    candidate_buffer,
+    features,
+    output_dir,
+    duplicate_similarity=0.98,
+    committee_cap=5,
+    min_cluster_support=2,
+):
+    """Admit a buffered candidate only after a similar-candidate cluster confirms it."""
+    if not 0.0 <= duplicate_similarity <= 1.0:
+        raise ValueError("duplicate_similarity must be within [0, 1]")
+    if committee_cap < 1:
+        raise ValueError("committee_cap must be at least 1")
+    if min_cluster_support < 2:
+        raise ValueError("min_cluster_support must be at least 2")
+
+    image_embeddings = torch.stack(
+        [feature.float().mean(dim=0) for feature in features]
+    )
+    image_embeddings = torch.nn.functional.normalize(image_embeddings, dim=1)
+    stream_seeds = sorted({row["stream_seed"] for row in candidate_buffer})
+    decisions = []
+    admitted_experts = []
+    per_stream = {}
+    for stream_seed in stream_seeds:
+        clusters = []
+        committee_size = 0
+        stream_rows = sorted(
+            (row for row in candidate_buffer if row["stream_seed"] == stream_seed),
+            key=lambda row: row["stream_step"],
+        )
+        for row in stream_rows:
+            quality = (
+                row["channel_support"] / max(row["support_threshold"], 1e-12)
+                - row["ms_score"] / max(row["ms_threshold"], 1e-12)
+            )
+            gate_passed = bool(
+                row["is_candidate"]
+                and row["ms_score"] <= row["ms_threshold"]
+                and row["channel_support"] >= row["support_threshold"]
+            )
+            max_similarity = None
+            duplicate = False
+            cluster_id = None
+            cluster_size = 0
+            triggered_admission = False
+            admitted_image_id = None
+            if not gate_passed:
+                reason = "gate_failed"
+            else:
+                if clusters:
+                    centroids = torch.stack(
+                        [
+                            torch.nn.functional.normalize(
+                                cluster["embedding_sum"], dim=0
+                            )
+                            for cluster in clusters
+                        ]
+                    )
+                    similarities = centroids @ image_embeddings[row["image_id"]]
+                    max_similarity = float(similarities.max())
+                    if max_similarity >= duplicate_similarity:
+                        cluster_id = int(similarities.argmax())
+                        duplicate = True
+                if cluster_id is None:
+                    cluster_id = len(clusters)
+                    clusters.append(
+                        {
+                            "embedding_sum": torch.zeros_like(
+                                image_embeddings[row["image_id"]]
+                            ),
+                            "members": [],
+                            "expert_admitted": False,
+                        }
+                    )
+                cluster = clusters[cluster_id]
+                member = dict(row)
+                member["candidate_quality"] = quality
+                cluster["members"].append(member)
+                cluster["embedding_sum"] += image_embeddings[row["image_id"]]
+                cluster_size = len(cluster["members"])
+                if cluster["expert_admitted"]:
+                    reason = "reinforce_existing_cluster"
+                elif cluster_size < min_cluster_support:
+                    reason = "pending_cluster_confirmation"
+                elif committee_size >= committee_cap:
+                    reason = "committee_cap"
+                else:
+                    representative = max(
+                        cluster["members"], key=lambda item: item["candidate_quality"]
+                    )
+                    expert = dict(representative)
+                    expert.update(
+                        {
+                            "cluster_id": cluster_id,
+                            "cluster_support_at_admission": cluster_size,
+                            "admission_trigger_step": row["stream_step"],
+                            "expert_index": committee_size,
+                            "expert_admitted": True,
+                        }
+                    )
+                    admitted_experts.append(expert)
+                    cluster["expert_admitted"] = True
+                    committee_size += 1
+                    triggered_admission = True
+                    admitted_image_id = representative["image_id"]
+                    reason = "cluster_confirmed"
+            decision = {
+                **row,
+                "candidate_quality": quality,
+                "gate_passed": gate_passed,
+                "max_cluster_similarity": max_similarity,
+                "duplicate_similarity_threshold": duplicate_similarity,
+                "is_duplicate": duplicate,
+                "cluster_id": cluster_id,
+                "cluster_size_after": cluster_size,
+                "min_cluster_support": min_cluster_support,
+                "committee_cap": committee_cap,
+                "triggered_expert_admission": triggered_admission,
+                "admitted_image_id": admitted_image_id,
+                "expert_admitted": admitted_image_id == row["image_id"],
+                "admission_reason": reason,
+                "committee_size_after": committee_size,
+            }
+            decisions.append(decision)
+        per_stream[str(stream_seed)] = {
+            "candidate_count": len(stream_rows),
+            "cluster_count": len(clusters),
+            "confirmed_cluster_count": sum(
+                cluster["expert_admitted"] for cluster in clusters
+            ),
+            "expert_count": committee_size,
+        }
+
+    normal_experts = [row for row in admitted_experts if row["image_type"] == "good"]
+    anomaly_experts = [row for row in admitted_experts if row["image_type"] != "good"]
+    summary = {
+        "stage": 3,
+        "admission": {
+            "condition": "candidate gate passed, similar-candidate cluster confirmed, committee below cap",
+            "duplicate_similarity": duplicate_similarity,
+            "min_cluster_support": min_cluster_support,
+            "committee_cap": committee_cap,
+            "embedding": "mean of normalized DINO patch features, then L2 normalized",
+            "representative": "highest support-ratio minus MS-ratio within confirmed cluster",
+        },
+        "committee": {
+            "expert_count": len(admitted_experts),
+            "normal_expert_count": len(normal_experts),
+            "anomaly_expert_count": len(anomaly_experts),
+            "normal_precision": (
+                len(normal_experts) / len(admitted_experts) if admitted_experts else None
+            ),
+        },
+        "candidate_states": {
+            "pending_cluster_confirmation": sum(
+                row["admission_reason"] == "pending_cluster_confirmation"
+                for row in decisions
+            ),
+            "reinforce_existing_cluster": sum(
+                row["admission_reason"] == "reinforce_existing_cluster"
+                for row in decisions
+            ),
+            "cluster_confirmed": sum(
+                row["admission_reason"] == "cluster_confirmed" for row in decisions
+            ),
+            "committee_cap": sum(
+                row["admission_reason"] == "committee_cap" for row in decisions
+            ),
+            "gate_failed": sum(row["admission_reason"] == "gate_failed" for row in decisions),
+        },
+        "per_stream": per_stream,
+    }
+
+    fig, axis = plt.subplots(figsize=(8, 5))
+    for stream_seed in stream_seeds:
+        stream_rows = [row for row in decisions if row["stream_seed"] == stream_seed]
+        axis.step(
+            [row["stream_step"] for row in stream_rows],
+            [row["committee_size_after"] for row in stream_rows],
+            where="post",
+            label=f"seed {stream_seed}",
+        )
+    axis.axhline(committee_cap, color="black", linestyle="--", linewidth=1, label="cap")
+    axis.set_xlabel("stream step of candidate")
+    axis.set_ylabel("committee size")
+    axis.set_title("Stage 3: Cluster-confirmed Dynamic Expert admission")
+    axis.grid(alpha=0.25)
+    if stream_seeds:
+        axis.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / "stage3_expert_admission.png", dpi=200)
+    plt.close(fig)
+
+    write_csv(output_dir / "stage3_expert_admission_decisions.csv", decisions)
+    write_csv(output_dir / "stage3_expert_committee.csv", admitted_experts)
+    (output_dir / "stage3_expert_summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return summary, admitted_experts
 
 
 def run_stage1_image_support(
@@ -406,10 +630,14 @@ def main():
     parser.add_argument("--stream-seeds", type=str, default="0,1,2")
     parser.add_argument("--msm-chunk-size", type=int, default=8)
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--stage", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--stage", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--stage1-records", type=str, default=None)
+    parser.add_argument("--stage2-candidates", type=str, default=None)
     parser.add_argument("--candidate-ms-quantile", type=float, default=0.3)
     parser.add_argument("--candidate-support-quantile", type=float, default=0.7)
+    parser.add_argument("--expert-duplicate-similarity", type=float, default=0.98)
+    parser.add_argument("--expert-committee-cap", type=int, default=5)
+    parser.add_argument("--expert-min-cluster-support", type=int, default=2)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -422,7 +650,7 @@ def main():
 
     if args.stage == 2 and args.stage1_records:
         stage1_records = read_stage1_records(args.stage1_records)
-        summary = run_stage2_candidate_buffer(
+        summary, _ = run_stage2_candidate_buffer(
             stage1_records,
             output_dir,
             ms_quantile=args.candidate_ms_quantile,
@@ -456,6 +684,19 @@ def main():
     features = features[: len(samples)]
     if len(features) != len(samples):
         raise RuntimeError("Feature cache contains fewer entries than the selected samples")
+    if args.stage == 3 and args.stage2_candidates:
+        candidate_buffer = read_stage2_candidates(args.stage2_candidates)
+        summary, _ = run_stage3_expert_admission(
+            candidate_buffer,
+            features,
+            output_dir,
+            duplicate_similarity=args.expert_duplicate_similarity,
+            committee_cap=args.expert_committee_cap,
+            min_cluster_support=args.expert_min_cluster_support,
+        )
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return
+
     stream_seeds = tuple(int(value.strip()) for value in args.stream_seeds.split(","))
     stage1_summary, stage1_records = run_stage1_image_support(
         features,
@@ -472,12 +713,23 @@ def main():
     if args.stage == 1:
         summary = stage1_summary
     else:
-        summary = run_stage2_candidate_buffer(
+        stage2_summary, candidate_buffer = run_stage2_candidate_buffer(
             stage1_records,
             output_dir,
             ms_quantile=args.candidate_ms_quantile,
             support_quantile=args.candidate_support_quantile,
         )
+        if args.stage == 2:
+            summary = stage2_summary
+        else:
+            summary, _ = run_stage3_expert_admission(
+                candidate_buffer,
+                features,
+                output_dir,
+                duplicate_similarity=args.expert_duplicate_similarity,
+                committee_cap=args.expert_committee_cap,
+                min_cluster_support=args.expert_min_cluster_support,
+            )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 
 
