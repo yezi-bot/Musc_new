@@ -1,6 +1,7 @@
 """Validate stage 1 image-level Channel support for dynamic EX-MSM."""
 
 import argparse
+import csv
 import json
 import math
 import random
@@ -73,6 +74,181 @@ def summarize(values):
         "q25": float(np.quantile(values, 0.25)),
         "q75": float(np.quantile(values, 0.75)),
     }
+
+
+def read_stage1_records(path):
+    records = []
+    with Path(path).open("r", newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            records.append(
+                {
+                    "stream_seed": int(row["stream_seed"]),
+                    "stream_step": int(row["stream_step"]),
+                    "image_id": int(row["image_id"]),
+                    "image_type": row["image_type"],
+                    "method": row["method"],
+                    "reliable_mature_channels": int(row["reliable_mature_channels"]),
+                    "online_threshold": (
+                        float(row["online_threshold"]) if row["online_threshold"] else None
+                    ),
+                    "channel_support": (
+                        float(row["channel_support"]) if row["channel_support"] else None
+                    ),
+                    "ms_score": float(row["ms_score"]) if row["ms_score"] else None,
+                    "ms_score_source": row["ms_score_source"],
+                }
+            )
+    return records
+
+
+def run_stage2_candidate_buffer(
+    stage1_records,
+    output_dir,
+    ms_quantile=0.3,
+    support_quantile=0.7,
+    support_method="local",
+):
+    """Gate images into a buffer without admitting any image as an expert."""
+    if not 0.0 <= ms_quantile <= 1.0:
+        raise ValueError("ms_quantile must be within [0, 1]")
+    if not 0.0 <= support_quantile <= 1.0:
+        raise ValueError("support_quantile must be within [0, 1]")
+
+    selected = [row for row in stage1_records if row["method"] == support_method]
+    stream_seeds = sorted({row["stream_seed"] for row in selected})
+    decisions = []
+    candidate_buffer = []
+    per_stream = {}
+    for stream_seed in stream_seeds:
+        stream_rows = sorted(
+            (row for row in selected if row["stream_seed"] == stream_seed),
+            key=lambda row: row["stream_step"],
+        )
+        ms_history = []
+        support_history = []
+        stream_candidates = 0
+        for row in stream_rows:
+            ms_threshold = (
+                float(np.quantile(ms_history, ms_quantile)) if ms_history else None
+            )
+            support_threshold = (
+                float(np.quantile(support_history, support_quantile))
+                if support_history
+                else None
+            )
+            ms_score = row["ms_score"]
+            channel_support = row["channel_support"]
+            is_candidate = bool(
+                ms_score is not None
+                and channel_support is not None
+                and ms_threshold is not None
+                and support_threshold is not None
+                and ms_score <= ms_threshold
+                and channel_support >= support_threshold
+            )
+            decision = {
+                "stream_seed": stream_seed,
+                "stream_step": row["stream_step"],
+                "image_id": row["image_id"],
+                "image_type": row["image_type"],
+                "ms_score": ms_score,
+                "channel_support": channel_support,
+                "ms_threshold": ms_threshold,
+                "support_threshold": support_threshold,
+                "is_candidate": is_candidate,
+                "expert_admitted": False,
+            }
+            decisions.append(decision)
+            if is_candidate:
+                candidate = dict(decision)
+                candidate["candidate_index"] = stream_candidates
+                candidate_buffer.append(candidate)
+                stream_candidates += 1
+            if ms_score is not None and np.isfinite(ms_score):
+                ms_history.append(ms_score)
+            if channel_support is not None and np.isfinite(channel_support):
+                support_history.append(channel_support)
+        per_stream[str(stream_seed)] = {
+            "image_count": len(stream_rows),
+            "candidate_count": stream_candidates,
+        }
+
+    normal_candidates = [row for row in candidate_buffer if row["image_type"] == "good"]
+    anomaly_candidates = [row for row in candidate_buffer if row["image_type"] != "good"]
+    eligible_normal = [
+        row
+        for row in decisions
+        if row["image_type"] == "good"
+        and row["ms_threshold"] is not None
+        and row["support_threshold"] is not None
+    ]
+    summary = {
+        "stage": 2,
+        "gate": {
+            "condition": "ms_score <= historical q_ms and channel_support >= historical q_support",
+            "ms_quantile": ms_quantile,
+            "support_quantile": support_quantile,
+            "support_method": support_method,
+            "threshold_source": "strictly prior values within each stream",
+        },
+        "candidate_buffer": {
+            "candidate_count": len(candidate_buffer),
+            "normal_candidate_count": len(normal_candidates),
+            "anomaly_candidate_count": len(anomaly_candidates),
+            "normal_precision": (
+                len(normal_candidates) / len(candidate_buffer) if candidate_buffer else None
+            ),
+            "eligible_normal_capture_rate": (
+                len(normal_candidates) / len(eligible_normal) if eligible_normal else None
+            ),
+        },
+        "expert_admission": {
+            "enabled": False,
+            "expert_count": 0,
+        },
+        "per_stream": per_stream,
+    }
+
+    fig, axis = plt.subplots(figsize=(7, 5))
+    available = [
+        row
+        for row in decisions
+        if row["ms_score"] is not None and row["channel_support"] is not None
+    ]
+    rejected = [row for row in available if not row["is_candidate"]]
+    candidates = [row for row in available if row["is_candidate"]]
+    if rejected:
+        axis.scatter(
+            [row["ms_score"] for row in rejected],
+            [row["channel_support"] for row in rejected],
+            s=18,
+            alpha=0.45,
+            label="not selected",
+        )
+    if candidates:
+        axis.scatter(
+            [row["ms_score"] for row in candidates],
+            [row["channel_support"] for row in candidates],
+            s=32,
+            alpha=0.85,
+            label="Candidate Buffer",
+        )
+    axis.set_xlabel("online DINO MSM score")
+    axis.set_ylabel(f"{support_method} Channel support")
+    axis.set_title("Stage 2: Candidate Expert gate")
+    axis.grid(alpha=0.25)
+    if available:
+        axis.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / "stage2_candidate_gate.png", dpi=200)
+    plt.close(fig)
+
+    write_csv(output_dir / "stage2_candidate_decisions.csv", decisions)
+    write_csv(output_dir / "stage2_candidate_buffer.csv", candidate_buffer)
+    (output_dir / "stage2_candidate_summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return summary
 
 
 def run_stage1_image_support(
@@ -212,7 +388,7 @@ def run_stage1_image_support(
     (output_dir / "stage1_online_image_support_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    return summary
+    return summary, records
 
 
 def main():
@@ -230,6 +406,10 @@ def main():
     parser.add_argument("--stream-seeds", type=str, default="0,1,2")
     parser.add_argument("--msm-chunk-size", type=int, default=8)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--stage", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--stage1-records", type=str, default=None)
+    parser.add_argument("--candidate-ms-quantile", type=float, default=0.3)
+    parser.add_argument("--candidate-support-quantile", type=float, default=0.7)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -239,6 +419,17 @@ def main():
         raise RuntimeError("No bottle test images found")
     if args.max_samples is not None:
         samples = samples[: args.max_samples]
+
+    if args.stage == 2 and args.stage1_records:
+        stage1_records = read_stage1_records(args.stage1_records)
+        summary = run_stage2_candidate_buffer(
+            stage1_records,
+            output_dir,
+            ms_quantile=args.candidate_ms_quantile,
+            support_quantile=args.candidate_support_quantile,
+        )
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     features_cache = (
@@ -266,7 +457,7 @@ def main():
     if len(features) != len(samples):
         raise RuntimeError("Feature cache contains fewer entries than the selected samples")
     stream_seeds = tuple(int(value.strip()) for value in args.stream_seeds.split(","))
-    summary = run_stage1_image_support(
+    stage1_summary, stage1_records = run_stage1_image_support(
         features,
         samples,
         device,
@@ -278,6 +469,15 @@ def main():
         stream_seeds=stream_seeds,
         msm_chunk_size=args.msm_chunk_size,
     )
+    if args.stage == 1:
+        summary = stage1_summary
+    else:
+        summary = run_stage2_candidate_buffer(
+            stage1_records,
+            output_dir,
+            ms_quantile=args.candidate_ms_quantile,
+            support_quantile=args.candidate_support_quantile,
+        )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 
 
