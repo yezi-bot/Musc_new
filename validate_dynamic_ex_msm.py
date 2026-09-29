@@ -123,6 +123,27 @@ def read_stage2_candidates(path):
     return candidates
 
 
+def read_stage3_experts(path):
+    experts = []
+    with Path(path).open("r", newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            experts.append(
+                {
+                    "stream_seed": int(row["stream_seed"]),
+                    "image_id": int(row["image_id"]),
+                    "image_type": row["image_type"],
+                    "admission_trigger_step": int(row["admission_trigger_step"]),
+                    "expert_index": int(row["expert_index"]),
+                    "cluster_id": int(row["cluster_id"]),
+                    "cluster_support_at_admission": int(
+                        row["cluster_support_at_admission"]
+                    ),
+                    "cluster_max_support_gap": int(row["cluster_max_support_gap"]),
+                }
+            )
+    return experts
+
+
 def run_stage2_candidate_buffer(
     stage1_records,
     output_dir,
@@ -364,11 +385,19 @@ def run_stage3_expert_admission(
                     representative = max(
                         cluster["members"], key=lambda item: item["candidate_quality"]
                     )
+                    member_steps = sorted(
+                        member["stream_step"] for member in cluster["members"]
+                    )
+                    max_support_gap = max(
+                        later - earlier
+                        for earlier, later in zip(member_steps, member_steps[1:])
+                    )
                     expert = dict(representative)
                     expert.update(
                         {
                             "cluster_id": cluster_id,
                             "cluster_support_at_admission": cluster_size,
+                            "cluster_max_support_gap": max_support_gap,
                             "admission_trigger_step": row["stream_step"],
                             "expert_index": committee_size,
                             "expert_admitted": True,
@@ -473,6 +502,232 @@ def run_stage3_expert_admission(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     return summary, admitted_experts
+
+
+def run_stage4_expert_lifecycle(
+    stage1_records,
+    admitted_experts,
+    features,
+    output_dir,
+    support_similarity=0.98,
+    base_ttl=5,
+    max_ttl=20,
+    ttl_gap_multiplier=2.0,
+    min_committee_size=1,
+):
+    """Delete experts after an adaptive number of consecutive unsupported images."""
+    if not 0.0 <= support_similarity <= 1.0:
+        raise ValueError("support_similarity must be within [0, 1]")
+    if base_ttl < 1:
+        raise ValueError("base_ttl must be at least 1")
+    if max_ttl < base_ttl:
+        raise ValueError("max_ttl must be greater than or equal to base_ttl")
+    if ttl_gap_multiplier < 1.0:
+        raise ValueError("ttl_gap_multiplier must be at least 1")
+    if min_committee_size < 0:
+        raise ValueError("min_committee_size must be non-negative")
+
+    def patience_from_gap(max_support_gap):
+        return min(
+            max_ttl,
+            max(base_ttl, int(math.ceil(max_support_gap * ttl_gap_multiplier))),
+        )
+
+    image_embeddings = torch.stack(
+        [feature.float().mean(dim=0) for feature in features]
+    )
+    image_embeddings = torch.nn.functional.normalize(image_embeddings, dim=1)
+    local_records = [row for row in stage1_records if row["method"] == "local"]
+    stream_seeds = sorted({row["stream_seed"] for row in local_records})
+    events = []
+    deletions = []
+    final_experts = []
+    per_stream = {}
+    committee_timeline = {}
+    for stream_seed in stream_seeds:
+        stream_rows = sorted(
+            (row for row in local_records if row["stream_seed"] == stream_seed),
+            key=lambda row: row["stream_step"],
+        )
+        scheduled = {}
+        for expert in admitted_experts:
+            if expert["stream_seed"] == stream_seed:
+                scheduled.setdefault(expert["admission_trigger_step"], []).append(expert)
+        active = []
+        timeline = []
+        for row in stream_rows:
+            stream_step = row["stream_step"]
+            current_embedding = image_embeddings[row["image_id"]]
+            survivors = []
+            deletion_slots = max(0, len(active) - min_committee_size)
+            ordered_active = sorted(
+                active,
+                key=lambda state: (
+                    state["last_supported_step"],
+                    state["support_count"],
+                ),
+            )
+            for state in ordered_active:
+                similarity = float(
+                    image_embeddings[state["image_id"]] @ current_embedding
+                )
+                supported = similarity >= support_similarity
+                state["age"] += 1
+                if supported:
+                    support_gap = stream_step - state["last_supported_step"]
+                    state["max_support_gap"] = max(
+                        state["max_support_gap"], support_gap
+                    )
+                    state["patience"] = patience_from_gap(state["max_support_gap"])
+                    state["ttl"] = state["patience"]
+                    state["last_supported_step"] = stream_step
+                    state["support_count"] += 1
+                    event = "supported"
+                else:
+                    state["ttl"] -= 1
+                    event = "ttl_decrement"
+                expired = state["ttl"] <= 0
+                deleted = expired and deletion_slots > 0
+                if deleted:
+                    event = "deleted"
+                    deletion_slots -= 1
+                elif expired:
+                    state["ttl"] = 0
+                    event = "retained_minimum"
+                event_row = {
+                    "stream_seed": stream_seed,
+                    "stream_step": stream_step,
+                    "current_image_id": row["image_id"],
+                    "expert_index": state["expert_index"],
+                    "expert_image_id": state["image_id"],
+                    "expert_image_type": state["image_type"],
+                    "support_similarity": similarity,
+                    "support_threshold": support_similarity,
+                    "supported": supported,
+                    "age": state["age"],
+                    "ttl": state["ttl"],
+                    "patience": state["patience"],
+                    "max_support_gap": state["max_support_gap"],
+                    "last_supported_step": state["last_supported_step"],
+                    "support_count": state["support_count"],
+                    "event": event,
+                }
+                events.append(event_row)
+                if deleted:
+                    deletion = dict(event_row)
+                    deletion["lifetime"] = state["age"]
+                    deletions.append(deletion)
+                else:
+                    survivors.append(state)
+            active = survivors
+
+            for expert in scheduled.get(stream_step, []):
+                initial_gap = expert["cluster_max_support_gap"]
+                initial_patience = patience_from_gap(initial_gap)
+                state = {
+                    **expert,
+                    "age": 0,
+                    "ttl": initial_patience,
+                    "patience": initial_patience,
+                    "max_support_gap": initial_gap,
+                    "last_supported_step": stream_step,
+                    "support_count": expert["cluster_support_at_admission"],
+                }
+                active.append(state)
+                events.append(
+                    {
+                        "stream_seed": stream_seed,
+                        "stream_step": stream_step,
+                        "current_image_id": row["image_id"],
+                        "expert_index": state["expert_index"],
+                        "expert_image_id": state["image_id"],
+                        "expert_image_type": state["image_type"],
+                        "support_similarity": None,
+                        "support_threshold": support_similarity,
+                        "supported": True,
+                        "age": 0,
+                        "ttl": initial_patience,
+                        "patience": initial_patience,
+                        "max_support_gap": initial_gap,
+                        "last_supported_step": stream_step,
+                        "support_count": state["support_count"],
+                        "event": "admitted",
+                    }
+                )
+            timeline.append((stream_step, len(active)))
+
+        for state in active:
+            final_experts.append(
+                {
+                    **state,
+                    "final_stream_step": stream_rows[-1]["stream_step"],
+                }
+            )
+        committee_timeline[stream_seed] = timeline
+        admitted_count = sum(
+            expert["stream_seed"] == stream_seed for expert in admitted_experts
+        )
+        deleted_count = sum(row["stream_seed"] == stream_seed for row in deletions)
+        per_stream[str(stream_seed)] = {
+            "admitted_count": admitted_count,
+            "deleted_count": deleted_count,
+            "surviving_count": len(active),
+        }
+
+    normal_final = [row for row in final_experts if row["image_type"] == "good"]
+    anomaly_final = [row for row in final_experts if row["image_type"] != "good"]
+    summary = {
+        "stage": 4,
+        "lifecycle": {
+            "support_similarity": support_similarity,
+            "base_ttl": base_ttl,
+            "max_ttl": max_ttl,
+            "ttl_gap_multiplier": ttl_gap_multiplier,
+            "min_committee_size": min_committee_size,
+            "patience": "clip(ceil(observed maximum support gap * multiplier), base_ttl, max_ttl)",
+            "delete_condition": "adaptive TTL reaches zero and deletion preserves the minimum committee size",
+        },
+        "experts": {
+            "admitted_count": len(admitted_experts),
+            "deleted_count": len(deletions),
+            "surviving_count": len(final_experts),
+            "normal_surviving_count": len(normal_final),
+            "anomaly_surviving_count": len(anomaly_final),
+            "surviving_normal_precision": (
+                len(normal_final) / len(final_experts) if final_experts else None
+            ),
+            "retained_minimum_events": sum(
+                row["event"] == "retained_minimum" for row in events
+            ),
+        },
+        "per_stream": per_stream,
+    }
+
+    fig, axis = plt.subplots(figsize=(9, 5))
+    for stream_seed, timeline in committee_timeline.items():
+        axis.step(
+            [item[0] for item in timeline],
+            [item[1] for item in timeline],
+            where="post",
+            label=f"seed {stream_seed}",
+        )
+    axis.set_xlabel("stream step")
+    axis.set_ylabel("active expert count")
+    axis.set_title("Stage 4: Expert lifecycle")
+    axis.grid(alpha=0.25)
+    if committee_timeline:
+        axis.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / "stage4_expert_lifecycle.png", dpi=200)
+    plt.close(fig)
+
+    write_csv(output_dir / "stage4_expert_lifecycle_events.csv", events)
+    write_csv(output_dir / "stage4_expert_deletions.csv", deletions)
+    write_csv(output_dir / "stage4_final_committee.csv", final_experts)
+    (output_dir / "stage4_expert_lifecycle_summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return summary, events, final_experts
 
 
 def run_stage1_image_support(
@@ -630,14 +885,20 @@ def main():
     parser.add_argument("--stream-seeds", type=str, default="0,1,2")
     parser.add_argument("--msm-chunk-size", type=int, default=8)
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--stage", type=int, choices=(1, 2, 3), default=1)
+    parser.add_argument("--stage", type=int, choices=(1, 2, 3, 4), default=1)
     parser.add_argument("--stage1-records", type=str, default=None)
     parser.add_argument("--stage2-candidates", type=str, default=None)
+    parser.add_argument("--stage3-experts", type=str, default=None)
     parser.add_argument("--candidate-ms-quantile", type=float, default=0.3)
     parser.add_argument("--candidate-support-quantile", type=float, default=0.7)
     parser.add_argument("--expert-duplicate-similarity", type=float, default=0.98)
     parser.add_argument("--expert-committee-cap", type=int, default=5)
     parser.add_argument("--expert-min-cluster-support", type=int, default=2)
+    parser.add_argument("--expert-support-similarity", type=float, default=0.98)
+    parser.add_argument("--expert-base-ttl", type=int, default=5)
+    parser.add_argument("--expert-max-ttl", type=int, default=20)
+    parser.add_argument("--expert-ttl-gap-multiplier", type=float, default=2.0)
+    parser.add_argument("--expert-min-committee-size", type=int, default=1)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -696,6 +957,22 @@ def main():
         )
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return
+    if args.stage == 4 and args.stage1_records and args.stage3_experts:
+        stage1_records = read_stage1_records(args.stage1_records)
+        admitted_experts = read_stage3_experts(args.stage3_experts)
+        summary, _, _ = run_stage4_expert_lifecycle(
+            stage1_records,
+            admitted_experts,
+            features,
+            output_dir,
+            support_similarity=args.expert_support_similarity,
+            base_ttl=args.expert_base_ttl,
+            max_ttl=args.expert_max_ttl,
+            ttl_gap_multiplier=args.expert_ttl_gap_multiplier,
+            min_committee_size=args.expert_min_committee_size,
+        )
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return
 
     stream_seeds = tuple(int(value.strip()) for value in args.stream_seeds.split(","))
     stage1_summary, stage1_records = run_stage1_image_support(
@@ -722,7 +999,7 @@ def main():
         if args.stage == 2:
             summary = stage2_summary
         else:
-            summary, _ = run_stage3_expert_admission(
+            stage3_summary, admitted_experts = run_stage3_expert_admission(
                 candidate_buffer,
                 features,
                 output_dir,
@@ -730,6 +1007,20 @@ def main():
                 committee_cap=args.expert_committee_cap,
                 min_cluster_support=args.expert_min_cluster_support,
             )
+            if args.stage == 3:
+                summary = stage3_summary
+            else:
+                summary, _, _ = run_stage4_expert_lifecycle(
+                    stage1_records,
+                    admitted_experts,
+                    features,
+                    output_dir,
+                    support_similarity=args.expert_support_similarity,
+                    base_ttl=args.expert_base_ttl,
+                    max_ttl=args.expert_max_ttl,
+                    ttl_gap_multiplier=args.expert_ttl_gap_multiplier,
+                    min_committee_size=args.expert_min_committee_size,
+                )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 
 
