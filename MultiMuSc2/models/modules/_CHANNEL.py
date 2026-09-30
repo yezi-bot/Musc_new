@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 
 class Channel:
     def __init__(self, feature,image_id,patch_id,ttl,reliability):
@@ -171,7 +170,7 @@ class ChannelMemory:
                   grid_size,
                  )[patch_id].clone()
                 local_valid[patch_id]=False
-                finite =current_distance(local_valid)
+                finite =current_distance[local_valid]
                 if finite.numel() == 0:
                  raise RuntimeError(
                  f"patch {patch_id} has no valid local neighbour "
