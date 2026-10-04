@@ -1,5 +1,3 @@
-from multiprocessing import Value
-from sympy.plotting.experimental_lambdify import experimental_lambdify
 import math
 import numpy as np
 import torch
@@ -72,7 +70,7 @@ class DynamicExpertManager:
         return[
             {
                 "expert_id":expert["expert_id"],
-                "iamge_id":expert["iamge_id"],
+                "image_id":expert["image_id"],
             }
             for expert in self.active_experts
         ]
