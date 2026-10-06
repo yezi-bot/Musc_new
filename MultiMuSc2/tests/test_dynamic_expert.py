@@ -93,6 +93,13 @@ class DynamicExpertManagerTest(unittest.TestCase):
         )
         self.assertEqual(manager.fuser_training_image_ids(1), [30])
         self.assertEqual(manager.fuser_training_image_ids(2), [30, 31])
+        self.assertEqual(
+            manager.fuser_training_members(2),
+            [
+                {"step": 0, "image_id": 30, "cluster_id": 0},
+                {"step": 1, "image_id": 31, "cluster_id": 0},
+            ],
+        )
 
 
 if __name__ == "__main__":

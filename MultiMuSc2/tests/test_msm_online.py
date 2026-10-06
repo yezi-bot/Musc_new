@@ -6,7 +6,9 @@ import torch
 from MultiMuSc2.models.modules._MSM import (
     MSM2_online,
     aggregate_reference_distances,
+    build_causal_fuser_training_data,
     compute_scores_fast,
+    fit_causal_detect_fuser,
     safe_topmin_counts,
 )
 
@@ -19,6 +21,10 @@ class ConstantFuser:
     def score_samples(self, samples):
         self.last_samples = samples
         return np.full(samples.shape[0], self.value, dtype=np.float32)
+
+    def fit(self, samples):
+        self.last_samples = samples
+        return self
 
 
 class OnlineMSMTest(unittest.TestCase):
@@ -110,6 +116,86 @@ class OnlineMSMTest(unittest.TestCase):
 
         self.assertEqual(patch_score.shape, (2,))
         self.assertIsNone(audit["clip_distance"])
+
+    def test_causal_training_is_leave_one_image_out(self):
+        dino = torch.tensor(
+            [
+                [[0.0, 0.0], [0.0, 1.0]],
+                [[2.0, 0.0], [4.0, 0.0]],
+            ]
+        )
+        clip = dino * 2.0
+        training = build_causal_fuser_training_data(
+            dino,
+            clip,
+            image_ids=[10, 11],
+            member_steps=[2, 4],
+            current_step=5,
+        )
+
+        self.assertTrue(training["available"])
+        self.assertEqual(training["train_pairs"].shape, (4, 2))
+        self.assertTrue((training["train_pairs"][:, 0] > 0).all())
+        self.assertTrue((training["train_pairs"][:, 1] > 0).all())
+        self.assertGreater(training["dino_scale"], 0.0)
+        self.assertGreater(training["clip_scale"], 0.0)
+
+    def test_causal_training_rejects_current_or_future_members(self):
+        features = torch.zeros(2, 2, 2)
+        with self.assertRaisesRegex(ValueError, "strictly historical"):
+            build_causal_fuser_training_data(
+                features,
+                features,
+                image_ids=[10, 11],
+                member_steps=[2, 5],
+                current_step=5,
+            )
+
+    def test_fuser_fit_reports_insufficient_and_degenerate_history(self):
+        fuser = ConstantFuser(1.0)
+        one_image = torch.ones(1, 2, 2)
+        insufficient = fit_causal_detect_fuser(
+            fuser,
+            one_image,
+            one_image,
+            image_ids=[10],
+            member_steps=[1],
+            current_step=2,
+        )
+        identical = torch.ones(2, 2, 2)
+        degenerate = fit_causal_detect_fuser(
+            fuser,
+            identical,
+            identical,
+            image_ids=[10, 11],
+            member_steps=[1, 2],
+            current_step=3,
+        )
+
+        self.assertEqual(insufficient["reason"], "insufficient_history")
+        self.assertFalse(insufficient["fitted"])
+        self.assertEqual(degenerate["reason"], "degenerate_training_data")
+        self.assertFalse(degenerate["fitted"])
+
+    def test_fuser_fit_uses_aligned_causal_pairs(self):
+        fuser = ConstantFuser(1.0)
+        dino = torch.tensor(
+            [
+                [[0.0, 0.0], [0.0, 1.0]],
+                [[2.0, 0.0], [4.0, 0.0]],
+            ]
+        )
+        result = fit_causal_detect_fuser(
+            fuser,
+            dino,
+            dino * 2.0,
+            image_ids=[10, 11],
+            member_steps=[1, 2],
+            current_step=3,
+        )
+
+        self.assertTrue(result["fitted"])
+        np.testing.assert_allclose(fuser.last_samples, result["train_pairs"].numpy())
 
 
 if __name__ == "__main__":

@@ -80,7 +80,7 @@ class DynamicExpertManager:
     def active_expert_before_step(self):
         return self.active_experts_before_step()
 
-    def fuser_training_image_ids(self, step):
+    def fuser_training_members(self, step):
         members = []
         active_cluster_ids = {
             expert["cluster_id"]
@@ -91,16 +91,30 @@ class DynamicExpertManager:
             for member in self.clusters[cluster_id]["members"]:
                 if member["step"] < step:
                     members.append(
-                        (member["step"], member["image_id"])
+                        {
+                            "step": member["step"],
+                            "image_id": member["image_id"],
+                            "cluster_id": cluster_id,
+                        }
                     )
 
-        image_ids = []
+        historical_members = []
         seen = set()
-        for _, image_id in sorted(members):
+        for member in sorted(
+            members,
+            key=lambda item: (item["step"], item["image_id"]),
+        ):
+            image_id = member["image_id"]
             if image_id not in seen:
                 seen.add(image_id)
-                image_ids.append(image_id)
-        return image_ids
+                historical_members.append(member)
+        return historical_members
+
+    def fuser_training_image_ids(self, step):
+        return [
+            member["image_id"]
+            for member in self.fuser_training_members(step)
+        ]
 
 # 根据相似候选出现间隔计算专家 TTL，限制在max和min之间
     def _patience_from_gap(self,support_gap):

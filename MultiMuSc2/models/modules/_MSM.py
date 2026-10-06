@@ -178,6 +178,131 @@ def MSM2_online(
     return patch_score, audit
 
 
+def build_causal_fuser_training_data(
+    training_dino,
+    training_clip,
+    image_ids,
+    member_steps,
+    current_step,
+    dino_weight=1.0,
+    clip_weight=0.5,
+    topmin_min=0,
+    topmin_max=0.3,
+):
+    member_count = len(image_ids)
+    if training_dino.ndim != 3 or training_clip.ndim != 3:
+        raise ValueError("training features must have shape [image, patch, feature]")
+    if not (
+        training_dino.shape[0]
+        == training_clip.shape[0]
+        == member_count
+        == len(member_steps)
+    ):
+        raise ValueError("DINO, CLIP, image IDs, and member steps must be aligned")
+    if len(set(image_ids)) != member_count:
+        raise ValueError("fuser training image IDs must be unique")
+    if any(step >= current_step for step in member_steps):
+        raise ValueError("fuser training members must be strictly historical")
+    if member_count < 2:
+        return {
+            "available": False,
+            "reason": "insufficient_history",
+            "image_ids": list(image_ids),
+            "train_pairs": None,
+            "dino_scale": None,
+            "clip_scale": None,
+        }
+
+    dino_distances = []
+    clip_distances = []
+    for index in range(member_count):
+        reference_indices = [
+            reference_index
+            for reference_index in range(member_count)
+            if reference_index != index
+        ]
+        dino_distance = aggregate_reference_distances(
+            training_dino[index],
+            training_dino[reference_indices],
+            topmin_min,
+            topmin_max,
+        )
+        clip_distance = aggregate_reference_distances(
+            training_clip[index],
+            training_clip[reference_indices],
+            topmin_min,
+            topmin_max,
+        ).to(dino_distance.device)
+        if dino_distance.shape != clip_distance.shape:
+            raise ValueError("DINO and CLIP training patch counts must match")
+        dino_distances.append(dino_distance)
+        clip_distances.append(clip_distance)
+
+    dino_history = torch.cat(dino_distances)
+    clip_history = torch.cat(clip_distances)
+    train_pairs = torch.stack(
+        [dino_weight * dino_history, clip_weight * clip_history],
+        dim=1,
+    )
+    if not torch.isfinite(train_pairs).all():
+        raise ValueError("fuser training distances contain non-finite values")
+
+    return {
+        "available": True,
+        "reason": None,
+        "image_ids": list(image_ids),
+        "train_pairs": train_pairs,
+        "dino_scale": float(torch.quantile(dino_history.float(), 0.5)),
+        "clip_scale": float(torch.quantile(clip_history.float(), 0.5)),
+    }
+
+
+def fit_causal_detect_fuser(
+    detect_fuser,
+    training_dino,
+    training_clip,
+    image_ids,
+    member_steps,
+    current_step,
+    dino_weight=1.0,
+    clip_weight=0.5,
+    topmin_min=0,
+    topmin_max=0.3,
+):
+    training = build_causal_fuser_training_data(
+        training_dino,
+        training_clip,
+        image_ids,
+        member_steps,
+        current_step,
+        dino_weight,
+        clip_weight,
+        topmin_min,
+        topmin_max,
+    )
+    if not training["available"]:
+        training["fitted"] = False
+        return training
+
+    train_pairs = training["train_pairs"]
+    if torch.unique(train_pairs, dim=0).shape[0] < 2:
+        training["available"] = False
+        training["fitted"] = False
+        training["reason"] = "degenerate_training_data"
+        return training
+
+    try:
+        detect_fuser.fit(train_pairs.detach().cpu().numpy())
+    except Exception as error:
+        training["available"] = False
+        training["fitted"] = False
+        training["reason"] = f"fit_failed:{type(error).__name__}"
+        return training
+
+    training["fitted"] = True
+    return training
+
+
 def compute_scores_fast(Z, i, device, topmin_min=0, topmin_max=0.3):
     # speed fast but space large
     # compute anomaly scores
