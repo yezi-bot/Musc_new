@@ -11,16 +11,33 @@ from ._MSM import (
     aggregate_reference_distances,
     build_causal_fuser_training_data,
     fit_causal_detect_fuser,
+    interval_average,
 )
 
 
-def _image_msm_score(current, historical_features):
+def _image_msm_score(current, historical_features, reference_chunk_size=8):
     if not historical_features:
         return None
-    references = torch.stack(historical_features).to(current.device)
-    patch_scores = aggregate_reference_distances(
-        current,
-        references,
+    if reference_chunk_size < 1:
+        raise ValueError("reference_chunk_size must be at least 1")
+
+    patch_count, feature_dim = current.shape
+    patch_to_image = []
+    for start in range(0, len(historical_features), reference_chunk_size):
+        references = torch.stack(
+            historical_features[start : start + reference_chunk_size]
+        ).to(current.device)
+        distances = torch.cdist(
+            current.unsqueeze(0),
+            references.reshape(-1, feature_dim),
+        ).reshape(
+            patch_count,
+            references.shape[0],
+            patch_count,
+        )
+        patch_to_image.append(distances.amin(dim=-1))
+    patch_scores = interval_average(
+        torch.cat(patch_to_image, dim=1),
         topmin_min=0,
         topmin_max=0.3,
     )
@@ -128,6 +145,7 @@ def build_dynamic_committee_timeline(
                 "expert_channel_supports": expert_supports,
                 "admitted_expert_id": event["admitted_expert_id"],
                 "deleted_expert_ids": event["deleted_expert_ids"],
+                "active_experts_after": manager.active_experts_before_step(),
                 "active_expert_ids_after": event["active_expert_ids_after_step"],
                 "channel_count_after": len(memory.channels),
                 "mature_channel_count_after": len(memory.mature_channels()),

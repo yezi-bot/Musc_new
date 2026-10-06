@@ -3,9 +3,11 @@ import unittest
 import torch
 
 from MultiMuSc2.models.modules._DYNAMIC_PIPELINE import (
+    _image_msm_score,
     build_dynamic_committee_timeline,
     score_dynamic_msm2_layer,
 )
+from MultiMuSc2.models.modules._MSM import aggregate_reference_distances
 
 
 def synthetic_features(image_count=5):
@@ -56,6 +58,24 @@ def scoring_timeline(image_count=4):
 
 
 class DynamicPipelineTest(unittest.TestCase):
+    def test_chunked_online_msm_matches_unchunked_result(self):
+        features = synthetic_features(6)
+        expected = float(
+            aggregate_reference_distances(
+                features[-1],
+                features[:-1],
+                topmin_min=0,
+                topmin_max=0.3,
+            ).max()
+        )
+        actual = _image_msm_score(
+            features[-1],
+            [feature for feature in features[:-1]],
+            reference_chunk_size=2,
+        )
+
+        self.assertAlmostEqual(actual, expected, places=6)
+
     def test_timeline_snapshots_are_strictly_pre_update(self):
         timeline = build_dynamic_committee_timeline(
             synthetic_features(),

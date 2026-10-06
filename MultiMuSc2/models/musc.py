@@ -50,6 +50,10 @@ class MuSc():
         self.vis = cfg['testing']['vis']
         self.vis_type = cfg['testing']['vis_type']
         self.save_excel = cfg['testing']['save_excel']
+        self.max_samples = cfg['testing'].get('max_samples')
+        if self.max_samples is not None and int(self.max_samples) < 2:
+            raise ValueError('testing.max_samples must be at least 2')
+        self.shuffle_stream = bool(cfg['testing'].get('shuffle_stream', False))
         # the categories to be tested
         self.categories = cfg['datasets']['class_name']
         if isinstance(self.categories, str):
@@ -128,6 +132,19 @@ class MuSc():
             test_dataset = btad.BTADDataset(source=self.path, split=btad.DatasetSplit.TEST,
                                             classname=category, resize=self.image_size, imagesize=self.image_size, clip_transformer=self.preprocess,
                                                 divide_num=divide_num, divide_iter=divide_iter, random_seed=self.seed)
+        if self.max_samples is not None and self.max_samples < len(test_dataset):
+            indices = torch.linspace(
+                0,
+                len(test_dataset) - 1,
+                steps=int(self.max_samples),
+            ).round().long().unique(sorted=True).tolist()
+            test_dataset = torch.utils.data.Subset(test_dataset, indices)
+        if self.shuffle_stream:
+            generator = torch.Generator().manual_seed(self.seed + divide_iter)
+            indices = torch.randperm(
+                len(test_dataset), generator=generator
+            ).tolist()
+            test_dataset = torch.utils.data.Subset(test_dataset, indices)
         return test_dataset
 
     # def visualization_seg(self, image_path_list, gt_list, pr_px, category):
@@ -315,53 +332,62 @@ class MuSc():
                     Z_layers0[str(self.committee_layer_index)],
                     dim=0,
                 ).to(self.device)
-                dynamic_timeline = build_dynamic_committee_timeline(
-                    committee_features,
-                    device=self.device,
-                    position_radius=int(
-                        self.dynamic_committee_cfg.get('position_radius', 1)
-                    ),
-                    channel_distance_quantile=float(
-                        self.dynamic_committee_cfg.get(
-                            'channel_distance_quantile', 0.7
+                timeline_path = self.dynamic_committee_cfg.get('timeline_path')
+                if timeline_path:
+                    with open(timeline_path, 'r', encoding='utf-8') as handle:
+                        dynamic_timeline = json.load(handle)
+                    if len(dynamic_timeline) != committee_features.shape[0]:
+                        raise ValueError(
+                            'loaded dynamic timeline does not match image count'
                         )
-                    ),
-                    reliability_alpha=float(
-                        self.dynamic_committee_cfg.get('reliability_alpha', 0.5)
-                    ),
-                    manager_kwargs={
-                        'ms_quantile': float(
-                            self.dynamic_committee_cfg.get('ms_quantile', 0.3)
+                else:
+                    dynamic_timeline = build_dynamic_committee_timeline(
+                        committee_features,
+                        device=self.device,
+                        position_radius=int(
+                            self.dynamic_committee_cfg.get('position_radius', 1)
                         ),
-                        'support_quantile': float(
-                            self.dynamic_committee_cfg.get('support_quantile', 0.7)
-                        ),
-                        'duplicate_similarity': float(
+                        channel_distance_quantile=float(
                             self.dynamic_committee_cfg.get(
-                                'duplicate_similarity', 0.98
+                                'channel_distance_quantile', 0.7
                             )
                         ),
-                        'min_cluster_support': int(
-                            self.dynamic_committee_cfg.get(
-                                'min_cluster_support', 2
-                            )
+                        reliability_alpha=float(
+                            self.dynamic_committee_cfg.get('reliability_alpha', 0.5)
                         ),
-                        'committee_cap': int(
-                            self.dynamic_committee_cfg.get('committee_cap', 5)
-                        ),
-                        'base_ttl': int(
-                            self.dynamic_committee_cfg.get('base_ttl', 5)
-                        ),
-                        'max_ttl': int(
-                            self.dynamic_committee_cfg.get('max_ttl', 20)
-                        ),
-                        'ttl_gap_multiplier': float(
-                            self.dynamic_committee_cfg.get(
-                                'ttl_gap_multiplier', 2.0
-                            )
-                        ),
-                    },
-                )
+                        manager_kwargs={
+                            'ms_quantile': float(
+                                self.dynamic_committee_cfg.get('ms_quantile', 0.3)
+                            ),
+                            'support_quantile': float(
+                                self.dynamic_committee_cfg.get('support_quantile', 0.7)
+                            ),
+                            'duplicate_similarity': float(
+                                self.dynamic_committee_cfg.get(
+                                    'duplicate_similarity', 0.98
+                                )
+                            ),
+                            'min_cluster_support': int(
+                                self.dynamic_committee_cfg.get(
+                                    'min_cluster_support', 2
+                                )
+                            ),
+                            'committee_cap': int(
+                                self.dynamic_committee_cfg.get('committee_cap', 5)
+                            ),
+                            'base_ttl': int(
+                                self.dynamic_committee_cfg.get('base_ttl', 5)
+                            ),
+                            'max_ttl': int(
+                                self.dynamic_committee_cfg.get('max_ttl', 20)
+                            ),
+                            'ttl_gap_multiplier': float(
+                                self.dynamic_committee_cfg.get(
+                                    'ttl_gap_multiplier', 2.0
+                                )
+                            ),
+                        },
+                    )
                 lowest_indices = None
             else:
                 anomaly_maps_l0 = torch.tensor([]).double()
