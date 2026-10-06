@@ -9,6 +9,175 @@ We provide two implementations of the MSM module.
 The above commented out function provides faster speeds, but because more tensors are loaded onto the GPU at once, the memory consumption is higher.
 By default, our program uses the following function, which is slower but consumes less GPU memory.
 """
+
+
+def safe_topmin_counts(reference_count, topmin_min=0, topmin_max=0.3):
+    if reference_count < 1:
+        raise ValueError("at least one reference image is required")
+
+    k_max = (
+        int(reference_count * topmin_max)
+        if topmin_max < 1
+        else int(topmin_max)
+    )
+    k_min = (
+        int(reference_count * topmin_min)
+        if topmin_min < 1
+        else int(topmin_min)
+    )
+    k_max = max(1, min(reference_count, k_max))
+    k_min = min(max(0, k_min), k_max - 1)
+    return k_min, k_max, max(1, k_max - k_min)
+
+
+def interval_average(distances, topmin_min=0, topmin_max=0.3):
+    if distances.ndim != 2:
+        raise ValueError("distances must have shape [patch_count, reference_count]")
+
+    k_min, k_max, keep = safe_topmin_counts(
+        distances.shape[1],
+        topmin_min,
+        topmin_max,
+    )
+    values = torch.topk(
+        distances.float(),
+        k_max,
+        largest=False,
+        sorted=True,
+    ).values
+    values = torch.topk(
+        values,
+        keep,
+        largest=True,
+        sorted=True,
+    ).values
+    return values.mean(dim=1)
+
+
+def aggregate_reference_distances(
+    query,
+    references,
+    topmin_min=0,
+    topmin_max=0.3,
+):
+    if query.ndim != 2:
+        raise ValueError("query must have shape [patch_count, feature_dim]")
+    if references.ndim != 3:
+        raise ValueError(
+            "references must have shape [reference_count, patch_count, feature_dim]"
+        )
+    if references.shape[0] < 1:
+        raise ValueError("at least one reference image is required")
+    if query.shape[1] != references.shape[2]:
+        raise ValueError("query and references must have the same feature dimension")
+
+    patch_count = query.shape[0]
+    reference_count, reference_patch_count, feature_dim = references.shape
+    distances = torch.cdist(
+        query.unsqueeze(0),
+        references.reshape(-1, feature_dim),
+    ).reshape(
+        patch_count,
+        reference_count,
+        reference_patch_count,
+    )
+    nearest_patch = distances.min(dim=-1).values
+    return interval_average(nearest_patch, topmin_min, topmin_max)
+
+
+def MSM2_online(
+    current_dino,
+    current_clip,
+    expert_dino,
+    expert_clip,
+    detect_fuser=None,
+    fusion_mode="fuser",
+    dino_scale=None,
+    clip_scale=None,
+    dino_weight=1.0,
+    clip_weight=0.5,
+    epsilon=1e-6,
+    topmin_min=0,
+    topmin_max=0.3,
+):
+    dino_distance = aggregate_reference_distances(
+        current_dino,
+        expert_dino,
+        topmin_min,
+        topmin_max,
+    )
+    if fusion_mode == "dino_only":
+        return dino_distance, {
+            "fusion_mode": fusion_mode,
+            "reference_count": int(expert_dino.shape[0]),
+            "dino_distance": dino_distance,
+            "clip_distance": None,
+            "fuser_score": None,
+        }
+
+    if current_clip is None or expert_clip is None:
+        raise ValueError(f"{fusion_mode} fusion requires CLIP features")
+    if expert_dino.shape[0] != expert_clip.shape[0]:
+        raise ValueError("DINO and CLIP expert counts must match")
+
+    clip_distance = aggregate_reference_distances(
+        current_clip,
+        expert_clip,
+        topmin_min,
+        topmin_max,
+    ).to(dino_distance.device)
+
+    if dino_distance.shape != clip_distance.shape:
+        raise ValueError("DINO and CLIP patch counts must match")
+
+    fuser_score = None
+    if fusion_mode == "fixed":
+        if dino_scale is None or clip_scale is None:
+            raise ValueError("fixed fusion requires historical DINO and CLIP scales")
+        dino_scale = max(float(dino_scale), epsilon)
+        clip_scale = max(float(clip_scale), epsilon)
+        weight_sum = dino_weight + clip_weight
+        if weight_sum <= 0:
+            raise ValueError("fusion weights must have a positive sum")
+        patch_score = (
+            dino_weight * dino_distance / dino_scale
+            + clip_weight * clip_distance / clip_scale
+        ) / weight_sum
+    elif fusion_mode == "fuser":
+        if detect_fuser is None:
+            raise ValueError("fuser fusion requires a fitted detect_fuser")
+        distance_pairs = torch.stack(
+            [dino_weight * dino_distance, clip_weight * clip_distance],
+            dim=1,
+        )
+        fuser_values = detect_fuser.score_samples(
+            distance_pairs.detach().cpu().numpy()
+        )
+        fuser_score = torch.as_tensor(
+            fuser_values,
+            device=dino_distance.device,
+            dtype=dino_distance.dtype,
+        )
+        patch_score = fuser_score * dino_distance * clip_distance
+    else:
+        raise ValueError(f"unsupported fusion_mode: {fusion_mode}")
+
+    audit = {
+        "fusion_mode": fusion_mode,
+        "reference_count": int(expert_dino.shape[0]),
+        "dino_distance": dino_distance,
+        "clip_distance": clip_distance,
+        "fuser_score": fuser_score,
+    }
+    if fuser_score is not None:
+        audit["fuser_min"] = float(fuser_score.min())
+        audit["fuser_max"] = float(fuser_score.max())
+        audit["fuser_mean"] = float(fuser_score.mean())
+        audit["fuser_positive_ratio"] = float((fuser_score > 0).float().mean())
+        audit["fuser_negative_ratio"] = float((fuser_score < 0).float().mean())
+    return patch_score, audit
+
+
 def compute_scores_fast(Z, i, device, topmin_min=0, topmin_max=0.3):
     # speed fast but space large
     # compute anomaly scores
@@ -21,21 +190,7 @@ def compute_scores_fast(Z, i, device, topmin_min=0, topmin_max=0.3):
     #求最小值，沿着最后一维（参照patch）
     patch2image = torch.min(patch2image, -1)[0]#[1369,11]
 
-    # interval average1
-    k_max = topmin_max
-    k_min = topmin_min
-    # 转化成整数
-    if k_max < 1:
-        k_max = int(patch2image.shape[1]*k_max)
-    if k_min < 1:
-        k_min = int(patch2image.shape[1]*k_min)
-    if k_max < k_min:
-        k_max, k_min = k_min, k_max
-    # 去掉最小的里面最小的剩下平均    
-    vals, _ = torch.topk(patch2image.float(), k_max, largest=False, sorted=True)
-    vals, _ = torch.topk(vals.float(), k_max-k_min, largest=True, sorted=True)
-    patch2image = vals.clone()
-    return torch.mean(patch2image, dim=1)
+    return interval_average(patch2image, topmin_min, topmin_max)
 
 def compute_scores_fast2(Z,Z11,Z2,Z22, i, device,detect_fuser, topmin_min=0, topmin_max=0.3):
     # speed fast but space large
@@ -51,34 +206,17 @@ def compute_scores_fast2(Z,Z11,Z2,Z22, i, device,detect_fuser, topmin_min=0, top
     patch2image2 = torch.cdist(Z2[i:i+1], Z22.reshape(-1, c)).reshape(patch_num, -1, patch_num)
     patch2image2 = torch.min(patch2image2, -1)[0]#[1369,11]
 
-    # # interval average1
-    k_max = topmin_max
-    k_min = topmin_min
-    if k_max < 1:
-        k_max = int(patch2image.shape[1]*k_max)
-    if k_min < 1:
-        k_min = int(patch2image.shape[1]*k_min)
-    if k_max < k_min:
-        k_max, k_min = k_min, k_max
-    vals, _ = torch.topk(patch2image.float(), k_max, largest=False, sorted=True)
-    vals, _ = torch.topk(vals.float(), k_max-k_min, largest=True, sorted=True)
-    patch2image = vals.clone()
-    patch2image11 = torch.mean(patch2image, dim=1)  # [1369]
+    patch2image11 = interval_average(
+        patch2image,
+        topmin_min,
+        topmin_max,
+    )
     patch2image = patch2image11.unsqueeze(0)
-    # interval average2
-    k_max = topmin_max
-    k_min = topmin_min
-    if k_max < 1:
-        k_max = int(patch2image2.shape[1]*k_max)
-    if k_min < 1:
-        k_min = int(patch2image2.shape[1]*k_min)
-    if k_max < k_min:
-        k_max, k_min = k_min, k_max
-    vals2, _ = torch.topk(patch2image2.float(), k_max, largest=False, sorted=True)
-    vals2, _ = torch.topk(vals2.float(), k_max-k_min, largest=True, sorted=True)
-
-    patch2image2 = vals2.clone()
-    patch2image22 = torch.mean(patch2image2, dim=1)  #[1369]
+    patch2image22 = interval_average(
+        patch2image2,
+        topmin_min,
+        topmin_max,
+    )
     patch2image2 =patch2image22.unsqueeze(0)
     s_map = torch.cat([1.0 * patch2image, 0.5 * patch2image2], dim=0).T
     s_map = s_map.cpu()
@@ -97,19 +235,7 @@ def compute_scores_slow(Z, i, device, topmin_min=0, topmin_max=0.3):
     for j in range(Z.shape[0]):
         if j != i:
             patch2image = torch.cat((patch2image, torch.min(torch.cdist(Z[i], Z[j]), 1)[0].unsqueeze(1)), dim=1)
-    # interval average
-    k_max = topmin_max
-    k_min = topmin_min
-    if k_max < 1:
-        k_max = int(patch2image.shape[1]*k_max)
-    if k_min < 1:
-        k_min = int(patch2image.shape[1]*k_min)
-    if k_max < k_min:
-        k_max, k_min = k_min, k_max
-    vals, _ = torch.topk(patch2image.float(), k_max, largest=False, sorted=True)
-    vals, _ = torch.topk(vals.float(), k_max-k_min, largest=True, sorted=True)
-    patch2image = vals.clone()
-    return torch.mean(patch2image, dim=1)
+    return interval_average(patch2image, topmin_min, topmin_max)
     
 def compute_scores_slow2(Z,Z11,Z2,Z22, i, device,detect_fuser, topmin_min=0, topmin_max=0.3):
     # space small but speed slow
@@ -120,34 +246,17 @@ def compute_scores_slow2(Z,Z11,Z2,Z22, i, device,detect_fuser, topmin_min=0, top
             patch2image = torch.cat((patch2image, torch.min(torch.cdist(Z[i], Z11[j]), 1)[0].unsqueeze(1)), dim=1)
     for j2 in range(Z22.shape[0]):
             patch2image2 = torch.cat((patch2image2, torch.min(torch.cdist(Z2[i], Z22[j]), 1)[0].unsqueeze(1)), dim=1)
-    # # interval average1
-    k_max = topmin_max
-    k_min = topmin_min
-    if k_max < 1:
-        k_max = int(patch2image.shape[1]*k_max)
-    if k_min < 1:
-        k_min = int(patch2image.shape[1]*k_min)
-    if k_max < k_min:
-        k_max, k_min = k_min, k_max
-    vals, _ = torch.topk(patch2image.float(), k_max, largest=False, sorted=True)
-    vals, _ = torch.topk(vals.float(), k_max-k_min, largest=True, sorted=True)
-    patch2image = vals.clone()
-    patch2image11 = torch.mean(patch2image, dim=1)  # [1369]
+    patch2image11 = interval_average(
+        patch2image,
+        topmin_min,
+        topmin_max,
+    )
     patch2image = patch2image11.unsqueeze(0)
-    # interval average2
-    k_max = topmin_max
-    k_min = topmin_min
-    if k_max < 1:
-        k_max = int(patch2image2.shape[1]*k_max)
-    if k_min < 1:
-        k_min = int(patch2image2.shape[1]*k_min)
-    if k_max < k_min:
-        k_max, k_min = k_min, k_max
-    vals2, _ = torch.topk(patch2image2.float(), k_max, largest=False, sorted=True)
-    vals2, _ = torch.topk(vals2.float(), k_max-k_min, largest=True, sorted=True)
-
-    patch2image2 = vals2.clone()
-    patch2image22 = torch.mean(patch2image2, dim=1)  #[1369]
+    patch2image22 = interval_average(
+        patch2image2,
+        topmin_min,
+        topmin_max,
+    )
     patch2image2 =patch2image22.unsqueeze(0)
     s_map = torch.cat([1.0 * patch2image, 0.5 * patch2image2], dim=0).T
     s_map = s_map.cpu()
@@ -180,4 +289,3 @@ if __name__ == "__main__":
     MSM(Z, device)
     e_time = time.time()
     print((e_time-s_time)*1000)
-    
