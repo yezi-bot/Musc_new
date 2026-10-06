@@ -1,4 +1,5 @@
 from sympy import print_gtk
+import json
 import os
 import sys
 import numpy as np
@@ -22,6 +23,10 @@ from models.modules._LNAMD import LNAMD
 from models.modules._MSM import MSM,MSM2
 from models.modules._RsCIN import RsCIN
 from models.modules._CHANNEL import Channel, ChannelMemory
+from models.modules._DYNAMIC_PIPELINE import (
+    build_dynamic_committee_timeline,
+    score_dynamic_msm2_layer,
+)
 # from models.modules._CHANNEL import _CHANNEL
 from utils.metrics import compute_metrics
 from openpyxl import Workbook
@@ -62,10 +67,29 @@ class MuSc():
         self.model_name2 = cfg['models']['backbone_name2']
         self.image_size = cfg['datasets']['img_resize']
         self.batch_size = cfg['models']['batch_size']
-        self.use_dynamic_model = cfg['models']['use_dynamic_model']
+        self.dynamic_committee_cfg = cfg['models'].get('dynamic_committee', {})
+        self.dynamic_fusion_cfg = cfg['models'].get('dynamic_fusion', {})
+        self.use_dynamic_model = self.dynamic_committee_cfg.get(
+            'enabled', cfg['models'].get('use_dynamic_model', False)
+        )
         self.debug_channel_analysis=cfg['models']['debug_channel_analysis']
         self.pretrained = cfg['models']['pretrained']
-        self.features_list = [l+1 for l in cfg['models']['feature_layers']]
+        self.feature_layers = cfg['models']['feature_layers']
+        self.features_list = [l+1 for l in self.feature_layers]
+        self.committee_r = int(self.dynamic_committee_cfg.get('r', 1))
+        self.committee_layer = int(
+            self.dynamic_committee_cfg.get('dino_layer', 23)
+        )
+        if self.use_dynamic_model and self.committee_layer not in self.feature_layers:
+            raise ValueError(
+                f"dynamic committee DINO layer {self.committee_layer} "
+                "is absent from feature_layers"
+            )
+        self.committee_layer_index = (
+            self.feature_layers.index(self.committee_layer)
+            if self.use_dynamic_model
+            else None
+        )
         self.divide_num = cfg['datasets']['divide_num']
         self.r_list = cfg['models']['r_list']
         self.r_list2 = cfg['models']['r_list2']
@@ -260,7 +284,8 @@ class MuSc():
             # LNAMD（固定r和layer聚合特征）
             feature_dim0 = patch_tokens_list1[0][0].shape[-1]   # 第0个batch第0层拿出最后一维：局部向量多长
             anomaly_maps_r0 = torch.tensor([]).double() 
-            for r in [1]: 
+            screening_r = self.committee_r if self.use_dynamic_model else 1
+            for r in [screening_r]:
                 print('aggregation degree: {}'.format(r))
                 #固定r
                 LNAMD_r0 = LNAMD(device=self.device, r=r, feature_dim=feature_dim0, feature_layer=self.features_list)
@@ -284,56 +309,111 @@ class MuSc():
                             print("feature",Z_layers0[str(l)][0].shape)
 
                 end_time = time.time()
-                
-                # MSM
+
+            if self.use_dynamic_model:
+                committee_features = torch.cat(
+                    Z_layers0[str(self.committee_layer_index)],
+                    dim=0,
+                ).to(self.device)
+                dynamic_timeline = build_dynamic_committee_timeline(
+                    committee_features,
+                    device=self.device,
+                    position_radius=int(
+                        self.dynamic_committee_cfg.get('position_radius', 1)
+                    ),
+                    channel_distance_quantile=float(
+                        self.dynamic_committee_cfg.get(
+                            'channel_distance_quantile', 0.7
+                        )
+                    ),
+                    reliability_alpha=float(
+                        self.dynamic_committee_cfg.get('reliability_alpha', 0.5)
+                    ),
+                    manager_kwargs={
+                        'ms_quantile': float(
+                            self.dynamic_committee_cfg.get('ms_quantile', 0.3)
+                        ),
+                        'support_quantile': float(
+                            self.dynamic_committee_cfg.get('support_quantile', 0.7)
+                        ),
+                        'duplicate_similarity': float(
+                            self.dynamic_committee_cfg.get(
+                                'duplicate_similarity', 0.98
+                            )
+                        ),
+                        'min_cluster_support': int(
+                            self.dynamic_committee_cfg.get(
+                                'min_cluster_support', 2
+                            )
+                        ),
+                        'committee_cap': int(
+                            self.dynamic_committee_cfg.get('committee_cap', 5)
+                        ),
+                        'base_ttl': int(
+                            self.dynamic_committee_cfg.get('base_ttl', 5)
+                        ),
+                        'max_ttl': int(
+                            self.dynamic_committee_cfg.get('max_ttl', 20)
+                        ),
+                        'ttl_gap_multiplier': float(
+                            self.dynamic_committee_cfg.get(
+                                'ttl_gap_multiplier', 2.0
+                            )
+                        ),
+                    },
+                )
+                lowest_indices = None
+            else:
                 anomaly_maps_l0 = torch.tensor([]).double()
                 start_time = time.time()
-                #l = '3'
                 for l in Z_layers0.keys():
-                    # different layers
-                    Z0 = torch.cat(Z_layers0[l], dim=0).to(self.device)  # 第 l 层列表里所有 batch 沿第 0 维拼接(N, L, C)
+                    Z0 = torch.cat(Z_layers0[l], dim=0).to(self.device)
                     print('layer-{} mutual scoring...'.format(l))
-                    anomaly_maps_msm0 = MSM(Z=Z0, device=self.device, topmin_min=0, topmin_max=0.3)
-                    anomaly_maps_l0 = torch.cat((anomaly_maps_l0, anomaly_maps_msm0.unsqueeze(0).cpu()), dim=0)#沿着0拼接
+                    anomaly_maps_msm0 = MSM(
+                        Z=Z0,
+                        device=self.device,
+                        topmin_min=0,
+                        topmin_max=0.3,
+                    )
+                    anomaly_maps_l0 = torch.cat(
+                        (anomaly_maps_l0, anomaly_maps_msm0.unsqueeze(0).cpu()),
+                        dim=0,
+                    )
                     torch.cuda.empty_cache()
-                
-                # 跨层数在第0层求平均
-                anomaly_maps_l0 = torch.mean(anomaly_maps_l0, 0)   
-                # 存到 r 累加器
-                anomaly_maps_r0 = torch.cat((anomaly_maps_r0, anomaly_maps_l0.unsqueeze(0)), dim=0)
-            # 对轮数r平均    
-            anomaly_maps_iter0 = torch.mean(anomaly_maps_r0, 0).to(self.device)
-            del anomaly_maps_r0
-            torch.cuda.empty_cache()
-
-            # interpolate
-            # 【N,L】
-            B0, L0 = anomaly_maps_iter0.shape
-            H0 = int(np.sqrt(L0))
-            # 变成原尺寸
-            anomaly_maps_iter0 = F.interpolate(anomaly_maps_iter0.view(B0, 1, H0, H0),
-                                              size=self.image_size, mode='bilinear', align_corners=True)
-            anomaly_maps0 = torch.cat((anomaly_maps0, anomaly_maps_iter0.cpu()), dim=0)
-            # 初步异常图转成numpy
-            anomaly_maps0 = anomaly_maps0.cpu().numpy()
-            torch.cuda.empty_cache()
-
-            B0 = anomaly_maps0.shape[0]  # the number of unlabeled test images
-            ac_score0 = np.array(anomaly_maps0).reshape(B0, -1).max(-1)
-            #按比例不同取数目不同
-            if len(ac_score0) <= 50:
-                num_indices  = int(0.25 * len(ac_score0))
-            elif 50 < len(ac_score0) <= 100:
-                num_indices = int(0.20 * len(ac_score0))
-            else:
-                num_indices = int(0.15 * len(ac_score0))
-
-            #sorted_indices得到排序后的索引，lowest_indices取前num_indices个索引
-            sorted_indices = np.argsort(ac_score0)
-            lowest_indices = sorted_indices[:num_indices]
+                anomaly_maps_l0 = torch.mean(anomaly_maps_l0, 0)
+                anomaly_maps_r0 = torch.cat(
+                    (anomaly_maps_r0, anomaly_maps_l0.unsqueeze(0)), dim=0
+                )
+                anomaly_maps_iter0 = torch.mean(anomaly_maps_r0, 0).to(self.device)
+                del anomaly_maps_r0
+                torch.cuda.empty_cache()
+                B0, L0 = anomaly_maps_iter0.shape
+                H0 = int(np.sqrt(L0))
+                anomaly_maps_iter0 = F.interpolate(
+                    anomaly_maps_iter0.view(B0, 1, H0, H0),
+                    size=self.image_size,
+                    mode='bilinear',
+                    align_corners=True,
+                )
+                anomaly_maps0 = torch.cat(
+                    (anomaly_maps0, anomaly_maps_iter0.cpu()), dim=0
+                )
+                anomaly_maps0 = anomaly_maps0.cpu().numpy()
+                torch.cuda.empty_cache()
+                B0 = anomaly_maps0.shape[0]
+                ac_score0 = np.array(anomaly_maps0).reshape(B0, -1).max(-1)
+                if len(ac_score0) <= 50:
+                    num_indices = int(0.25 * len(ac_score0))
+                elif 50 < len(ac_score0) <= 100:
+                    num_indices = int(0.20 * len(ac_score0))
+                else:
+                    num_indices = int(0.15 * len(ac_score0))
+                sorted_indices = np.argsort(ac_score0)
+                lowest_indices = sorted_indices[:num_indices]
 
             #real test
             anomaly_maps_r = torch.tensor([]).double()
+            dynamic_score_audits = []
             # LNAMD1
             feature_dim1 = patch_tokens_list1[0][0].shape[-1]
             for r in self.r_list:
@@ -371,95 +451,68 @@ class MuSc():
 
                 # MSM
                 anomaly_maps_l = torch.tensor([]).double()
-                contamination_history = []
                 start_time = time.time()
-                channel_memory = ChannelMemory(max_ttl=5)
                 for l in Z_layers2.keys():
-                    # different layers
-                    #当前特征层的局部特征
                     Z1 = torch.cat(Z_layers1[l], dim=0).to(self.device) # (N, L, C)
-                    if int(l)==3 and self.use_dynamic_model:
-                        for image_id in range(Z1.shape[0]):
-                            current_features = Z1[image_id]
-                            if image_id == 0 :
-                               channel_memory.initialize(features=current_features, image_id=image_id)
-                               print("initial channel",len(channel_memory.channels))
-                            else:
-                                density_score=channel_memory.compute_knn_density( k=5, span_threshold=3)
-                               
-                            
-                            # 统计成熟的channel
-                            channel_memory.update(features=current_features, image_id=image_id)
-                            mature_channels,mature_density = channel_memory.compute_knn_density(k=5, span_threshold=3)
-                            print("update channel",len(channel_memory.channels))
-                           
-
-                            normal_patch_seeded = 0
-                            anomaly_patch_seeded = 0
-                            if self.debug_channel_analysis :
-                             for channel in mature_channels:
-                                 seed_image_id = channel.image_id[0]
-                                 seed_patch_id = channel.patch_id[0]
-                                 # 计算anomoly_seed是否真的来自异常区域，GTmask
-                                 row = seed_patch_id // 37
-                                 col = seed_patch_id % 37
-                                 mask = img_masks[seed_image_id].squeeze().float()
-                                 mask_37 = torch.nn.functional.interpolate(
-                                  mask.unsqueeze(0).unsqueeze(0),
-                                        size=(37, 37),
-                                        mode="nearest" ).squeeze()
-                                 if mask_37[row, col] > 0:
-                                   anomaly_patch_seeded += 1
-                                 else:
-                                   normal_patch_seeded += 1  
-                             contamination_ratio = (
-                              anomaly_patch_seeded / len(mature_channels)
-                              if len(mature_channels) > 0
-                              else 0.0)  
-                             contamination_history.append(contamination_ratio)     
-                             print("========== Mature Channel Statistics ==========")
-                             print("total mature channels:", len(mature_channels))
-                             print("normal-seeded channels:", normal_patch_seeded)
-                             print("anomaly-seeded channels:", anomaly_patch_seeded)
-                             print("contamination ratio:", contamination_ratio)
-                             if self.debug_channel_analysis:
-                                plt.figure()
-                                plt.plot(
-                                    range(len(contamination_history)),
-                                    contamination_history )
-                                plt.xlabel("Image index")
-                                plt.ylabel("Mature channel contamination ratio")
-                                plt.title(f"{category} - Channel contamination")
-                                save_path = os.path.join(self.output_dir,
-                                 f"{category}_r{r}_channel_contamination.png")
-                                plt.savefig(save_path, dpi=300, bbox_inches="tight")
-                                plt.close()
-
-                    #从 Z1 中取出“可信正常图片”的 DINO 局部特征
-                    Z11 = Z1[lowest_indices]
-
                     Z2 = torch.cat(Z_layers2[l], dim=0).to(self.device)  # (N, L, C)
-                    Z22 = Z2[lowest_indices]
-            
-
-                    train_samples = []
-                    image_num, patch_num, c = Z11.shape
-                    for x in range(Z11.shape[0]):
-                        train_sample1 = torch.cdist(Z11[x:x + 1], Z11.reshape(-1, c)).reshape(patch_num, -1, patch_num)
-                        train_sample1 = torch.min(train_sample1, -1)[0]
-                        train_sample1 = torch.flatten(train_sample1)
-                        train_sample1 = train_sample1.unsqueeze(0)
-                        train_sample2 = torch.cdist(Z22[x:x + 1], Z22.reshape(-1, c)).reshape(patch_num, -1, patch_num)
-                        train_sample2 = torch.min(train_sample2, -1)[0]
-                        train_sample2 = torch.flatten(train_sample2)
-                        train_sample2 = train_sample2.unsqueeze(0)
-                        train_sample = torch.cat((train_sample1, train_sample2*0.5), dim=0).T
-                        train_samples.append(train_sample)
-                    train_data = torch.cat(train_samples, dim=0)
-                    train_data = train_data.cpu()
-                    self.detect_fuser.fit(train_data)
-                    print('layer-{} mutual scoring...'.format(l))
-                    anomaly_maps_msm = MSM2(Z=Z1,Z11=Z11,Z2=Z2,Z22=Z22,detect_fuser=self.detect_fuser, device=self.device, topmin_min=0.02, topmin_max=0.3)
+                    if self.use_dynamic_model:
+                        anomaly_maps_msm, layer_audits = score_dynamic_msm2_layer(
+                            Z1,
+                            Z2,
+                            dynamic_timeline,
+                            fusion_mode=self.dynamic_fusion_cfg.get(
+                                'mode', 'fuser'
+                            ),
+                            dino_weight=float(
+                                self.dynamic_fusion_cfg.get('dino_weight', 1.0)
+                            ),
+                            clip_weight=float(
+                                self.dynamic_fusion_cfg.get('clip_weight', 0.5)
+                            ),
+                            epsilon=float(
+                                self.dynamic_fusion_cfg.get('epsilon', 1.0e-6)
+                            ),
+                            topmin_min=0.02,
+                            topmin_max=0.3,
+                        )
+                        for audit in layer_audits:
+                            audit['aggregation_r'] = r
+                            audit['layer_index'] = int(l)
+                            audit['dino_layer'] = self.feature_layers[int(l)]
+                        dynamic_score_audits.extend(layer_audits)
+                    else:
+                        Z11 = Z1[lowest_indices]
+                        Z22 = Z2[lowest_indices]
+                        train_samples = []
+                        image_num, patch_num, c = Z11.shape
+                        for x in range(Z11.shape[0]):
+                            train_sample1 = torch.cdist(
+                                Z11[x:x + 1], Z11.reshape(-1, c)
+                            ).reshape(patch_num, -1, patch_num)
+                            train_sample1 = torch.min(train_sample1, -1)[0]
+                            train_sample1 = torch.flatten(train_sample1).unsqueeze(0)
+                            train_sample2 = torch.cdist(
+                                Z22[x:x + 1], Z22.reshape(-1, c)
+                            ).reshape(patch_num, -1, patch_num)
+                            train_sample2 = torch.min(train_sample2, -1)[0]
+                            train_sample2 = torch.flatten(train_sample2).unsqueeze(0)
+                            train_sample = torch.cat(
+                                (train_sample1, train_sample2 * 0.5), dim=0
+                            ).T
+                            train_samples.append(train_sample)
+                        train_data = torch.cat(train_samples, dim=0).cpu()
+                        self.detect_fuser.fit(train_data)
+                        print('layer-{} mutual scoring...'.format(l))
+                        anomaly_maps_msm = MSM2(
+                            Z=Z1,
+                            Z11=Z11,
+                            Z2=Z2,
+                            Z22=Z22,
+                            detect_fuser=self.detect_fuser,
+                            device=self.device,
+                            topmin_min=0.02,
+                            topmin_max=0.3,
+                        )
                     anomaly_maps_l = torch.cat((anomaly_maps_l, anomaly_maps_msm.unsqueeze(0).cpu()), dim=0)
                     torch.cuda.empty_cache()
                 
@@ -470,6 +523,32 @@ class MuSc():
             anomaly_maps_iter = torch.mean(anomaly_maps_r, 0).to(self.device)
             del anomaly_maps_r
             torch.cuda.empty_cache()
+
+            if self.use_dynamic_model:
+                audit_path = os.path.join(
+                    self.output_dir,
+                    f'{category}_dynamic_audit_seed{self.seed}_part{divide_iter}.json',
+                )
+                with open(audit_path, 'w', encoding='utf-8') as handle:
+                    json.dump(
+                        {
+                            'committee_settings': {
+                                'r': self.committee_r,
+                                'dino_layer': self.committee_layer,
+                                'position_radius': int(
+                                    self.dynamic_committee_cfg.get(
+                                        'position_radius', 1
+                                    )
+                                ),
+                            },
+                            'fusion_settings': self.dynamic_fusion_cfg,
+                            'timeline': dynamic_timeline,
+                            'scoring': dynamic_score_audits,
+                        },
+                        handle,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
 
             # interpolate
             B, L = anomaly_maps_iter.shape
