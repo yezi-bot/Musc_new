@@ -66,14 +66,41 @@ class DynamicExpertManager:
       self.next_expert_id = 0
       self.last_step = -1
 
-    def active_expert_before_step(self):
+    def active_experts_before_step(self):
         return[
             {
                 "expert_id":expert["expert_id"],
                 "image_id":expert["image_id"],
+                "cluster_id":expert["cluster_id"],
+                "admission_step":expert["admission_step"],
             }
             for expert in self.active_experts
         ]
+
+    def active_expert_before_step(self):
+        return self.active_experts_before_step()
+
+    def fuser_training_image_ids(self, step):
+        members = []
+        active_cluster_ids = {
+            expert["cluster_id"]
+            for expert in self.active_experts
+        }
+
+        for cluster_id in active_cluster_ids:
+            for member in self.clusters[cluster_id]["members"]:
+                if member["step"] < step:
+                    members.append(
+                        (member["step"], member["image_id"])
+                    )
+
+        image_ids = []
+        seen = set()
+        for _, image_id in sorted(members):
+            if image_id not in seen:
+                seen.add(image_id)
+                image_ids.append(image_id)
+        return image_ids
 
 # 根据相似候选出现间隔计算专家 TTL，限制在max和min之间
     def _patience_from_gap(self,support_gap):
@@ -231,6 +258,15 @@ class DynamicExpertManager:
                 expert["deletion_step"] = step
                 expert["last_event"] = "deleted"
 
+                cluster = self.clusters[
+                    expert["cluster_id"]
+                ]
+                if (
+                    cluster["active_expert_id"]
+                    == expert_id
+                ):
+                    cluster["active_expert_id"] = None
+
                 self.retired_experts.append(expert)
                 deleted_expert_ids.append(expert_id)
             else:
@@ -310,7 +346,7 @@ class DynamicExpertManager:
                     "embedding_sum":
                         torch.zeros_like(embedding),
                     "members": [],
-                    "expert_admitted": False,
+                    "active_expert_id": None,
                 }
             )
 
@@ -333,7 +369,7 @@ class DynamicExpertManager:
         # 更新 cluster 中心
         cluster["embedding_sum"] += embedding
         # cluster能否进入专家
-        if cluster["expert_admitted"]:
+        if cluster["active_expert_id"] is not None:
             return True, cluster_id, None
 
         # 两张图片支持
@@ -344,7 +380,7 @@ class DynamicExpertManager:
             return True, cluster_id, None
 
         if (
-            self.admitted_count
+            len(self.active_experts)
             >= self.committee_cap
         ):
             return True, cluster_id, None
@@ -378,7 +414,7 @@ class DynamicExpertManager:
             "image_id":
                 representative["image_id"],
             "cluster_id": cluster_id,
-            "admission_trigger_step": step,
+            "admission_step": step,
             "cluster_support_at_admission":
                 len(cluster["members"]),
             "max_support_gap": max_support_gap,
@@ -392,7 +428,7 @@ class DynamicExpertManager:
             "last_channel_support": None,
         }
 
-        cluster["expert_admitted"] = True
+        cluster["active_expert_id"] = self.next_expert_id
         self.active_experts.append(expert)
 
         self.admitted_count += 1
