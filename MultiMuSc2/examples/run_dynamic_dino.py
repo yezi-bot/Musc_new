@@ -343,7 +343,7 @@ def run_seed(
     )
     gt_px = np.stack(available_masks)
     pr_px = np.stack(available_maps)
-
+# 计算image/pixel指标
     image_metric, pixel_metric = compute_metrics(
         gt_sp=gt_sp,
         pr_sp=pr_sp,
@@ -396,7 +396,7 @@ def run_seed(
     )
     return result
 
-
+# 入口
 def main():
     args = parse_args()
     config_path = Path(args.config).resolve()
@@ -405,7 +405,7 @@ def main():
         encoding="utf-8",
     ) as handle:
         cfg = yaml.safe_load(handle)
-
+# dino-only
     if (
         cfg["models"]["dynamic_fusion"]["mode"]
         != "dino_only"
@@ -413,6 +413,7 @@ def main():
         raise ValueError(
             "run_dynamic_dino.py only accepts dino_only mode"
         )
+        # 禁止RsCIN
     if cfg["testing"].get("use_rscin", False):
         raise ValueError(
             "strict online mode does not allow RsCIN"

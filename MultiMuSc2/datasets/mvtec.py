@@ -1,7 +1,7 @@
 import os
 from enum import Enum
 # 读图
-import PIL
+from PIL import Image
 import torch
 from torchvision import transforms
 import random
@@ -53,22 +53,20 @@ class MVTecDataset(torch.utils.data.Dataset):
                 indices = torch.randint(0, len(self.data_to_iterate), (k_shot,))
                 self.data_to_iterate = [self.data_to_iterate[i] for i in indices]
         if clip_transformer is None:
-            self.transform_img = [
+            self.transform_img = transforms.Compose([
                 transforms.Resize((resize,resize)),
                 transforms.CenterCrop(imagesize),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-            ]
-            self.transform_img = transforms.Compose(self.transform_img)
+            ])
         else:
             self.transform_img = clip_transformer
             
-        self.transform_mask = [
-            transforms.Resize((resize,resize)),
+        self.transform_mask =transforms.Compose([
+            transforms.Resize((resize,resize),interpolation=transforms.InterpolationMode.NEAREST),
             transforms.CenterCrop(imagesize),
             transforms.ToTensor(),
-        ]
-        self.transform_mask = transforms.Compose(self.transform_mask)
+        ])
 
         self.imagesize = (3, imagesize, imagesize)
     
@@ -98,24 +96,34 @@ class MVTecDataset(torch.utils.data.Dataset):
         return [full_datasets[id] for id in sub_id_list]
      
     # 取单个样本
-    def __getitem__(self, idx):
-        classname, anomaly, image_path, mask_path = self.data_to_iterate[idx]
-        image = PIL.Image.open(image_path).convert("RGB")
-        image = self.transform_img(image)
+    def __getitem__(self, index):
+      classname, anomaly, image_path, mask_path = (self.data_to_iterate[index])
 
-        if self.split == DatasetSplit.TEST and mask_path is not None:
-            mask = PIL.Image.open(mask_path)
-            mask = self.transform_mask(mask)
-        else:
-            mask = torch.zeros([1, *image.size()[1:]])
-    
-        return {
-            "image": image,
-            "mask": mask,
-            "is_anomaly": int(anomaly != "good"),
-            "image_path": image_path,
-        }
+      with Image.open(image_path) as pil_image:
+          image = self.transform_img(
+              pil_image.convert("RGB")
+          )
 
+      if (
+          self.split == DatasetSplit.TEST
+          and mask_path is not None
+      ):
+          with Image.open(mask_path) as pil_mask:
+              mask = self.transform_mask(
+                  pil_mask.convert("L")
+              )
+          mask = (mask > 0.5).float()
+      else:
+          mask = torch.zeros(
+              [1, *image.size()[1:]]
+          )
+
+      return {
+          "image": image,
+          "mask": mask,
+          "is_anomaly": int(anomaly != "good"),
+          "image_path": image_path,
+      }
     def __len__(self):
         return len(self.data_to_iterate)
     # 扫描目录构建样本列表

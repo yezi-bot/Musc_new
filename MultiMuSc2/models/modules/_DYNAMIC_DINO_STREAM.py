@@ -8,11 +8,11 @@ from ._CHANNEL import ChannelMemory
 from ._DYNAMIC_EXPERT import DynamicExpertManager
 from ._MSM import interval_average
 
-
+# 尺度和层转成编号
 def feature_key(r, layer):
     return f"r{int(r)}_l{int(layer)}"
 
-
+# 分块计算DINO异常距离
 def chunked_dino_score(
     query,
     references,
@@ -23,18 +23,22 @@ def chunked_dino_score(
 ):
     if not references:
         return None
+
     if chunk_size < 1:
         raise ValueError("chunk_size must be at least 1")
 
+# 读取patch数和维度数
     query = query.detach().float().to(device)
     patch_count, feature_dim = query.shape
     patch_to_image = []
 
+# 分批处理参考图
     for start in range(0, len(references), chunk_size):
         reference_chunk = torch.stack(
             references[start : start + chunk_size]
         ).float().to(device)
 
+# 当前图所有 patch 到参考图所有 patch 的欧氏距离
         distances = torch.cdist(
             query.unsqueeze(0),
             reference_chunk.reshape(-1, feature_dim),
@@ -53,7 +57,7 @@ def chunked_dino_score(
         topmin_max=topmin_max,
     )
 
-
+# 初始化在线状态
 class DynamicDinoOnlineState:
     def __init__(
         self,
@@ -84,12 +88,14 @@ class DynamicDinoOnlineState:
             self.committee_r,
             self.committee_layer,
         )
+        # channel距离阈值
         self.channel_quantile = float(
             committee_config.get(
                 "channel_distance_quantile",
                 0.7,
             )
         )
+        # soft_reliability权重系数
         self.reliability_alpha = float(
             committee_config.get("reliability_alpha", 0.5)
         )
@@ -100,10 +106,11 @@ class DynamicDinoOnlineState:
         self.topmin_max = float(
             scoring_config.get("topmin_max", 0.3)
         )
+        # 读取 MSM 距离聚合区间和参考图分块数
         self.reference_chunk_size = int(
             scoring_config.get("reference_chunk_size", 8)
         )
-
+# 建立channel
         self.memory = ChannelMemory(
             max_ttl=int(committee_config.get("channel_ttl", 5)),
             mature_span=float(
@@ -115,7 +122,7 @@ class DynamicDinoOnlineState:
                 committee_config.get("position_radius", 1)
             ),
         )
-
+# 建立专家管理器
         self.manager = DynamicExpertManager(
             ms_quantile=float(
                 committee_config.get("ms_quantile", 0.3)
@@ -190,6 +197,7 @@ class DynamicDinoOnlineState:
             )
 
         layer_scores = []
+        # 历遍r和layer
         for r in self.r_list:
             for layer in self.feature_layers:
                 key = feature_key(r, layer)
@@ -206,7 +214,7 @@ class DynamicDinoOnlineState:
                     chunk_size=self.reference_chunk_size,
                 )
                 layer_scores.append(patch_score)
-
+# 全部层和尺度平均
         patch_score = torch.stack(layer_scores).mean(dim=0)
         grid_size = math.isqrt(patch_score.numel())
         if grid_size * grid_size != patch_score.numel():
@@ -238,7 +246,7 @@ class DynamicDinoOnlineState:
             raise ValueError(
                 "current_features do not match configured r/layer keys"
             )
-
+# 开始时的专家
         active_before = self.manager.active_experts_before_step()
 
         (
@@ -257,7 +265,7 @@ class DynamicDinoOnlineState:
             raise ValueError(
                 "committee patch count must form a square grid"
             )
-
+# 构造历史委员会特征
         historical_committee = [
             features[self.committee_key]
             for features in self.feature_bank
@@ -275,7 +283,7 @@ class DynamicDinoOnlineState:
             if ms_patch_score is not None
             else None
         )
-
+# 用累计距离计算channel阈值
         distance_threshold = (
             float(
                 np.quantile(
@@ -294,7 +302,7 @@ class DynamicDinoOnlineState:
                 distance_threshold,
             )
         )
-
+# 计算当前专家对历史channel的support
         expert_supports = {}
         for expert in active_before:
             expert_id = int(expert["expert_id"])
@@ -370,6 +378,10 @@ class DynamicDinoOnlineState:
             "mature_channel_count_after": len(
                 self.memory.mature_channels()
             ),
+            "ms_threshold": event["ms_threshold"],
+            "support_threshold": event["support_threshold"],
+            "is_candidate": event["is_candidate"],
+            "candidate_cluster_id": event["cluster_id"],
         }
         self.timeline.append(record)
 
