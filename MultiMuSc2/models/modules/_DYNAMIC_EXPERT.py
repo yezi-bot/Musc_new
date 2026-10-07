@@ -14,6 +14,8 @@ class DynamicExpertManager:
     base_ttl=5,
     max_ttl=20,
     ttl_gap_multiplier=2.0,
+    representative_mode="historical_quality",
+    admission_ttl_mode="historical_gap",
     ):
             # 历史异常的30％
       if not 0.0<=ms_quantile<=1.0:
@@ -41,6 +43,21 @@ class DynamicExpertManager:
             raise ValueError(
                 "ttl_gap_multiplier must be at least 1"
             )  
+      if representative_mode not in {
+            "historical_quality",
+            "latest_candidate",
+        }:
+            raise ValueError(
+                "representative_mode must be historical_quality "
+                "or latest_candidate"
+            )
+      if admission_ttl_mode not in {
+            "historical_gap",
+            "base",
+        }:
+            raise ValueError(
+                "admission_ttl_mode must be historical_gap or base"
+            )
       self.ms_quantile = float(ms_quantile)
       self.support_quantile = float(support_quantile)
       self.duplicate_similarity = float(
@@ -55,6 +72,8 @@ class DynamicExpertManager:
       self.ttl_gap_multiplier = float(
             ttl_gap_multiplier
         )
+      self.representative_mode = representative_mode
+      self.admission_ttl_mode = admission_ttl_mode
       
       self.ms_history = []
       self.support_history = []
@@ -79,6 +98,38 @@ class DynamicExpertManager:
 
     def active_expert_before_step(self):
         return self.active_experts_before_step()
+
+    def expert_audit_snapshot(self):
+        return [
+            {
+                "expert_id": int(expert["expert_id"]),
+                "image_id": int(expert["image_id"]),
+                "cluster_id": int(expert["cluster_id"]),
+                "admission_step": int(expert["admission_step"]),
+                "cluster_support_at_admission": int(
+                    expert["cluster_support_at_admission"]
+                ),
+                "max_support_gap": int(expert["max_support_gap"]),
+                "last_supported_step": int(
+                    expert["last_supported_step"]
+                ),
+                "support_count": int(expert["support_count"]),
+                "patience": int(expert["patience"]),
+                "ttl": int(expert["ttl"]),
+                "deletion_step": expert["deletion_step"],
+                "last_event": expert["last_event"],
+                "last_channel_support": expert[
+                    "last_channel_support"
+                ],
+                "representative_mode": expert[
+                    "representative_mode"
+                ],
+                "admission_ttl_mode": expert[
+                    "admission_ttl_mode"
+                ],
+            }
+            for expert in self.active_experts
+        ]
 
     def fuser_training_members(self, step):
         members = []
@@ -216,12 +267,20 @@ class DynamicExpertManager:
         support_threshold,
         expert_channel_supports,
         
+
     ):
         deleted_expert_ids = []
         survivors = []
+        lifecycle_events = []
 
         for expert in self.active_experts:
             expert_id = expert["expert_id"]
+            ttl_before = int(expert["ttl"])
+            patience_before = int(expert["patience"])
+            last_supported_step_before = int(
+                expert["last_supported_step"]
+            )
+            support_gap = None
 
             support = expert_channel_supports.get(
                 expert_id
@@ -265,13 +324,16 @@ class DynamicExpertManager:
                 expert["ttl"] -= 1
                 event = "ttl_decrement"
 
+            signal_decision = event
             expert["last_event"] = event
             expert["last_channel_support"] = support
 
+            deleted_this_step = False
             if expert["ttl"] <= 0:
                 expert["ttl"] = 0
                 expert["deletion_step"] = step
                 expert["last_event"] = "deleted"
+                deleted_this_step = True
 
                 cluster = self.clusters[
                     expert["cluster_id"]
@@ -287,8 +349,50 @@ class DynamicExpertManager:
             else:
                 survivors.append(expert)
 
+            lifecycle_events.append(
+                {
+                    "step": int(step),
+                    "expert_id": int(expert_id),
+                    "expert_image_id": int(expert["image_id"]),
+                    "cluster_id": int(expert["cluster_id"]),
+                    "admission_step": int(expert["admission_step"]),
+                    "age": int(step - expert["admission_step"]),
+                    "channel_support": support,
+                    "support_threshold": support_threshold,
+                    "support_available": support is not None,
+                    "threshold_available": support_threshold is not None,
+                    "support_gap": support_gap,
+                    "ttl_before": ttl_before,
+                    "ttl_after": int(expert["ttl"]),
+                    "patience_before": patience_before,
+                    "patience_after": int(expert["patience"]),
+                    "last_supported_step_before": (
+                        last_supported_step_before
+                    ),
+                    "last_supported_step_after": int(
+                        expert["last_supported_step"]
+                    ),
+                    "signal_decision": signal_decision,
+                    "decision": expert["last_event"],
+                    "refreshed": signal_decision == "ttl_refreshed",
+                    "deleted_this_step": deleted_this_step,
+                    "alive_after": not deleted_this_step,
+                    "admission_candidate_image_id": None,
+                    "admission_candidate_ms_score": None,
+                    "admission_ms_threshold": None,
+                    "admission_candidate_channel_support": None,
+                    "admission_support_threshold": None,
+                    "representative_mode": expert[
+                        "representative_mode"
+                    ],
+                    "admission_ttl_mode": expert[
+                        "admission_ttl_mode"
+                    ],
+                }
+            )
+
         self.active_experts = survivors
-        return deleted_expert_ids
+        return deleted_expert_ids, lifecycle_events
 
 
     def _consider_candidate(
@@ -401,17 +505,20 @@ class DynamicExpertManager:
             return True, cluster_id, None
 
         # 选择代表
-        representative = max(
-            cluster["members"],
-            key=lambda member: member["quality"],
-        )
+        if self.representative_mode == "historical_quality":
+            representative = max(
+                cluster["members"],
+                key=lambda member: member["quality"],
+            )
+        else:
+            representative = cluster["members"][-1]
 
         member_steps = sorted(
             member["step"]
             for member in cluster["members"]
         )
 
-        max_support_gap = max(
+        historical_max_support_gap = max(
             later - earlier
             for earlier, later in zip(
                 member_steps,
@@ -419,10 +526,14 @@ class DynamicExpertManager:
             )
         )
 
-        # 计算ttl
-        patience = self._patience_from_gap(
-            max_support_gap
-        )
+        if self.admission_ttl_mode == "historical_gap":
+            max_support_gap = historical_max_support_gap
+            patience = self._patience_from_gap(
+                max_support_gap
+            )
+        else:
+            max_support_gap = 0
+            patience = self.base_ttl
 
         expert = {
             "expert_id": self.next_expert_id,
@@ -441,6 +552,8 @@ class DynamicExpertManager:
             "deletion_step": None,
             "last_event": "admitted",
             "last_channel_support": None,
+            "representative_mode": self.representative_mode,
+            "admission_ttl_mode": self.admission_ttl_mode,
         }
 
         cluster["active_expert_id"] = self.next_expert_id
@@ -500,7 +613,10 @@ class DynamicExpertManager:
             support_threshold,
         ) = self._historical_thresholds()
 
-        deleted_expert_ids = (
+        (
+            deleted_expert_ids,
+            expert_lifecycle_events,
+        ) = (
             self._advance_lifecycle(
                 step,
                 support_threshold,
@@ -522,6 +638,62 @@ class DynamicExpertManager:
             ms_threshold,
             support_threshold,
         )
+
+        if admitted_expert_id is not None:
+            admitted_expert = next(
+                expert
+                for expert in self.active_experts
+                if expert["expert_id"] == admitted_expert_id
+            )
+            expert_lifecycle_events.append(
+                {
+                    "step": int(step),
+                    "expert_id": int(admitted_expert_id),
+                    "expert_image_id": int(
+                        admitted_expert["image_id"]
+                    ),
+                    "cluster_id": int(
+                        admitted_expert["cluster_id"]
+                    ),
+                    "admission_step": int(step),
+                    "age": 0,
+                    "channel_support": None,
+                    "support_threshold": support_threshold,
+                    "support_available": False,
+                    "threshold_available": (
+                        support_threshold is not None
+                    ),
+                    "support_gap": None,
+                    "ttl_before": None,
+                    "ttl_after": int(admitted_expert["ttl"]),
+                    "patience_before": None,
+                    "patience_after": int(
+                        admitted_expert["patience"]
+                    ),
+                    "last_supported_step_before": None,
+                    "last_supported_step_after": int(step),
+                    "signal_decision": "admitted",
+                    "decision": "admitted",
+                    "refreshed": False,
+                    "deleted_this_step": False,
+                    "alive_after": True,
+                    "admission_candidate_image_id": int(image_id),
+                    "admission_candidate_ms_score": ms_score,
+                    "admission_ms_threshold": ms_threshold,
+                    "admission_candidate_channel_support": (
+                        channel_support
+                    ),
+                    "admission_support_threshold": (
+                        support_threshold
+                    ),
+                    "representative_mode": admitted_expert[
+                        "representative_mode"
+                    ],
+                    "admission_ttl_mode": admitted_expert[
+                        "admission_ttl_mode"
+                    ],
+                }
+            )
 
 # 更新历史门限
         if ms_score is not None:
@@ -546,6 +718,8 @@ class DynamicExpertManager:
                 admitted_expert_id,
             "deleted_expert_ids":
                 deleted_expert_ids,
+            "expert_lifecycle_events":
+                expert_lifecycle_events,
             "active_expert_ids_after_step": [
                 expert["expert_id"]
                 for expert

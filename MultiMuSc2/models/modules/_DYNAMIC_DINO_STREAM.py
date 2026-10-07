@@ -148,6 +148,14 @@ class DynamicDinoOnlineState:
             ttl_gap_multiplier=float(
                 committee_config.get("ttl_gap_multiplier", 2.0)
             ),
+            representative_mode=committee_config.get(
+                "representative_mode",
+                "historical_quality",
+            ),
+            admission_ttl_mode=committee_config.get(
+                "admission_ttl_mode",
+                "historical_gap",
+            ),
         )
 
         self.feature_bank = []
@@ -248,6 +256,9 @@ class DynamicDinoOnlineState:
             )
 # 开始时的专家
         active_before = self.manager.active_experts_before_step()
+        expert_states_before = (
+            self.manager.expert_audit_snapshot()
+        )
 
         (
             anomaly_map,
@@ -330,6 +341,9 @@ class DynamicDinoOnlineState:
             channel_support=channel_support,
             expert_channel_supports=expert_supports,
         )
+        expert_states_after = (
+            self.manager.expert_audit_snapshot()
+        )
 
         if current_distances is not None:
             finite = current_distances[
@@ -366,14 +380,19 @@ class DynamicDinoOnlineState:
             "fallback_reason": fallback_reason,
             "scoring_reference_image_ids": reference_ids,
             "active_experts_before": active_before,
+            "expert_states_before": expert_states_before,
             "ms_score": ms_score,
             "channel_distance_threshold": distance_threshold,
             "channel_support": channel_support,
             "expert_channel_supports": expert_supports,
             "admitted_expert_id": event["admitted_expert_id"],
             "deleted_expert_ids": event["deleted_expert_ids"],
+            "expert_lifecycle_events": event[
+                "expert_lifecycle_events"
+            ],
             "active_experts_after":
                 self.manager.active_experts_before_step(),
+            "expert_states_after": expert_states_after,
             "channel_count_after": len(self.memory.channels),
             "mature_channel_count_after": len(
                 self.memory.mature_channels()

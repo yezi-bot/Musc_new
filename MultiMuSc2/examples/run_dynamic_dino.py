@@ -28,6 +28,42 @@ from models.modules._LNAMD import LNAMD
 from utils.metrics import compute_metrics
 
 
+LIFECYCLE_CSV_FIELDS = [
+    "step",
+    "stream_anomaly_type_debug",
+    "expert_id",
+    "expert_image_id",
+    "expert_anomaly_type_debug",
+    "expert_is_anomaly_debug",
+    "cluster_id",
+    "admission_step",
+    "age",
+    "channel_support",
+    "support_threshold",
+    "support_available",
+    "threshold_available",
+    "support_gap",
+    "ttl_before",
+    "ttl_after",
+    "patience_before",
+    "patience_after",
+    "last_supported_step_before",
+    "last_supported_step_after",
+    "signal_decision",
+    "decision",
+    "refreshed",
+    "deleted_this_step",
+    "alive_after",
+    "admission_candidate_image_id",
+    "admission_candidate_ms_score",
+    "admission_ms_threshold",
+    "admission_candidate_channel_support",
+    "admission_support_threshold",
+    "representative_mode",
+    "admission_ttl_mode",
+]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Strictly online Dynamic DINO-only evaluation."
@@ -231,6 +267,17 @@ def select_dataset(dataset, seed, max_samples):
     return torch.utils.data.Subset(dataset, shuffled)
 
 
+def validate_stream_counts(sample_count, available_count=None):
+    if sample_count < 2:
+        raise ValueError(
+            "strict online evaluation requires at least two stream samples"
+        )
+    if available_count is not None and available_count < 1:
+        raise ValueError(
+            "strict online evaluation produced no scoreable samples"
+        )
+
+
 def write_csv(path, rows):
     if not rows:
         return
@@ -245,6 +292,149 @@ def write_csv(path, rows):
         )
         writer.writeheader()
         writer.writerows(rows)
+
+
+def write_lifecycle_csv(path, rows):
+    with Path(path).open(
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=LIFECYCLE_CSV_FIELDS,
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def annotate_expert_debug_labels(audit):
+    anomaly_type_by_step = {
+        int(record["step"]): record["anomaly_type"]
+        for record in audit
+    }
+
+    for record in audit:
+        for key in (
+            "expert_states_before",
+            "expert_states_after",
+        ):
+            for expert in record.get(key, []):
+                anomaly_type = anomaly_type_by_step.get(
+                    int(expert["image_id"])
+                )
+                expert["expert_anomaly_type_debug"] = (
+                    anomaly_type
+                )
+                expert["expert_is_anomaly_debug"] = (
+                    anomaly_type != "good"
+                    if anomaly_type is not None
+                    else None
+                )
+
+        for event in record.get(
+            "expert_lifecycle_events",
+            [],
+        ):
+            anomaly_type = anomaly_type_by_step.get(
+                int(event["expert_image_id"])
+            )
+            event["expert_anomaly_type_debug"] = anomaly_type
+            event["expert_is_anomaly_debug"] = (
+                anomaly_type != "good"
+                if anomaly_type is not None
+                else None
+            )
+
+
+def lifecycle_csv_rows(audit):
+    rows = []
+    for record in audit:
+        for event in record.get(
+            "expert_lifecycle_events",
+            [],
+        ):
+            rows.append(
+                {
+                    "step": event["step"],
+                    "stream_anomaly_type_debug": record[
+                        "anomaly_type"
+                    ],
+                    "expert_id": event["expert_id"],
+                    "expert_image_id": event[
+                        "expert_image_id"
+                    ],
+                    "expert_anomaly_type_debug": event[
+                        "expert_anomaly_type_debug"
+                    ],
+                    "expert_is_anomaly_debug": event[
+                        "expert_is_anomaly_debug"
+                    ],
+                    "cluster_id": event["cluster_id"],
+                    "admission_step": event[
+                        "admission_step"
+                    ],
+                    "age": event["age"],
+                    "channel_support": event[
+                        "channel_support"
+                    ],
+                    "support_threshold": event[
+                        "support_threshold"
+                    ],
+                    "support_available": event[
+                        "support_available"
+                    ],
+                    "threshold_available": event[
+                        "threshold_available"
+                    ],
+                    "support_gap": event["support_gap"],
+                    "ttl_before": event["ttl_before"],
+                    "ttl_after": event["ttl_after"],
+                    "patience_before": event[
+                        "patience_before"
+                    ],
+                    "patience_after": event[
+                        "patience_after"
+                    ],
+                    "last_supported_step_before": event[
+                        "last_supported_step_before"
+                    ],
+                    "last_supported_step_after": event[
+                        "last_supported_step_after"
+                    ],
+                    "signal_decision": event[
+                        "signal_decision"
+                    ],
+                    "decision": event["decision"],
+                    "refreshed": event["refreshed"],
+                    "deleted_this_step": event[
+                        "deleted_this_step"
+                    ],
+                    "alive_after": event["alive_after"],
+                    "admission_candidate_image_id": event[
+                        "admission_candidate_image_id"
+                    ],
+                    "admission_candidate_ms_score": event[
+                        "admission_candidate_ms_score"
+                    ],
+                    "admission_ms_threshold": event[
+                        "admission_ms_threshold"
+                    ],
+                    "admission_candidate_channel_support": event[
+                        "admission_candidate_channel_support"
+                    ],
+                    "admission_support_threshold": event[
+                        "admission_support_threshold"
+                    ],
+                    "representative_mode": event.get(
+                        "representative_mode"
+                    ),
+                    "admission_ttl_mode": event.get(
+                        "admission_ttl_mode"
+                    ),
+                }
+            )
+    return rows
 
 
 def run_seed(
@@ -269,6 +459,7 @@ def run_seed(
         seed,
         args.max_samples,
     )
+    validate_stream_counts(len(dataset))
 
     extractor = DinoFeatureExtractor(
         model=model,
@@ -332,6 +523,11 @@ def run_seed(
         )
 
     runtime_seconds = time.perf_counter() - started
+    annotate_expert_debug_labels(audit)
+    validate_stream_counts(
+        len(dataset),
+        len(available_scores),
+    )
 
     gt_sp = np.asarray(
         available_labels,
@@ -378,6 +574,10 @@ def run_seed(
 
     seed_dir = output_dir / f"seed_{seed}"
     seed_dir.mkdir(parents=True, exist_ok=True)
+    write_lifecycle_csv(
+        seed_dir / "expert_lifecycle.csv",
+        lifecycle_csv_rows(audit),
+    )
     (seed_dir / "timeline.json").write_text(
         json.dumps(
             audit,
