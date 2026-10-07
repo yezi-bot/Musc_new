@@ -1,0 +1,40 @@
+datasets:
+  dataset_name: mvtec_ad
+  class_name: bottle
+  img_resize: 518
+
+models:
+  backbone_name: dinov2_vitl14
+  feature_layers: [5, 11, 17, 23]
+  r_list: [1, 3, 5]
+
+  dynamic_fusion:
+    mode: dino_only
+
+  dynamic_committee:
+    r: 1
+    dino_layer: 23
+    position_radius: 1
+    channel_distance_quantile: 0.7
+    reliability_alpha: 0.5
+    channel_ttl: 5
+    mature_span: 3.0
+    density_k: 5
+
+    ms_quantile: 0.3
+    support_quantile: 0.7
+    duplicate_similarity: 0.98
+    min_cluster_support: 2
+    committee_cap: 5
+    base_ttl: 5
+    max_ttl: 20
+    ttl_gap_multiplier: 2.0
+
+  scoring:
+    topmin_min: 0.02
+    topmin_max: 0.3
+    reference_chunk_size: 8
+
+testing:
+  shuffle_stream: true
+  use_rscin: false
