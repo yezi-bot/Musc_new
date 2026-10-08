@@ -490,22 +490,37 @@ def run_seed(
     audit = []
 
     for step in range(len(dataset)):
+        step_started = time.perf_counter()
         sample = dataset[step]
+        feature_started = time.perf_counter()
         current_features = extractor.extract(
             sample["image"].unsqueeze(0)
         )
+        feature_seconds = time.perf_counter() - feature_started
 
+        online_started = time.perf_counter()
         anomaly_map, record = (
             online_state.process_features(
                 current_features
             )
         )
+        online_seconds = time.perf_counter() - online_started
 
         record["image_path"] = os.path.relpath(
             sample["image_path"],
             args.data_root,
         )
         record["anomaly_type"] = Path( sample["image_path"]).parent.name
+        record["feature_extract_seconds"] = feature_seconds
+        record["online_process_seconds"] = online_seconds
+        record["step_total_seconds"] = (
+            time.perf_counter() - step_started
+        )
+        record["cuda_peak_memory_mb_so_far"] = (
+            torch.cuda.max_memory_allocated(device) / 1024 / 1024
+            if device.type == "cuda"
+            else 0.0
+        )
         audit.append(record)
 
         if anomaly_map is None:

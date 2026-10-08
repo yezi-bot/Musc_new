@@ -5,6 +5,11 @@ import torch
 import torch.nn.functional as F
 
 from ._CHANNEL import ChannelMemory
+from ._CAUSAL_POSITION_LOF import (
+    CausalPositionLofMemory,
+    lof_rank_reliability,
+    lof_tail_mean,
+)
 from ._DYNAMIC_EXPERT import DynamicExpertManager
 from ._MSM import interval_average
 
@@ -99,6 +104,44 @@ class DynamicDinoOnlineState:
         self.reliability_alpha = float(
             committee_config.get("reliability_alpha", 0.5)
         )
+        self.patch_reliability_mode = committee_config.get(
+            "patch_reliability_mode",
+            "distance_rank",
+        )
+        if self.patch_reliability_mode not in {
+            "distance_rank",
+            "causal_lof",
+        }:
+            raise ValueError(
+                "patch_reliability_mode must be distance_rank or causal_lof"
+            )
+        self.lof_position_radius = int(
+            committee_config.get("lof_position_radius", 0)
+        )
+        self.lof_tail_fraction = float(
+            committee_config.get("lof_tail_fraction", 0.15)
+        )
+        self.lof_history_quantile = float(
+            committee_config.get("lof_history_quantile", 0.85)
+        )
+        self.lof_reliability_minimum = float(
+            committee_config.get("lof_reliability_minimum", 0.1)
+        )
+        self.lof_soft_floor = bool(
+            committee_config.get("lof_soft_floor", True)
+        )
+        self.lof_position_chunk_size = int(
+            committee_config.get("lof_position_chunk_size", 64)
+        )
+        self.lof_image_chunk_size = int(
+            committee_config.get("lof_image_chunk_size", 8)
+        )
+        if self.lof_position_radius < 0:
+            raise ValueError("lof_position_radius must be non-negative")
+        if not 0.0 < self.lof_tail_fraction <= 1.0:
+            raise ValueError("lof_tail_fraction must be within (0, 1]")
+        if not 0.0 <= self.lof_history_quantile <= 1.0:
+            raise ValueError("lof_history_quantile must be within [0, 1]")
 
         self.topmin_min = float(
             scoring_config.get("topmin_min", 0.02)
@@ -158,6 +201,16 @@ class DynamicDinoOnlineState:
             ),
         )
 
+        self.lof_memory = CausalPositionLofMemory(
+            k=int(committee_config.get("lof_k", 6)),
+            device=self.device,
+            position_chunk_size=self.lof_position_chunk_size,
+            image_chunk_size=self.lof_image_chunk_size,
+        )
+        self.lof_tail_by_image = {}
+        self.lof_calibration_step_by_image = {}
+        self.lof_calibration_history_count_by_image = {}
+
         self.feature_bank = []
         self.distance_history = []
         self.timeline = []
@@ -181,6 +234,33 @@ class DynamicDinoOnlineState:
             (distances <= distance_threshold).float().mean()
         )
         return support, distances
+
+    def _lof_threshold(self, exclude_image_id=None):
+        history = [
+            tail
+            for image_id, tail in self.lof_tail_by_image.items()
+            if image_id != exclude_image_id
+        ]
+        if not history:
+            return None
+        return float(
+            np.quantile(history, self.lof_history_quantile)
+        )
+
+    def _store_lof_tail(
+        self,
+        image_id,
+        tail,
+        calibration_step,
+        history_count,
+    ):
+        self.lof_tail_by_image[int(image_id)] = float(tail)
+        self.lof_calibration_step_by_image[int(image_id)] = int(
+            calibration_step
+        )
+        self.lof_calibration_history_count_by_image[
+            int(image_id)
+        ] = int(history_count)
 
     def _score_current(self, current_features, active_experts):
         step = len(self.feature_bank)
@@ -313,8 +393,59 @@ class DynamicDinoOnlineState:
                 distance_threshold,
             )
         )
+        current_lof_scores = None
+        current_lof_tail = None
+        if self.patch_reliability_mode == "causal_lof":
+            current_lof_scores = self.lof_memory.score(
+                committee_features,
+                position_radius=self.lof_position_radius,
+            )
+            current_lof_tail = lof_tail_mean(
+                current_lof_scores,
+                self.lof_tail_fraction,
+            )
+
+        expert_lof_backfilled = {}
+        if self.patch_reliability_mode == "causal_lof":
+            for expert in active_before:
+                expert_image_id = int(expert["image_id"])
+                if expert_image_id in self.lof_tail_by_image:
+                    expert_lof_backfilled[int(expert["expert_id"])] = False
+                    continue
+                expert_features = self.feature_bank[
+                    expert_image_id
+                ][self.committee_key]
+                backfill_scores = self.lof_memory.score(
+                    expert_features,
+                    position_radius=self.lof_position_radius,
+                    exclude_image_id=expert_image_id,
+                )
+                backfill_tail = lof_tail_mean(
+                    backfill_scores,
+                    self.lof_tail_fraction,
+                )
+                was_backfilled = backfill_tail is not None
+                expert_lof_backfilled[
+                    int(expert["expert_id"])
+                ] = was_backfilled
+                if was_backfilled:
+                    self._store_lof_tail(
+                        image_id=expert_image_id,
+                        tail=backfill_tail,
+                        calibration_step=step,
+                        history_count=len(self.lof_memory.history) - 1,
+                    )
+
+        lof_history_count_before = len(self.lof_tail_by_image)
+        lof_threshold = self._lof_threshold()
 # 计算当前专家对历史channel的support
+        raw_expert_supports = {}
         expert_supports = {}
+        expert_lof_tails = {}
+        expert_lof_thresholds = {}
+        expert_lof_calibration_steps = {}
+        expert_lof_calibration_history_counts = {}
+        expert_lof_rejected = {}
         for expert in active_before:
             expert_id = int(expert["expert_id"])
             expert_image_id = int(expert["image_id"])
@@ -331,7 +462,38 @@ class DynamicDinoOnlineState:
                 grid_size,
                 distance_threshold,
             )
-            expert_supports[expert_id] = support
+            raw_expert_supports[expert_id] = support
+
+            expert_lof_tail = None
+            expert_lof_threshold = None
+            rejected = False
+            if self.patch_reliability_mode == "causal_lof":
+                expert_lof_tail = self.lof_tail_by_image.get(
+                    expert_image_id
+                )
+                expert_lof_threshold = self._lof_threshold(
+                    exclude_image_id=expert_image_id,
+                )
+                rejected = bool(
+                    expert_lof_tail is not None
+                    and expert_lof_threshold is not None
+                    and expert_lof_tail > expert_lof_threshold
+                )
+
+            expert_lof_tails[expert_id] = expert_lof_tail
+            expert_lof_thresholds[expert_id] = expert_lof_threshold
+            expert_lof_calibration_steps[expert_id] = (
+                self.lof_calibration_step_by_image.get(
+                    expert_image_id
+                )
+            )
+            expert_lof_calibration_history_counts[expert_id] = (
+                self.lof_calibration_history_count_by_image.get(
+                    expert_image_id
+                )
+            )
+            expert_lof_rejected[expert_id] = rejected
+            expert_supports[expert_id] = 0.0 if rejected else support
 
         event = self.manager.advance(
             step=step,
@@ -351,14 +513,33 @@ class DynamicDinoOnlineState:
             ]
             self.distance_history.extend(finite.tolist())
 
-        _, reliability = self.memory.patch_reliability(
-            committee_features,
-            grid_size,
-        )
-        soft_reliability = (
-            self.reliability_alpha
-            + (1.0 - self.reliability_alpha) * reliability
-        )
+        reliability_source = "distance_rank"
+        if (
+            self.patch_reliability_mode == "causal_lof"
+            and current_lof_scores is not None
+        ):
+            reliability = lof_rank_reliability(
+                current_lof_scores,
+                minimum=self.lof_reliability_minimum,
+            )
+            reliability_source = "causal_lof"
+        else:
+            _, reliability = self.memory.patch_reliability(
+                committee_features,
+                grid_size,
+            )
+
+        if (
+            self.patch_reliability_mode == "causal_lof"
+            and not self.lof_soft_floor
+            and reliability_source == "causal_lof"
+        ):
+            soft_reliability = reliability
+        else:
+            soft_reliability = (
+                self.reliability_alpha
+                + (1.0 - self.reliability_alpha) * reliability
+            )
 
         self.memory.update(
             committee_features,
@@ -366,6 +547,16 @@ class DynamicDinoOnlineState:
             grid_size=grid_size,
             patch_reliabilities=soft_reliability,
         )
+        if self.patch_reliability_mode == "causal_lof":
+            if current_lof_tail is not None:
+                self._store_lof_tail(
+                    image_id=step,
+                    tail=current_lof_tail,
+                    calibration_step=step,
+                    history_count=len(self.lof_memory.history),
+                )
+            self.lof_memory.update(committee_features)
+        lof_history_count_after = len(self.lof_tail_by_image)
 
         stored_features = {
             key: value.detach().cpu().clone()
@@ -385,6 +576,22 @@ class DynamicDinoOnlineState:
             "channel_distance_threshold": distance_threshold,
             "channel_support": channel_support,
             "expert_channel_supports": expert_supports,
+            "raw_expert_channel_supports": raw_expert_supports,
+            "expert_lof_tails": expert_lof_tails,
+            "expert_lof_thresholds": expert_lof_thresholds,
+            "expert_lof_calibration_steps": (
+                expert_lof_calibration_steps
+            ),
+            "expert_lof_calibration_history_counts": (
+                expert_lof_calibration_history_counts
+            ),
+            "expert_lof_backfilled": expert_lof_backfilled,
+            "expert_lof_rejected": expert_lof_rejected,
+            "current_lof_tail": current_lof_tail,
+            "lof_tail_threshold": lof_threshold,
+            "lof_history_count_before": lof_history_count_before,
+            "lof_history_count_after": lof_history_count_after,
+            "patch_reliability_source": reliability_source,
             "admitted_expert_id": event["admitted_expert_id"],
             "deleted_expert_ids": event["deleted_expert_ids"],
             "expert_lifecycle_events": event[
