@@ -4,6 +4,7 @@ import torch
 
 from MultiMuSc2.models.modules._DYNAMIC_PIPELINE import (
     _image_msm_score,
+    _strict_history_fallback,
     build_dynamic_committee_timeline,
     score_dynamic_msm2_layer,
 )
@@ -75,6 +76,24 @@ class DynamicPipelineTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(actual, expected, places=6)
+
+    def test_chunked_strict_history_fallback_matches_direct_result(self):
+        features = synthetic_features(6)
+        expected = aggregate_reference_distances(
+            features[-1],
+            features[:-1],
+            topmin_min=0,
+            topmin_max=0.3,
+        )
+        actual, reason = _strict_history_fallback(
+            features[-1],
+            features[:-1],
+            "strict_history_test",
+            reference_chunk_size=2,
+        )
+
+        self.assertTrue(torch.allclose(actual, expected))
+        self.assertEqual(reason, "strict_history_test")
 
     def test_timeline_snapshots_are_strictly_pre_update(self):
         timeline = build_dynamic_committee_timeline(
@@ -155,6 +174,44 @@ class DynamicPipelineTest(unittest.TestCase):
         self.assertTrue(audits[2]["fuser_retrained"])
         self.assertFalse(audits[4]["fuser_retrained"])
         self.assertEqual(audits[4]["training_image_count"], 2)
+
+    def test_committee_gate_waits_for_four_stable_active_experts(self):
+        dino = synthetic_features(6)
+        timeline = scoring_timeline(6)
+        active = [
+            {
+                "expert_id": image_id,
+                "image_id": image_id,
+                "cluster_id": image_id,
+                "admission_step": image_id,
+            }
+            for image_id in range(4)
+        ]
+        timeline[4]["active_experts_before"] = active
+        timeline[5]["active_experts_before"] = active
+        gated_scores, audits = score_dynamic_msm2_layer(
+            dino,
+            dino * 2.0,
+            timeline,
+            fusion_mode="fuser",
+            retrain_policy="committee_gate",
+            training_source="active_committee",
+            committee_min_experts=4,
+            committee_stable_steps=2,
+        )
+        dino_scores, _ = score_dynamic_msm2_layer(
+            dino,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+        )
+
+        self.assertEqual(audits[4]["fallback_reason"], "committee_not_stable")
+        self.assertEqual(audits[4]["effective_mode"], "dino_gate")
+        self.assertTrue(torch.allclose(gated_scores[4], dino_scores[4]))
+        self.assertFalse(audits[4]["fuser_retrained"])
+        self.assertTrue(audits[5]["fuser_retrained"])
+        self.assertEqual(audits[5]["fuser_training_image_ids"], [0, 1, 2, 3])
 
 
 if __name__ == "__main__":

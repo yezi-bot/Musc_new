@@ -18,25 +18,23 @@ from models.musc import MuSc
 
 
 VARIANTS = {
-    "static_fuser_self": {
-        "dynamic": False,
-        "mode": "fuser",
+    "dynamic_dino_only": {
+        "dynamic": True,
+        "mode": "dino_only",
         "retrain_policy": "on_change",
+        "training_source": "cluster_history",
     },
-    "static_fuser_loo": {
-        "dynamic": False,
-        "mode": "static_loo",
-        "retrain_policy": "on_change",
-    },
-    "dynamic_fuser_frozen": {
+    "dynamic_fuser_committee_gate": {
         "dynamic": True,
         "mode": "fuser",
-        "retrain_policy": "fit_once",
+        "retrain_policy": "committee_gate",
+        "training_source": "active_committee",
     },
-    "dynamic_fuser_retrain": {
+    "dynamic_fuser_cluster_retrain": {
         "dynamic": True,
         "mode": "fuser",
         "retrain_policy": "on_change",
+        "training_source": "cluster_history",
     },
 }
 
@@ -200,6 +198,13 @@ def run_variant(base_config, args, seed, variant_name, timeline_path=None):
     cfg["models"]["dynamic_fusion"]["retrain_policy"] = variant[
         "retrain_policy"
     ]
+    cfg["models"]["dynamic_fusion"]["training_source"] = variant[
+        "training_source"
+    ]
+    cfg["models"]["dynamic_fusion"]["committee_min_experts"] = 4
+    cfg["models"]["dynamic_fusion"]["committee_stable_steps"] = 2
+    cfg["models"]["dynamic_fusion"]["committee_change_ratio"] = 0.4
+    cfg["models"]["dynamic_fusion"]["committee_retrain_cooldown"] = 5
 
     model = MuSc(cfg, seed=seed)
     if torch.cuda.is_available():

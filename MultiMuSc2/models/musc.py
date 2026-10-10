@@ -503,6 +503,29 @@ class MuSc():
                             retrain_policy=self.dynamic_fusion_cfg.get(
                                 'retrain_policy', 'on_change'
                             ),
+                            training_source=self.dynamic_fusion_cfg.get(
+                                'training_source', 'cluster_history'
+                            ),
+                            committee_min_experts=int(
+                                self.dynamic_fusion_cfg.get(
+                                    'committee_min_experts', 4
+                                )
+                            ),
+                            committee_stable_steps=int(
+                                self.dynamic_fusion_cfg.get(
+                                    'committee_stable_steps', 2
+                                )
+                            ),
+                            committee_change_ratio=float(
+                                self.dynamic_fusion_cfg.get(
+                                    'committee_change_ratio', 0.4
+                                )
+                            ),
+                            committee_retrain_cooldown=int(
+                                self.dynamic_fusion_cfg.get(
+                                    'committee_retrain_cooldown', 5
+                                )
+                            ),
                         )
                         for audit in layer_audits:
                             audit['aggregation_r'] = r
