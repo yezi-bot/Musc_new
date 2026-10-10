@@ -158,6 +158,7 @@ def build_dynamic_committee_timeline(
             segment_start = step
         current = committee_features[step]
         active_before = manager.active_experts_before_step()
+        provisional_before = manager.provisional_expert_before_step()
         training_members = manager.fuser_training_members(step)
         ms_score, ms_short_scores = _image_msm_profile(
             current,
@@ -233,6 +234,7 @@ def build_dynamic_committee_timeline(
                 "segment_start": segment_start,
                 "state_reset_before": state_reset_before,
                 "active_experts_before": active_before,
+                "provisional_expert_before": provisional_before,
                 "fuser_training_members_before": training_members,
                 "ms_score": ms_score,
                 "ms_long": ms_score,
@@ -411,6 +413,8 @@ def score_dynamic_msm2_layer(
         fuser_retrained = False
         training_recomputed = False
         change_ratio = None
+        provisional = record.get("provisional_expert_before")
+        provisional_score_audit = None
 
         if fusion_mode == "strict_history_dino":
             patch_score, fallback_reason = _strict_history_dino_fallback(
@@ -603,6 +607,37 @@ def score_dynamic_msm2_layer(
                     )
                     effective_mode = "dino_fallback"
 
+        if fusion_mode == "dino_only" and provisional is not None:
+            provisional_image_ids = [
+                int(image_id)
+                for image_id in provisional.get(
+                    "image_ids", [provisional["image_id"]]
+                )
+            ]
+            if any(image_id >= step for image_id in provisional_image_ids):
+                raise ValueError(
+                    "provisional expert must be strictly historical"
+                )
+            provisional_weight = float(provisional["weight"])
+            if not 0.0 <= provisional_weight <= 1.0:
+                raise ValueError(
+                    "provisional expert weight must be within [0, 1]"
+                )
+            provisional_score, provisional_score_audit = MSM2_online(
+                current_dino,
+                None,
+                dino_features[provisional_image_ids],
+                None,
+                fusion_mode="dino_only",
+                topmin_min=topmin_min,
+                topmin_max=topmin_max,
+            )
+            patch_score = (
+                (1.0 - provisional_weight) * patch_score
+                + provisional_weight * provisional_score
+            )
+            effective_mode = "dino_provisional"
+
         if not torch.isfinite(patch_score).all():
             if fusion_mode == "clip_only":
                 patch_score, fallback_reason = _strict_history_clip_fallback(
@@ -626,6 +661,36 @@ def score_dynamic_msm2_layer(
             "effective_mode": effective_mode,
             "active_expert_ids": [expert["expert_id"] for expert in active],
             "expert_image_ids": expert_image_ids,
+            "provisional_expert_image_id": (
+                int(provisional["image_id"])
+                if provisional is not None
+                else None
+            ),
+            "provisional_expert_image_ids": (
+                [
+                    int(image_id)
+                    for image_id in provisional.get(
+                        "image_ids", [provisional["image_id"]]
+                    )
+                ]
+                if provisional is not None
+                else []
+            ),
+            "provisional_expert_weight": (
+                float(provisional["weight"])
+                if provisional is not None
+                else None
+            ),
+            "provisional_pool_size": (
+                int(provisional["pool_size"])
+                if provisional is not None
+                else 0
+            ),
+            "provisional_state": (
+                provisional.get("state")
+                if provisional is not None
+                else None
+            ),
             "fuser_training_image_ids": (
                 chosen_training_ids
             ),
@@ -652,6 +717,16 @@ def score_dynamic_msm2_layer(
         }
         if score_audit is not None:
             audit.update(_distance_audit(score_audit))
+        if provisional_score_audit is not None:
+            provisional_distance_audit = _distance_audit(
+                provisional_score_audit
+            )
+            audit.update(
+                {
+                    f"provisional_{key}": value
+                    for key, value in provisional_distance_audit.items()
+                }
+            )
         if score_audit is not None and score_audit.get("fuser_score") is not None:
             audit.update(
                 {

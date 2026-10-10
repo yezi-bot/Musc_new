@@ -459,6 +459,26 @@ class MuSc():
                                     'novel_ratio_threshold', 0.95
                                 )
                             ),
+                            'novel_provisional_weight': float(
+                                self.dynamic_committee_cfg.get(
+                                    'novel_provisional_weight', 0.25
+                                )
+                            ),
+                            'novel_confirmed_weight': float(
+                                self.dynamic_committee_cfg.get(
+                                    'novel_confirmed_weight', 0.5
+                                )
+                            ),
+                            'novel_confirmed_ttl': int(
+                                self.dynamic_committee_cfg.get(
+                                    'novel_confirmed_ttl', 16
+                                )
+                            ),
+                            'novel_confirmed_members': int(
+                                self.dynamic_committee_cfg.get(
+                                    'novel_confirmed_members', 1
+                                )
+                            ),
                         },
                         reset_steps=(
                             stream_boundaries

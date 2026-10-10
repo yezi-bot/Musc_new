@@ -52,6 +52,28 @@ VARIANTS = {
         "candidate_mode": "dual_path",
         "novel_admission_mode": "quarantine",
     },
+    "dynamic_dino_provisional": {
+        "dynamic": True,
+        "mode": "dino_only",
+        "reset": False,
+        "candidate_mode": "dual_path",
+        "novel_admission_mode": "provisional",
+    },
+    "dynamic_dino_soft_confirmed": {
+        "dynamic": True,
+        "mode": "dino_only",
+        "reset": False,
+        "candidate_mode": "dual_path",
+        "novel_admission_mode": "soft_confirmed",
+    },
+    "dynamic_dino_soft_committee": {
+        "dynamic": True,
+        "mode": "dino_only",
+        "reset": False,
+        "candidate_mode": "dual_path",
+        "novel_admission_mode": "soft_confirmed",
+        "novel_confirmed_members": 2,
+    },
     "dynamic_dino_oracle_reset": {
         "dynamic": True,
         "mode": "dino_only",
@@ -110,6 +132,10 @@ def audit_metrics(audit_path, boundary):
             "new_distribution_admission_latency": None,
             "post_median_provisional_support": None,
             "post_median_recent_provisional_support": None,
+            "soft_confirmations": None,
+            "pre_soft_confirmations": None,
+            "post_soft_confirmations": None,
+            "soft_confirmation_latency": None,
         }
     audit = json.loads(Path(audit_path).read_text(encoding="utf-8"))
     timeline = audit["timeline"]
@@ -139,7 +165,10 @@ def audit_metrics(audit_path, boundary):
     violations = sum(
         image_id >= record["step"]
         for record in scoring
-        for image_id in record["expert_image_ids"]
+        for image_id in (
+            record["expert_image_ids"]
+            + record.get("provisional_expert_image_ids", [])
+        )
     )
     novel_admissions = [
         record
@@ -148,11 +177,29 @@ def audit_metrics(audit_path, boundary):
         and (
             record.get("candidate_route") == "new_distribution"
             or record.get("admission_route")
-            in {"new_distribution", "new_distribution_quarantine"}
+            in {
+                "new_distribution",
+                "new_distribution_quarantine",
+                "new_distribution_provisional",
+            }
         )
     ]
     first_post_novel = next(
         (record["step"] for record in novel_admissions if record["step"] >= boundary),
+        None,
+    )
+    soft_confirmations = [
+        record
+        for record in timeline
+        if (record.get("novel_quarantine") or {}).get("decision")
+        == "confirmed_soft"
+    ]
+    first_post_soft = next(
+        (
+            record["step"]
+            for record in soft_confirmations
+            if record["step"] >= boundary
+        ),
         None,
     )
     post_provisional_support = [
@@ -207,6 +254,18 @@ def audit_metrics(audit_path, boundary):
         "post_median_recent_provisional_support": (
             float(np.median(post_recent_provisional_support))
             if post_recent_provisional_support
+            else None
+        ),
+        "soft_confirmations": len(soft_confirmations),
+        "pre_soft_confirmations": sum(
+            record["step"] < boundary for record in soft_confirmations
+        ),
+        "post_soft_confirmations": sum(
+            record["step"] >= boundary for record in soft_confirmations
+        ),
+        "soft_confirmation_latency": (
+            first_post_soft - boundary
+            if first_post_soft is not None
             else None
         ),
     }
@@ -288,6 +347,12 @@ def run_variant(base_config, args, sequence, seed, variant_name):
     cfg["models"]["dynamic_committee"]["novel_quarantine_steps"] = 8
     cfg["models"]["dynamic_committee"]["novel_quarantine_tail"] = 4
     cfg["models"]["dynamic_committee"]["novel_ratio_threshold"] = 0.95
+    cfg["models"]["dynamic_committee"]["novel_provisional_weight"] = 0.25
+    cfg["models"]["dynamic_committee"]["novel_confirmed_weight"] = 0.5
+    cfg["models"]["dynamic_committee"]["novel_confirmed_ttl"] = 16
+    cfg["models"]["dynamic_committee"][
+        "novel_confirmed_members"
+    ] = variant.get("novel_confirmed_members", 1)
     cfg["models"]["dynamic_committee"]["novel_ms_quantile"] = 0.9
     cfg["models"]["dynamic_committee"]["novel_support_quantile"] = 0.3
     cfg["models"]["dynamic_committee"]["novel_provisional_min"] = 0.05

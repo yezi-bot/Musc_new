@@ -24,6 +24,10 @@ class DynamicExpertManager:
     novel_quarantine_steps=8,
     novel_quarantine_tail=4,
     novel_ratio_threshold=0.95,
+    novel_provisional_weight=0.25,
+    novel_confirmed_weight=0.5,
+    novel_confirmed_ttl=16,
+    novel_confirmed_members=1,
     ):
             # 历史异常的30％
       if not 0.0<=ms_quantile<=1.0:
@@ -74,9 +78,15 @@ class DynamicExpertManager:
             raise ValueError("novel_support_quantile must be within [0, 1]")
       if not 0.0 <= novel_provisional_min <= 1.0:
             raise ValueError("novel_provisional_min must be within [0, 1]")
-      if novel_admission_mode not in {"immediate", "quarantine"}:
+      if novel_admission_mode not in {
+            "immediate",
+            "quarantine",
+            "provisional",
+            "soft_confirmed",
+      }:
             raise ValueError(
-                "novel_admission_mode must be immediate or quarantine"
+                "novel_admission_mode must be immediate, quarantine, "
+                "provisional, or soft_confirmed"
             )
       if novel_quarantine_steps < 2:
             raise ValueError("novel_quarantine_steps must be at least 2")
@@ -86,6 +96,22 @@ class DynamicExpertManager:
             )
       if novel_ratio_threshold <= 0.0:
             raise ValueError("novel_ratio_threshold must be positive")
+      if not 0.0 <= novel_provisional_weight <= 1.0:
+            raise ValueError(
+                "novel_provisional_weight must be within [0, 1]"
+            )
+      if not 0.0 <= novel_confirmed_weight <= 1.0:
+            raise ValueError(
+                "novel_confirmed_weight must be within [0, 1]"
+            )
+      if novel_confirmed_ttl < 1:
+            raise ValueError("novel_confirmed_ttl must be at least 1")
+      if novel_confirmed_members < 1:
+            raise ValueError("novel_confirmed_members must be at least 1")
+      if novel_confirmed_members > novel_quarantine_tail:
+            raise ValueError(
+                "novel_confirmed_members must not exceed quarantine tail"
+            )
       self.ms_quantile = float(ms_quantile)
       self.support_quantile = float(support_quantile)
       self.duplicate_similarity = float(
@@ -110,6 +136,10 @@ class DynamicExpertManager:
       self.novel_quarantine_steps = int(novel_quarantine_steps)
       self.novel_quarantine_tail = int(novel_quarantine_tail)
       self.novel_ratio_threshold = float(novel_ratio_threshold)
+      self.novel_provisional_weight = float(novel_provisional_weight)
+      self.novel_confirmed_weight = float(novel_confirmed_weight)
+      self.novel_confirmed_ttl = int(novel_confirmed_ttl)
+      self.novel_confirmed_members = int(novel_confirmed_members)
       
       self.ms_history = []
       self.support_history = []
@@ -122,6 +152,48 @@ class DynamicExpertManager:
       self.last_step = -1
       self.novel_quarantine = None
       self.last_novel_quarantine_event = None
+      self.confirmed_provisional = None
+
+    def provisional_expert_before_step(self):
+        if (
+            self.novel_admission_mode
+            not in {"provisional", "soft_confirmed"}
+        ):
+            return None
+        if self.novel_quarantine:
+            representative = min(
+                self.novel_quarantine[-self.novel_quarantine_tail:],
+                key=lambda item: item["ms_short_score"],
+            )
+            start_step = self.novel_quarantine[0]["step"]
+            pool_size = len(self.novel_quarantine)
+            weight = self.novel_provisional_weight
+            state = "collecting"
+        elif self.confirmed_provisional is not None:
+            representatives = self.confirmed_provisional["members"]
+            representative = representatives[0]
+            start_step = self.confirmed_provisional["start_step"]
+            pool_size = self.novel_quarantine_steps
+            weight = self.novel_confirmed_weight
+            state = "confirmed"
+        else:
+            return None
+        return {
+            "image_id": int(representative["image_id"]),
+            "image_ids": [
+                int(member["image_id"])
+                for member in (
+                    representatives
+                    if state == "confirmed"
+                    else [representative]
+                )
+            ],
+            "representative_step": int(representative["step"]),
+            "start_step": int(start_step),
+            "pool_size": int(pool_size),
+            "weight": float(weight),
+            "state": state,
+        }
 
     def active_experts_before_step(self):
         return[
@@ -506,7 +578,11 @@ class DynamicExpertManager:
             "last_channel_support": None,
             "representative_mode": self.representative_mode,
             "admission_ttl_mode": self.admission_ttl_mode,
-            "admission_route": "new_distribution_quarantine",
+            "admission_route": (
+                "new_distribution_provisional"
+                if self.novel_admission_mode == "provisional"
+                else "new_distribution_quarantine"
+            ),
             "admission_candidate_ms_score": member["ms_score"],
             "admission_candidate_channel_support": member[
                 "channel_support"
@@ -530,11 +606,19 @@ class DynamicExpertManager:
         novel_trigger,
     ):
         self.last_novel_quarantine_event = None
-        if self.novel_admission_mode != "quarantine":
+        if self.novel_admission_mode not in {
+            "quarantine",
+            "provisional",
+            "soft_confirmed",
+        }:
             return None, None
         if ms_short_score is None or ms_short_ratio is None:
             return None, None
         if self.novel_quarantine is None and not novel_trigger:
+            if self.confirmed_provisional is not None:
+                self.confirmed_provisional["ttl"] -= 1
+                if self.confirmed_provisional["ttl"] <= 0:
+                    self.confirmed_provisional = None
             return None, None
 
         member = self._quarantine_member(
@@ -550,6 +634,7 @@ class DynamicExpertManager:
         if self.novel_quarantine is None:
             if not novel_trigger:
                 return None, None
+            self.confirmed_provisional = None
             self.novel_quarantine = [member]
             self.last_novel_quarantine_event = {
                 "decision": "opened",
@@ -600,6 +685,33 @@ class DynamicExpertManager:
             pool[-self.novel_quarantine_tail:],
             key=lambda item: item["ms_short_score"],
         )
+        if self.novel_admission_mode == "soft_confirmed":
+            representatives = sorted(
+                pool[-self.novel_quarantine_tail:],
+                key=lambda item: item["ms_short_score"],
+            )[:self.novel_confirmed_members]
+            self.confirmed_provisional = {
+                "members": representatives,
+                "start_step": pool[0]["step"],
+                "confirmation_step": int(step),
+                "ttl": self.novel_confirmed_ttl,
+            }
+            self.last_novel_quarantine_event = {
+                "decision": "confirmed_soft",
+                "start_step": pool[0]["step"],
+                "end_step": int(step),
+                "size": len(pool),
+                "median_ratio": median_ratio,
+                "selected_image_id": representative["image_id"],
+                "selected_ms_short": representative["ms_short_score"],
+                "confirmed_weight": self.novel_confirmed_weight,
+                "confirmed_ttl": self.novel_confirmed_ttl,
+                "confirmed_image_ids": [
+                    int(member["image_id"])
+                    for member in representatives
+                ],
+            }
+            return None, None
         cluster_id, expert_id = self._admit_quarantined_member(
             representative,
             step,
@@ -681,7 +793,8 @@ class DynamicExpertManager:
             )
         if (
             candidate_route == "new_distribution"
-            and self.novel_admission_mode == "quarantine"
+            and self.novel_admission_mode
+            in {"quarantine", "provisional", "soft_confirmed"}
         ):
             return True, None, None, candidate_route
 

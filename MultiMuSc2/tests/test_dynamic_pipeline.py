@@ -8,7 +8,10 @@ from MultiMuSc2.models.modules._DYNAMIC_PIPELINE import (
     build_dynamic_committee_timeline,
     score_dynamic_msm2_layer,
 )
-from MultiMuSc2.models.modules._MSM import aggregate_reference_distances
+from MultiMuSc2.models.modules._MSM import (
+    MSM2_online,
+    aggregate_reference_distances,
+)
 
 
 def synthetic_features(image_count=5):
@@ -163,6 +166,97 @@ class DynamicPipelineTest(unittest.TestCase):
             self.assertEqual(audits[0]["fallback_reason"], "first_image_unavailable")
             if mode == "clip_only":
                 self.assertEqual(audits[1]["effective_mode"], "clip_fallback")
+
+    def test_provisional_expert_blends_with_existing_dino_path(self):
+        dino = synthetic_features(4)
+        timeline = scoring_timeline()
+        timeline[2]["provisional_expert_before"] = {
+            "image_id": 1,
+            "representative_step": 1,
+            "start_step": 0,
+            "pool_size": 2,
+            "weight": 0.25,
+        }
+        base_score, _ = MSM2_online(
+            dino[2],
+            None,
+            dino[[0]],
+            None,
+            fusion_mode="dino_only",
+            topmin_min=0.02,
+            topmin_max=0.3,
+        )
+        provisional_score, _ = MSM2_online(
+            dino[2],
+            None,
+            dino[[1]],
+            None,
+            fusion_mode="dino_only",
+            topmin_min=0.02,
+            topmin_max=0.3,
+        )
+
+        scores, audits = score_dynamic_msm2_layer(
+            dino,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+        )
+
+        self.assertTrue(
+            torch.allclose(
+                scores[2],
+                0.75 * base_score + 0.25 * provisional_score,
+            )
+        )
+        self.assertEqual(audits[2]["effective_mode"], "dino_provisional")
+        self.assertEqual(audits[2]["provisional_expert_image_id"], 1)
+        self.assertEqual(audits[2]["provisional_expert_image_ids"], [1])
+        self.assertEqual(audits[2]["provisional_pool_size"], 2)
+
+    def test_confirmed_soft_committee_uses_all_historical_members(self):
+        dino = synthetic_features(4)
+        timeline = scoring_timeline()
+        timeline[3]["provisional_expert_before"] = {
+            "image_id": 1,
+            "image_ids": [1, 2],
+            "representative_step": 1,
+            "start_step": 0,
+            "pool_size": 4,
+            "weight": 0.5,
+            "state": "confirmed",
+        }
+        base_score, _ = MSM2_online(
+            dino[3],
+            None,
+            dino[[0]],
+            None,
+            fusion_mode="dino_only",
+            topmin_min=0.02,
+            topmin_max=0.3,
+        )
+        committee_score, _ = MSM2_online(
+            dino[3],
+            None,
+            dino[[1, 2]],
+            None,
+            fusion_mode="dino_only",
+            topmin_min=0.02,
+            topmin_max=0.3,
+        )
+
+        scores, audits = score_dynamic_msm2_layer(
+            dino,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+        )
+
+        self.assertTrue(
+            torch.allclose(scores[3], 0.5 * base_score + 0.5 * committee_score)
+        )
+        self.assertEqual(audits[3]["provisional_expert_image_ids"], [1, 2])
+
 
     def test_reset_starts_a_new_causal_history_segment(self):
         features = synthetic_features(6)

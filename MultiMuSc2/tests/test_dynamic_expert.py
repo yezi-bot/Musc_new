@@ -22,6 +22,13 @@ def prepared_manager(committee_cap=1):
 
 
 class DynamicExpertManagerTest(unittest.TestCase):
+    def test_confirmed_member_count_cannot_exceed_tail(self):
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            DynamicExpertManager(
+                novel_quarantine_tail=2,
+                novel_confirmed_members=3,
+            )
+
     def advance_candidate(
         self,
         manager,
@@ -214,6 +221,122 @@ class DynamicExpertManagerTest(unittest.TestCase):
         self.assertEqual(events[-1]["novel_quarantine"]["decision"], "rejected")
         self.assertIsNone(events[-1]["admitted_expert_id"])
         self.assertEqual(manager.active_experts, [])
+
+    def test_provisional_expert_is_historical_and_not_a_fuser_member(self):
+        manager = DynamicExpertManager(
+            candidate_mode="dual_path",
+            novel_admission_mode="provisional",
+            novel_quarantine_steps=4,
+            novel_quarantine_tail=2,
+            novel_ratio_threshold=0.95,
+            novel_provisional_weight=0.25,
+        )
+        manager.ms_history.extend([1.0] * 8)
+        manager.support_history.extend([0.7, 0.8, 0.9])
+
+        first = manager.advance(
+            step=0,
+            image_id=10,
+            dino_patch_features=patch_features(1.0, 1.0),
+            ms_score=1.2,
+            channel_support=0.1,
+            expert_channel_supports={},
+            provisional_channel_support=0.2,
+            ms_short_score=1.1,
+            ms_short_ratio=0.9,
+        )
+        snapshot = manager.provisional_expert_before_step()
+
+        self.assertEqual(first["candidate_route"], "new_distribution")
+        self.assertEqual(snapshot["image_id"], 10)
+        self.assertEqual(snapshot["image_ids"], [10])
+        self.assertEqual(snapshot["representative_step"], 0)
+        self.assertEqual(snapshot["weight"], 0.25)
+        self.assertEqual(manager.fuser_training_members(1), [])
+
+        events = []
+        for step, short_score in zip(range(1, 4), [1.0, 0.8, 0.9]):
+            events.append(
+                manager.advance(
+                    step=step,
+                    image_id=10 + step,
+                    dino_patch_features=patch_features(1.0 + step, 1.0),
+                    ms_score=0.5,
+                    channel_support=0.1,
+                    expert_channel_supports={},
+                    provisional_channel_support=0.0,
+                    ms_short_score=short_score,
+                    ms_short_ratio=0.9,
+                )
+            )
+
+        self.assertEqual(
+            events[-1]["admission_route"],
+            "new_distribution_provisional",
+        )
+        self.assertEqual(manager.active_experts[0]["image_id"], 12)
+        self.assertIsNone(manager.provisional_expert_before_step())
+
+    def test_soft_confirmation_stays_out_of_formal_committee(self):
+        manager = DynamicExpertManager(
+            candidate_mode="dual_path",
+            novel_admission_mode="soft_confirmed",
+            novel_quarantine_steps=4,
+            novel_quarantine_tail=2,
+            novel_ratio_threshold=0.95,
+            novel_provisional_weight=0.25,
+            novel_confirmed_weight=0.5,
+            novel_confirmed_ttl=2,
+            novel_confirmed_members=2,
+        )
+        manager.ms_history.extend([1.0] * 8)
+        manager.support_history.extend([0.7, 0.8, 0.9])
+
+        events = []
+        for step, short_score in enumerate([1.1, 1.0, 0.8, 0.9]):
+            events.append(
+                manager.advance(
+                    step=step,
+                    image_id=10 + step,
+                    dino_patch_features=patch_features(1.0 + step, 1.0),
+                    ms_score=1.2 if step == 0 else 0.5,
+                    channel_support=0.1,
+                    expert_channel_supports={},
+                    provisional_channel_support=0.2 if step == 0 else 0.0,
+                    ms_short_score=short_score,
+                    ms_short_ratio=0.9,
+                )
+            )
+
+        snapshot = manager.provisional_expert_before_step()
+        self.assertEqual(
+            events[-1]["novel_quarantine"]["decision"],
+            "confirmed_soft",
+        )
+        self.assertEqual(snapshot["image_id"], 12)
+        self.assertEqual(snapshot["image_ids"], [12, 13])
+        self.assertEqual(snapshot["weight"], 0.5)
+        self.assertEqual(snapshot["state"], "confirmed")
+        self.assertEqual(
+            events[-1]["novel_quarantine"]["confirmed_image_ids"],
+            [12, 13],
+        )
+        self.assertEqual(manager.active_experts, [])
+        self.assertEqual(manager.fuser_training_members(4), [])
+
+        for step in range(4, 6):
+            manager.advance(
+                step=step,
+                image_id=10 + step,
+                dino_patch_features=patch_features(1.0 + step, 1.0),
+                ms_score=0.5,
+                channel_support=0.1,
+                expert_channel_supports={},
+                provisional_channel_support=0.0,
+                ms_short_score=0.9,
+                ms_short_ratio=0.9,
+            )
+        self.assertIsNone(manager.provisional_expert_before_step())
 
 
 if __name__ == "__main__":
