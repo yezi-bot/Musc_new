@@ -508,7 +508,7 @@ class MuSc():
                             ),
                             committee_min_experts=int(
                                 self.dynamic_fusion_cfg.get(
-                                    'committee_min_experts', 4
+                                    'committee_min_experts', 3
                                 )
                             ),
                             committee_stable_steps=int(

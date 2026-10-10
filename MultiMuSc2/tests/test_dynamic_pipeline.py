@@ -175,7 +175,7 @@ class DynamicPipelineTest(unittest.TestCase):
         self.assertFalse(audits[4]["fuser_retrained"])
         self.assertEqual(audits[4]["training_image_count"], 2)
 
-    def test_committee_gate_waits_for_four_stable_active_experts(self):
+    def test_committee_gate_waits_for_three_stable_active_experts(self):
         dino = synthetic_features(6)
         timeline = scoring_timeline(6)
         active = [
@@ -185,7 +185,7 @@ class DynamicPipelineTest(unittest.TestCase):
                 "cluster_id": image_id,
                 "admission_step": image_id,
             }
-            for image_id in range(4)
+            for image_id in range(3)
         ]
         timeline[4]["active_experts_before"] = active
         timeline[5]["active_experts_before"] = active
@@ -196,7 +196,7 @@ class DynamicPipelineTest(unittest.TestCase):
             fusion_mode="fuser",
             retrain_policy="committee_gate",
             training_source="active_committee",
-            committee_min_experts=4,
+            committee_min_experts=3,
             committee_stable_steps=2,
         )
         dino_scores, _ = score_dynamic_msm2_layer(
@@ -211,7 +211,7 @@ class DynamicPipelineTest(unittest.TestCase):
         self.assertTrue(torch.allclose(gated_scores[4], dino_scores[4]))
         self.assertFalse(audits[4]["fuser_retrained"])
         self.assertTrue(audits[5]["fuser_retrained"])
-        self.assertEqual(audits[5]["fuser_training_image_ids"], [0, 1, 2, 3])
+        self.assertEqual(audits[5]["fuser_training_image_ids"], [0, 1, 2])
 
 
 if __name__ == "__main__":

@@ -241,7 +241,7 @@ def score_dynamic_msm2_layer(
     topmin_max=0.3,
     retrain_policy="on_change",
     training_source="cluster_history",
-    committee_min_experts=4,
+    committee_min_experts=3,
     committee_stable_steps=2,
     committee_change_ratio=0.4,
     committee_retrain_cooldown=5,

@@ -201,7 +201,7 @@ def run_variant(base_config, args, seed, variant_name, timeline_path=None):
     cfg["models"]["dynamic_fusion"]["training_source"] = variant[
         "training_source"
     ]
-    cfg["models"]["dynamic_fusion"]["committee_min_experts"] = 4
+    cfg["models"]["dynamic_fusion"]["committee_min_experts"] = 3
     cfg["models"]["dynamic_fusion"]["committee_stable_steps"] = 2
     cfg["models"]["dynamic_fusion"]["committee_change_ratio"] = 0.4
     cfg["models"]["dynamic_fusion"]["committee_retrain_cooldown"] = 5
