@@ -118,10 +118,16 @@ class DynamicPipelineTest(unittest.TestCase):
         clip = dino * 1.7
         timeline = scoring_timeline()
 
-        for mode in ("fuser", "fixed", "dino_only", "clip_only"):
+        for mode in (
+            "fuser",
+            "fixed",
+            "dino_only",
+            "clip_only",
+            "strict_history_dino",
+        ):
             scores, audits = score_dynamic_msm2_layer(
                 dino,
-                None if mode == "dino_only" else clip,
+                None if mode in {"dino_only", "strict_history_dino"} else clip,
                 timeline,
                 fusion_mode=mode,
             )
@@ -130,6 +136,34 @@ class DynamicPipelineTest(unittest.TestCase):
             self.assertEqual(audits[0]["fallback_reason"], "first_image_unavailable")
             if mode == "clip_only":
                 self.assertEqual(audits[1]["effective_mode"], "clip_fallback")
+
+    def test_reset_starts_a_new_causal_history_segment(self):
+        features = synthetic_features(6)
+        timeline = build_dynamic_committee_timeline(
+            features,
+            device="cpu",
+            reset_steps=[3],
+        )
+        scores, audits = score_dynamic_msm2_layer(
+            features,
+            None,
+            timeline,
+            fusion_mode="strict_history_dino",
+        )
+        expected = aggregate_reference_distances(
+            features[4],
+            features[3:4],
+            topmin_min=0,
+            topmin_max=0.3,
+        )
+
+        self.assertTrue(timeline[3]["state_reset_before"])
+        self.assertEqual(timeline[3]["segment_start"], 3)
+        self.assertIsNone(timeline[3]["ms_score"])
+        self.assertEqual(audits[3]["fallback_reason"], "first_image_unavailable")
+        self.assertTrue(torch.equal(scores[3], torch.zeros_like(scores[3])))
+        self.assertTrue(torch.allclose(scores[4], expected))
+        self.assertNotIn("dino_mean", audits[4])
 
     def test_fuser_retrains_only_when_member_signature_changes(self):
         dino = synthetic_features(4)

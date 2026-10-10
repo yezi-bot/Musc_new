@@ -64,6 +64,7 @@ def build_dynamic_committee_timeline(
     mature_span=3.0,
     density_k=5,
     manager_kwargs=None,
+    reset_steps=None,
 ):
     if committee_features.ndim != 3:
         raise ValueError("committee_features must have shape [image, patch, feature]")
@@ -71,19 +72,42 @@ def build_dynamic_committee_timeline(
     if grid_size * grid_size != committee_features.shape[1]:
         raise ValueError("committee patch count must form a square grid")
 
-    memory = ChannelMemory(
-        max_ttl=channel_ttl,
-        mature_span=mature_span,
-        density_k=density_k,
-        device=device,
-        position_radius=position_radius,
-    )
+    reset_steps = set(reset_steps or [])
+    invalid_reset_steps = [
+        step
+        for step in reset_steps
+        if step <= 0 or step >= committee_features.shape[0]
+    ]
+    if invalid_reset_steps:
+        raise ValueError("reset_steps must be inside the feature stream")
+
+    def new_memory():
+        return ChannelMemory(
+            max_ttl=channel_ttl,
+            mature_span=mature_span,
+            density_k=density_k,
+            device=device,
+            position_radius=position_radius,
+        )
+
+    memory = new_memory()
     manager = DynamicExpertManager(**(manager_kwargs or {}))
     historical_features = []
     distance_history = []
     timeline = []
+    segment_start = 0
 
     for step in range(committee_features.shape[0]):
+        state_reset_before = step in reset_steps
+        if state_reset_before:
+            next_expert_id = manager.next_expert_id
+            memory = new_memory()
+            manager = DynamicExpertManager(**(manager_kwargs or {}))
+            manager.next_expert_id = next_expert_id
+            manager.last_step = step - 1
+            historical_features = []
+            distance_history = []
+            segment_start = step
         current = committee_features[step]
         active_before = manager.active_experts_before_step()
         training_members = manager.fuser_training_members(step)
@@ -137,6 +161,8 @@ def build_dynamic_committee_timeline(
         timeline.append(
             {
                 "step": step,
+                "segment_start": segment_start,
+                "state_reset_before": state_reset_before,
                 "active_experts_before": active_before,
                 "fuser_training_members_before": training_members,
                 "ms_score": ms_score,
@@ -254,7 +280,7 @@ def score_dynamic_msm2_layer(
         raise ValueError(f"unsupported retrain_policy: {retrain_policy}")
     if training_source not in {"cluster_history", "active_committee"}:
         raise ValueError(f"unsupported training_source: {training_source}")
-    if fusion_mode != "dino_only":
+    if fusion_mode not in {"dino_only", "strict_history_dino"}:
         if clip_features is None or clip_features.shape[0] != dino_features.shape[0]:
             raise ValueError("DINO and CLIP image counts must match")
 
@@ -267,8 +293,18 @@ def score_dynamic_msm2_layer(
     last_fit_step = None
     previous_active_signature = None
     active_stable_count = 0
+    history_start = 0
 
     for step, record in enumerate(timeline):
+        if record.get("state_reset_before", False):
+            history_start = step
+            cached_signature = None
+            cached_training = None
+            detect_fuser = None
+            fitted_signature = None
+            last_fit_step = None
+            previous_active_signature = None
+            active_stable_count = 0
         current_dino = dino_features[step]
         active = record["active_experts_before"]
         expert_image_ids = [expert["image_id"] for expert in active]
@@ -285,21 +321,28 @@ def score_dynamic_msm2_layer(
         ]
         fallback_reason = None
         effective_mode = fusion_mode
+        score_audit = None
         fuser_retrained = False
         training_recomputed = False
         change_ratio = None
 
-        if not expert_image_ids:
+        if fusion_mode == "strict_history_dino":
+            patch_score, fallback_reason = _strict_history_dino_fallback(
+                current_dino,
+                dino_features[history_start:step],
+            )
+            effective_mode = "strict_history_dino"
+        elif not expert_image_ids:
             if fusion_mode == "clip_only":
                 patch_score, fallback_reason = _strict_history_clip_fallback(
                     clip_features[step],
-                    clip_features[:step],
+                    clip_features[history_start:step],
                 )
                 effective_mode = "clip_fallback"
             else:
                 patch_score, fallback_reason = _strict_history_dino_fallback(
                     current_dino,
-                    dino_features[:step],
+                    dino_features[history_start:step],
                 )
                 effective_mode = "dino_fallback"
         elif fusion_mode == "dino_only":
@@ -470,7 +513,7 @@ def score_dynamic_msm2_layer(
                 else:
                     patch_score, fallback_reason = _strict_history_dino_fallback(
                         current_dino,
-                        dino_features[:step],
+                        dino_features[history_start:step],
                     )
                     effective_mode = "dino_fallback"
 
@@ -478,19 +521,21 @@ def score_dynamic_msm2_layer(
             if fusion_mode == "clip_only":
                 patch_score, fallback_reason = _strict_history_clip_fallback(
                     clip_features[step],
-                    clip_features[:step],
+                    clip_features[history_start:step],
                 )
                 effective_mode = "clip_fallback"
             else:
                 patch_score, fallback_reason = _strict_history_dino_fallback(
                     current_dino,
-                    dino_features[:step],
+                    dino_features[history_start:step],
                 )
                 effective_mode = "dino_fallback"
             fallback_reason = f"non_finite_score:{fallback_reason}"
 
         audit = {
             "step": step,
+            "segment_start": history_start,
+            "state_reset_before": record.get("state_reset_before", False),
             "requested_mode": fusion_mode,
             "effective_mode": effective_mode,
             "active_expert_ids": [expert["expert_id"] for expert in active],
@@ -519,9 +564,9 @@ def score_dynamic_msm2_layer(
                 else 0
             ),
         }
-        if "score_audit" in locals():
+        if score_audit is not None:
             audit.update(_distance_audit(score_audit))
-        if "score_audit" in locals() and score_audit.get("fuser_score") is not None:
+        if score_audit is not None and score_audit.get("fuser_score") is not None:
             audit.update(
                 {
                     "fuser_min": score_audit["fuser_min"],

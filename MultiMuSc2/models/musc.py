@@ -228,9 +228,17 @@ class MuSc():
                 cv2.imwrite(save_path, anomaly_map)
 
 
-    def make_category_data(self, category):
-        
-        print(category)
+    def make_category_data(self, category, return_predictions=False):
+        category_names = (
+            list(category)
+            if isinstance(category, (list, tuple))
+            else [category]
+        )
+        if not category_names:
+            raise ValueError('at least one category is required')
+        category_name = '_to_'.join(category_names)
+
+        print(category_name)
         torch.cuda.reset_max_memory_allocated()
         # divide sub-datasets
         divide_num = self.divide_num
@@ -244,10 +252,33 @@ class MuSc():
         start_time_all = time.time()
 
         dataset_num = 0
+        stream_boundaries = []
+        if len(category_names) > 1 and divide_num != 1:
+            raise ValueError('category streams require datasets.divide_num=1')
         # divide_iter：第几块
         for divide_iter in range(divide_num):
             #第i张图片的时候怎么处理
-            test_dataset = self.load_datasets(category, divide_num=divide_num, divide_iter=divide_iter)
+            if len(category_names) == 1:
+                test_dataset = self.load_datasets(
+                    category_names[0],
+                    divide_num=divide_num,
+                    divide_iter=divide_iter,
+                )
+            else:
+                segment_datasets = [
+                    self.load_datasets(
+                        name,
+                        divide_num=divide_num,
+                        divide_iter=divide_iter,
+                    )
+                    for name in category_names
+                ]
+                cumulative = 0
+                stream_boundaries = []
+                for segment in segment_datasets[:-1]:
+                    cumulative += len(segment)
+                    stream_boundaries.append(cumulative)
+                test_dataset = torch.utils.data.ConcatDataset(segment_datasets)
             #按照batch_size送入图片，怎么送入图片
             test_dataloader = torch.utils.data.DataLoader(
                 test_dataset,
@@ -387,6 +418,13 @@ class MuSc():
                                 )
                             ),
                         },
+                        reset_steps=(
+                            stream_boundaries
+                            if self.dynamic_committee_cfg.get(
+                                'reset_at_category_boundaries', False
+                            )
+                            else None
+                        ),
                     )
                 lowest_indices = None
             else:
@@ -604,7 +642,7 @@ class MuSc():
             if self.use_dynamic_model:
                 audit_path = os.path.join(
                     self.output_dir,
-                    f'{category}_dynamic_audit_seed{self.seed}_part{divide_iter}.json',
+                    f'{category_name}_dynamic_audit_seed{self.seed}_part{divide_iter}.json',
                 )
                 with open(audit_path, 'w', encoding='utf-8') as handle:
                     json.dump(
@@ -662,14 +700,25 @@ class MuSc():
         image_metric, pixel_metric = compute_metrics(gt_sp, pr_sp, gt_px, pr_px)
         auroc_sp, f1_sp, ap_sp = image_metric
         auroc_px, f1_px, ap_px, aupro = pixel_metric
-        print(category)
+        print(category_name)
         print('image-level, auroc:{}, f1:{}, ap:{}'.format(auroc_sp*100, f1_sp*100, ap_sp*100))
         print('pixel-level, auroc:{}, f1:{}, ap:{}, aupro:{}'.format(auroc_px*100, f1_px*100, ap_px*100, aupro*100))
 
         if self.vis:
             print('visualization...')
-            self.visualization_seg(image_path_list, gt_list, pr_px, category)
+            self.visualization_seg(image_path_list, gt_list, pr_px, category_name)
     
+        if return_predictions:
+            return image_metric, pixel_metric, {
+                'categories': category_names,
+                'stream_boundaries': stream_boundaries,
+                'image_paths': image_path_list,
+                'image_labels': gt_sp,
+                'image_scores': pr_sp,
+                'raw_image_scores': ac_score,
+                'pixel_labels': gt_px,
+                'pixel_scores': pr_px,
+            }
         return image_metric, pixel_metric
 
 
