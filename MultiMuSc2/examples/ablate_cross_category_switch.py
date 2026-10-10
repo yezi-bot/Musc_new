@@ -52,6 +52,8 @@ VARIANTS = {
     },
 }
 
+MS_SHORT_WINDOWS = (8, 16, 32)
+
 
 def load_config(path):
     with Path(path).open("r", encoding="utf-8") as handle:
@@ -198,6 +200,50 @@ def audit_metrics(audit_path, boundary):
     }
 
 
+def write_ms_long_short_diagnostics(audit_path, labels, boundary, output_path):
+    if audit_path is None:
+        return
+    audit = json.loads(Path(audit_path).read_text(encoding="utf-8"))
+    timeline = audit["timeline"]
+    if len(timeline) != len(labels):
+        raise RuntimeError("timeline and image labels must have the same length")
+
+    rows = []
+    for record, label in zip(timeline, labels):
+        ms_long = record.get("ms_long", record.get("ms_score"))
+        short_scores = record.get("ms_short_scores", {})
+        row = {
+            "step": record["step"],
+            "phase": "post" if record["step"] >= boundary else "pre",
+            "offset_from_boundary": record["step"] - boundary,
+            "is_anomaly": int(bool(label)),
+            "ms_long": ms_long,
+        }
+        for window in MS_SHORT_WINDOWS:
+            ms_short = short_scores.get(str(window))
+            row[f"ms_short_{window}"] = ms_short
+            row[f"ms_gap_{window}"] = (
+                ms_long - ms_short
+                if ms_long is not None and ms_short is not None
+                else None
+            )
+            row[f"ms_ratio_{window}"] = (
+                ms_short / ms_long
+                if ms_long is not None
+                and ms_long > 0.0
+                and ms_short is not None
+                else None
+            )
+        rows.append(row)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def run_variant(base_config, args, sequence, seed, variant_name):
     variant = VARIANTS[variant_name]
     sequence_name = "_to_".join(sequence)
@@ -227,6 +273,9 @@ def run_variant(base_config, args, sequence, seed, variant_name):
     cfg["models"]["dynamic_committee"]["novel_ms_quantile"] = 0.9
     cfg["models"]["dynamic_committee"]["novel_support_quantile"] = 0.3
     cfg["models"]["dynamic_committee"]["novel_provisional_min"] = 0.05
+    cfg["models"]["dynamic_committee"]["ms_short_windows"] = list(
+        MS_SHORT_WINDOWS
+    )
     cfg["models"].setdefault("dynamic_fusion", {})["mode"] = variant["mode"]
 
     model = MuSc(cfg, seed=seed)
@@ -253,6 +302,12 @@ def run_variant(base_config, args, sequence, seed, variant_name):
     pixel_scores = np.asarray(predictions["pixel_scores"])
     audit_files = list(run_output.rglob(f"{sequence_name}_dynamic_audit_*.json"))
     audit_path = audit_files[0] if len(audit_files) == 1 else None
+    write_ms_long_short_diagnostics(
+        audit_path,
+        labels,
+        boundary,
+        run_output / "ms_long_short_diagnostics.csv",
+    )
 
     row = {
         "sequence": "->".join(sequence),

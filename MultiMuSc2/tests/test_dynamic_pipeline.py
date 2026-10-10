@@ -113,6 +113,33 @@ class DynamicPipelineTest(unittest.TestCase):
                 )
             )
 
+    def test_short_ms_uses_only_recent_strict_history(self):
+        features = synthetic_features(6)
+        timeline = build_dynamic_committee_timeline(
+            features,
+            device="cpu",
+            ms_short_windows=(2, 4),
+        )
+
+        expected_long = _image_msm_score(
+            features[5],
+            list(features[:5]),
+        )
+        expected_short = _image_msm_score(
+            features[5],
+            list(features[3:5]),
+        )
+
+        self.assertAlmostEqual(timeline[5]["ms_score"], expected_long)
+        self.assertAlmostEqual(
+            timeline[5]["ms_short_scores"]["2"],
+            expected_short,
+        )
+        self.assertEqual(
+            timeline[5]["ms_short_history_sizes"],
+            {"2": 2, "4": 4},
+        )
+
     def test_all_modes_share_timeline_and_return_finite_scores(self):
         dino = synthetic_features(4)
         clip = dino * 1.7

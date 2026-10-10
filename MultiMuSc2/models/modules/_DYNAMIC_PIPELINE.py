@@ -15,7 +15,11 @@ from ._MSM import (
 )
 
 
-def _image_msm_score(current, historical_features, reference_chunk_size=8):
+def _patch_to_history_image_distances(
+    current,
+    historical_features,
+    reference_chunk_size=8,
+):
     if not historical_features:
         return None
     if reference_chunk_size < 1:
@@ -36,12 +40,54 @@ def _image_msm_score(current, historical_features, reference_chunk_size=8):
             patch_count,
         )
         patch_to_image.append(distances.amin(dim=-1))
+    return torch.cat(patch_to_image, dim=1)
+
+
+def _image_msm_from_distances(patch_to_image):
     patch_scores = interval_average(
-        torch.cat(patch_to_image, dim=1),
+        patch_to_image,
         topmin_min=0,
         topmin_max=0.3,
     )
     return float(patch_scores.max().cpu())
+
+
+def _image_msm_score(current, historical_features, reference_chunk_size=8):
+    distances = _patch_to_history_image_distances(
+        current,
+        historical_features,
+        reference_chunk_size=reference_chunk_size,
+    )
+    return None if distances is None else _image_msm_from_distances(distances)
+
+
+def _image_msm_profile(
+    current,
+    historical_features,
+    short_windows=(8, 16, 32),
+    reference_chunk_size=8,
+):
+    windows = tuple(int(window) for window in short_windows)
+    if not windows or any(window < 1 for window in windows):
+        raise ValueError("short_windows must contain positive integers")
+    if len(set(windows)) != len(windows):
+        raise ValueError("short_windows must not contain duplicates")
+
+    distances = _patch_to_history_image_distances(
+        current,
+        historical_features,
+        reference_chunk_size=reference_chunk_size,
+    )
+    if distances is None:
+        return None, {str(window): None for window in windows}
+
+    long_score = _image_msm_from_distances(distances)
+    short_scores = {}
+    for window in windows:
+        short_scores[str(window)] = _image_msm_from_distances(
+            distances[:, -min(window, distances.shape[1]) :]
+        )
+    return long_score, short_scores
 
 
 def _channel_support(memory, features, grid_size, distance_threshold):
@@ -63,11 +109,13 @@ def build_dynamic_committee_timeline(
     channel_ttl=5,
     mature_span=3.0,
     density_k=5,
+    ms_short_windows=(8, 16, 32),
     manager_kwargs=None,
     reset_steps=None,
 ):
     if committee_features.ndim != 3:
         raise ValueError("committee_features must have shape [image, patch, feature]")
+    ms_short_windows = tuple(int(window) for window in ms_short_windows)
     grid_size = math.isqrt(committee_features.shape[1])
     if grid_size * grid_size != committee_features.shape[1]:
         raise ValueError("committee patch count must form a square grid")
@@ -111,7 +159,18 @@ def build_dynamic_committee_timeline(
         current = committee_features[step]
         active_before = manager.active_experts_before_step()
         training_members = manager.fuser_training_members(step)
-        ms_score = _image_msm_score(current, historical_features)
+        ms_score, ms_short_scores = _image_msm_profile(
+            current,
+            historical_features,
+            short_windows=ms_short_windows,
+        )
+        primary_short_window = int(ms_short_windows[0])
+        ms_short = ms_short_scores[str(primary_short_window)]
+        ms_short_ratio = (
+            ms_short / ms_score
+            if ms_score is not None and ms_score > 0.0
+            else None
+        )
         distance_threshold = (
             float(np.quantile(distance_history, channel_distance_quantile))
             if distance_history
@@ -174,6 +233,15 @@ def build_dynamic_committee_timeline(
                 "active_experts_before": active_before,
                 "fuser_training_members_before": training_members,
                 "ms_score": ms_score,
+                "ms_long": ms_score,
+                "ms_short": ms_short,
+                "ms_short_ratio": ms_short_ratio,
+                "ms_short_window": primary_short_window,
+                "ms_short_scores": ms_short_scores,
+                "ms_short_history_sizes": {
+                    str(window): min(int(window), len(historical_features))
+                    for window in ms_short_windows
+                },
                 "channel_distance_threshold": distance_threshold,
                 "channel_support": channel_support,
                 "association_profile": association_profile,

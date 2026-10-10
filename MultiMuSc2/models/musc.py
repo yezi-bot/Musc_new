@@ -386,6 +386,12 @@ class MuSc():
                         reliability_alpha=float(
                             self.dynamic_committee_cfg.get('reliability_alpha', 0.5)
                         ),
+                        ms_short_windows=tuple(
+                            int(window)
+                            for window in self.dynamic_committee_cfg.get(
+                                'ms_short_windows', [8, 16, 32]
+                            )
+                        ),
                         manager_kwargs={
                             'ms_quantile': float(
                                 self.dynamic_committee_cfg.get('ms_quantile', 0.3)
