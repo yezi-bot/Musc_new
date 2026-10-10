@@ -12,15 +12,11 @@ sys.path.append('./models/backbone')
 
 import datasets.mvtec as mvtec
 from datasets.mvtec import _CLASSNAMES as _CLASSNAMES_mvtec_ad
-import datasets.visa as visa
-from datasets.visa import _CLASSNAMES as _CLASSNAMES_visa
-import datasets.btad as btad
-from datasets.btad import _CLASSNAMES as _CLASSNAMES_btad
 
 import models.backbone.open_clip as open_clip
 import models.backbone._backbones as _backbones
 from models.modules._LNAMD import LNAMD
-from models.modules._MSM import MSM,MSM2
+from models.modules._MSM import MSM, MSM2, fit_causal_detect_fuser
 from models.modules._RsCIN import RsCIN
 from models.modules._CHANNEL import Channel, ChannelMemory
 from models.modules._DYNAMIC_PIPELINE import (
@@ -59,11 +55,13 @@ class MuSc():
         if isinstance(self.categories, str):
             if self.categories.lower() == 'all':
                 if self.dataset == 'visa':
-                    self.categories = _CLASSNAMES_visa
+                    from datasets.visa import _CLASSNAMES as classnames
+                    self.categories = classnames
                 elif self.dataset == 'mvtec_ad':
                     self.categories = _CLASSNAMES_mvtec_ad
                 elif self.dataset == 'btad':
-                    self.categories = _CLASSNAMES_btad
+                    from datasets.btad import _CLASSNAMES as classnames
+                    self.categories = classnames
             else:
                 self.categories = [self.categories]
 
@@ -121,6 +119,7 @@ class MuSc():
     def load_datasets(self, category, divide_num=1, divide_iter=0):
         # dataloader
         if self.dataset == 'visa':
+            import datasets.visa as visa
             test_dataset = visa.VisaDataset(source=self.path, split=visa.DatasetSplit.TEST,
                                             classname=category, resize=self.image_size, imagesize=self.image_size, clip_transformer=self.preprocess,
                                                 divide_num=divide_num, divide_iter=divide_iter, random_seed=self.seed)
@@ -129,6 +128,7 @@ class MuSc():
                                             classname=category, resize=self.image_size, imagesize=self.image_size, clip_transformer=self.preprocess,
                                                 divide_num=divide_num, divide_iter=divide_iter, random_seed=self.seed)
         elif self.dataset == 'btad':
+            import datasets.btad as btad
             test_dataset = btad.BTADDataset(source=self.path, split=btad.DatasetSplit.TEST,
                                             classname=category, resize=self.image_size, imagesize=self.image_size, clip_transformer=self.preprocess,
                                                 divide_num=divide_num, divide_iter=divide_iter, random_seed=self.seed)
@@ -500,6 +500,9 @@ class MuSc():
                             ),
                             topmin_min=0.02,
                             topmin_max=0.3,
+                            retrain_policy=self.dynamic_fusion_cfg.get(
+                                'retrain_policy', 'on_change'
+                            ),
                         )
                         for audit in layer_audits:
                             audit['aggregation_r'] = r
@@ -509,25 +512,50 @@ class MuSc():
                     else:
                         Z11 = Z1[lowest_indices]
                         Z22 = Z2[lowest_indices]
-                        train_samples = []
-                        image_num, patch_num, c = Z11.shape
-                        for x in range(Z11.shape[0]):
-                            train_sample1 = torch.cdist(
-                                Z11[x:x + 1], Z11.reshape(-1, c)
-                            ).reshape(patch_num, -1, patch_num)
-                            train_sample1 = torch.min(train_sample1, -1)[0]
-                            train_sample1 = torch.flatten(train_sample1).unsqueeze(0)
-                            train_sample2 = torch.cdist(
-                                Z22[x:x + 1], Z22.reshape(-1, c)
-                            ).reshape(patch_num, -1, patch_num)
-                            train_sample2 = torch.min(train_sample2, -1)[0]
-                            train_sample2 = torch.flatten(train_sample2).unsqueeze(0)
-                            train_sample = torch.cat(
-                                (train_sample1, train_sample2 * 0.5), dim=0
-                            ).T
-                            train_samples.append(train_sample)
-                        train_data = torch.cat(train_samples, dim=0).cpu()
-                        self.detect_fuser.fit(train_data)
+                        static_mode = self.dynamic_fusion_cfg.get('mode', 'fuser')
+                        if static_mode == 'static_loo':
+                            member_ids = [int(index) for index in lowest_indices]
+                            training = fit_causal_detect_fuser(
+                                self.detect_fuser,
+                                Z11,
+                                Z22,
+                                image_ids=member_ids,
+                                member_steps=list(range(len(member_ids))),
+                                current_step=len(member_ids) + 1,
+                                dino_weight=float(
+                                    self.dynamic_fusion_cfg.get('dino_weight', 1.0)
+                                ),
+                                clip_weight=float(
+                                    self.dynamic_fusion_cfg.get('clip_weight', 0.5)
+                                ),
+                                topmin_min=0.02,
+                                topmin_max=0.3,
+                            )
+                            if not training['fitted']:
+                                raise RuntimeError(
+                                    f"static leave-one-out fuser unavailable: "
+                                    f"{training['reason']}"
+                                )
+                        else:
+                            train_samples = []
+                            image_num, patch_num, c = Z11.shape
+                            for x in range(Z11.shape[0]):
+                                train_sample1 = torch.cdist(
+                                    Z11[x:x + 1], Z11.reshape(-1, c)
+                                ).reshape(patch_num, -1, patch_num)
+                                train_sample1 = torch.min(train_sample1, -1)[0]
+                                train_sample1 = torch.flatten(train_sample1).unsqueeze(0)
+                                train_sample2 = torch.cdist(
+                                    Z22[x:x + 1], Z22.reshape(-1, c)
+                                ).reshape(patch_num, -1, patch_num)
+                                train_sample2 = torch.min(train_sample2, -1)[0]
+                                train_sample2 = torch.flatten(train_sample2).unsqueeze(0)
+                                train_sample = torch.cat(
+                                    (train_sample1, train_sample2 * 0.5), dim=0
+                                ).T
+                                train_samples.append(train_sample)
+                            train_data = torch.cat(train_samples, dim=0).cpu()
+                            self.detect_fuser.fit(train_data)
                         print('layer-{} mutual scoring...'.format(l))
                         anomaly_maps_msm = MSM2(
                             Z=Z1,

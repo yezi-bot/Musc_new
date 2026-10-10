@@ -18,10 +18,26 @@ from models.musc import MuSc
 
 
 VARIANTS = {
-    "static_fuser": {"dynamic": False, "mode": "fuser"},
-    "dynamic_fuser": {"dynamic": True, "mode": "fuser"},
-    "dynamic_fixed": {"dynamic": True, "mode": "fixed"},
-    "dynamic_dino_only": {"dynamic": True, "mode": "dino_only"},
+    "static_fuser_self": {
+        "dynamic": False,
+        "mode": "fuser",
+        "retrain_policy": "on_change",
+    },
+    "static_fuser_loo": {
+        "dynamic": False,
+        "mode": "static_loo",
+        "retrain_policy": "on_change",
+    },
+    "dynamic_fuser_frozen": {
+        "dynamic": True,
+        "mode": "fuser",
+        "retrain_policy": "fit_once",
+    },
+    "dynamic_fuser_retrain": {
+        "dynamic": True,
+        "mode": "fuser",
+        "retrain_policy": "on_change",
+    },
 }
 
 
@@ -47,7 +63,10 @@ def read_csv(path):
             for key, value in row.items():
                 if key in {"seed", "variant"}:
                     continue
-                parsed[key] = float(value) if value else None
+                if key == "fallback_reason_counts":
+                    parsed[key] = value
+                else:
+                    parsed[key] = float(value) if value else None
             rows.append(parsed)
     return rows
 
@@ -103,13 +122,56 @@ def scoring_metrics(scoring):
         for row in scoring
         if row["fallback_reason"] == "first_image_unavailable"
     }
+    fuser_records = [row for row in scoring if "fuser_mean" in row]
+    fallback_reason_counts = {}
+    for row in fallback:
+        reason = row["fallback_reason"]
+        fallback_reason_counts[reason] = fallback_reason_counts.get(reason, 0) + 1
     return {
         "scoring_record_count": len(scoring),
         "expert_scoring_coverage": len(covered) / len(scoring) if scoring else None,
         "fallback_record_count": len(fallback),
         "fallback_step_count": len(fallback_steps),
         "first_image_unavailable_step_count": len(first_image_steps),
+        "fuser_retrain_count": sum(row["fuser_retrained"] for row in scoring),
+        "training_recompute_count": sum(
+            row.get("training_recomputed", False) for row in scoring
+        ),
+        "fuser_score_min": (
+            min(row["fuser_min"] for row in fuser_records)
+            if fuser_records else None
+        ),
+        "fuser_score_max": (
+            max(row["fuser_max"] for row in fuser_records)
+            if fuser_records else None
+        ),
+        "fuser_score_mean": _mean_field(fuser_records, "fuser_mean"),
+        "fuser_negative_ratio": _mean_field(
+            fuser_records, "fuser_negative_ratio"
+        ),
+        "training_image_count_max": max(
+            (row["training_image_count"] for row in scoring), default=0
+        ),
+        "training_patch_pair_count_max": max(
+            (row["training_patch_pair_count"] for row in scoring), default=0
+        ),
+        "dino_score_mean": _mean_field(scoring, "dino_mean"),
+        "clip_score_mean": _mean_field(scoring, "clip_mean"),
+        "dino_clip_correlation_mean": _mean_field(
+            scoring, "dino_clip_correlation"
+        ),
+        "dino_clip_z_disagreement_mean": _mean_field(
+            scoring, "dino_clip_z_disagreement"
+        ),
+        "fallback_reason_counts": json.dumps(
+            fallback_reason_counts, ensure_ascii=False, sort_keys=True
+        ),
     }
+
+
+def _mean_field(rows, field):
+    values = [row[field] for row in rows if row.get(field) is not None]
+    return sum(values) / len(values) if values else None
 
 
 def run_variant(base_config, args, seed, variant_name, timeline_path=None):
@@ -123,6 +185,9 @@ def run_variant(base_config, args, seed, variant_name, timeline_path=None):
     cfg["testing"]["save_excel"] = False
     cfg["testing"]["max_samples"] = args.max_samples
     cfg["testing"]["shuffle_stream"] = True
+    cfg["models"]["feature_layers"] = [23]
+    cfg["models"]["r_list"] = [1]
+    cfg["models"]["r_list2"] = [1]
     run_output = Path(args.output_dir) / f"seed_{seed}" / variant_name
     cfg["testing"]["output_dir"] = str(run_output)
     cfg["models"].setdefault("dynamic_committee", {})["enabled"] = variant[
@@ -132,6 +197,9 @@ def run_variant(base_config, args, seed, variant_name, timeline_path=None):
         str(timeline_path) if timeline_path else None
     )
     cfg["models"].setdefault("dynamic_fusion", {})["mode"] = variant["mode"]
+    cfg["models"]["dynamic_fusion"]["retrain_policy"] = variant[
+        "retrain_policy"
+    ]
 
     model = MuSc(cfg, seed=seed)
     if torch.cuda.is_available():
@@ -169,6 +237,19 @@ def run_variant(base_config, args, seed, variant_name, timeline_path=None):
         "admitted_expert_count": None,
         "normal_expert_count": None,
         "anomaly_expert_count": None,
+        "fuser_retrain_count": None,
+        "training_recompute_count": None,
+        "fuser_score_min": None,
+        "fuser_score_max": None,
+        "fuser_score_mean": None,
+        "fuser_negative_ratio": None,
+        "training_image_count_max": None,
+        "training_patch_pair_count_max": None,
+        "dino_score_mean": None,
+        "clip_score_mean": None,
+        "dino_clip_correlation_mean": None,
+        "dino_clip_z_disagreement_mean": None,
+        "fallback_reason_counts": None,
     }
     timeline = None
     if variant["dynamic"]:
@@ -189,7 +270,7 @@ def aggregate(rows):
     numeric_fields = [
         key
         for key in rows[0]
-        if key not in {"seed", "variant"}
+        if key not in {"seed", "variant", "fallback_reason_counts"}
     ]
     for variant_name in VARIANTS:
         variant_rows = [row for row in rows if row["variant"] == variant_name]

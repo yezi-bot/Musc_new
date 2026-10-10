@@ -169,6 +169,46 @@ def _strict_history_dino_fallback(current_dino, dino_history):
     ), "strict_history_dino"
 
 
+def _strict_history_clip_fallback(current_clip, clip_history):
+    if clip_history.shape[0] == 0:
+        return torch.zeros(
+            current_clip.shape[0],
+            device=current_clip.device,
+            dtype=torch.float32,
+        ), "first_image_unavailable"
+    return aggregate_reference_distances(
+        current_clip,
+        clip_history,
+        topmin_min=0,
+        topmin_max=0.3,
+    ), "strict_history_clip"
+
+
+def _distance_audit(score_audit):
+    result = {}
+    dino_distance = score_audit.get("dino_distance")
+    clip_distance = score_audit.get("clip_distance")
+    for name, values in (("dino", dino_distance), ("clip", clip_distance)):
+        if values is not None:
+            result[f"{name}_min"] = float(values.min())
+            result[f"{name}_max"] = float(values.max())
+            result[f"{name}_mean"] = float(values.mean())
+    if dino_distance is not None and clip_distance is not None:
+        dino_std = dino_distance.float().std(unbiased=False)
+        clip_std = clip_distance.float().std(unbiased=False)
+        if dino_std > 0 and clip_std > 0:
+            dino_z = (dino_distance - dino_distance.mean()) / dino_std
+            clip_z = (clip_distance - clip_distance.mean()) / clip_std
+            result["dino_clip_correlation"] = float(torch.mean(dino_z * clip_z))
+            result["dino_clip_z_disagreement"] = float(
+                torch.mean(torch.abs(dino_z - clip_z))
+            )
+        else:
+            result["dino_clip_correlation"] = None
+            result["dino_clip_z_disagreement"] = None
+    return result
+
+
 def score_dynamic_msm2_layer(
     dino_features,
     clip_features,
@@ -179,11 +219,14 @@ def score_dynamic_msm2_layer(
     epsilon=1e-6,
     topmin_min=0.02,
     topmin_max=0.3,
+    retrain_policy="on_change",
 ):
     if dino_features.ndim != 3:
         raise ValueError("dino_features must have shape [image, patch, feature]")
     if len(timeline) != dino_features.shape[0]:
         raise ValueError("timeline and feature image counts must match")
+    if retrain_policy not in {"on_change", "fit_once"}:
+        raise ValueError(f"unsupported retrain_policy: {retrain_policy}")
     if fusion_mode != "dino_only":
         if clip_features is None or clip_features.shape[0] != dino_features.shape[0]:
             raise ValueError("DINO and CLIP image counts must match")
@@ -201,13 +244,21 @@ def score_dynamic_msm2_layer(
         fallback_reason = None
         effective_mode = fusion_mode
         fuser_retrained = False
+        training_recomputed = False
 
         if not expert_image_ids:
-            patch_score, fallback_reason = _strict_history_dino_fallback(
-                current_dino,
-                dino_features[:step],
-            )
-            effective_mode = "dino_fallback"
+            if fusion_mode == "clip_only":
+                patch_score, fallback_reason = _strict_history_clip_fallback(
+                    clip_features[step],
+                    clip_features[:step],
+                )
+                effective_mode = "clip_fallback"
+            else:
+                patch_score, fallback_reason = _strict_history_dino_fallback(
+                    current_dino,
+                    dino_features[:step],
+                )
+                effective_mode = "dino_fallback"
         elif fusion_mode == "dino_only":
             patch_score, score_audit = MSM2_online(
                 current_dino,
@@ -218,12 +269,27 @@ def score_dynamic_msm2_layer(
                 topmin_min=topmin_min,
                 topmin_max=topmin_max,
             )
+        elif fusion_mode == "clip_only":
+            patch_score, score_audit = MSM2_online(
+                current_dino,
+                clip_features[step],
+                dino_features[expert_image_ids],
+                clip_features[expert_image_ids],
+                fusion_mode="clip_only",
+                topmin_min=topmin_min,
+                topmin_max=topmin_max,
+            )
         else:
             members = record["fuser_training_members_before"]
             member_ids = [member["image_id"] for member in members]
             member_steps = [member["step"] for member in members]
             signature = tuple(member_ids)
-            if signature != cached_signature:
+            should_recompute = signature != cached_signature and (
+                retrain_policy == "on_change"
+                or cached_training is None
+                or not cached_training.get("fitted", False)
+            )
+            if should_recompute:
                 if fusion_mode == "fixed":
                     cached_training = build_causal_fuser_training_data(
                         dino_features[member_ids],
@@ -256,7 +322,8 @@ def score_dynamic_msm2_layer(
                         topmin_max=topmin_max,
                     )
                 cached_signature = signature
-                fuser_retrained = True
+                training_recomputed = True
+                fuser_retrained = fusion_mode == "fuser"
 
             dino_scale = cached_training.get("dino_scale")
             clip_scale = cached_training.get("clip_scale")
@@ -299,11 +366,18 @@ def score_dynamic_msm2_layer(
                 effective_mode = "dino_fallback"
 
         if not torch.isfinite(patch_score).all():
-            patch_score, fallback_reason = _strict_history_dino_fallback(
-                current_dino,
-                dino_features[:step],
-            )
-            effective_mode = "dino_fallback"
+            if fusion_mode == "clip_only":
+                patch_score, fallback_reason = _strict_history_clip_fallback(
+                    clip_features[step],
+                    clip_features[:step],
+                )
+                effective_mode = "clip_fallback"
+            else:
+                patch_score, fallback_reason = _strict_history_dino_fallback(
+                    current_dino,
+                    dino_features[:step],
+                )
+                effective_mode = "dino_fallback"
             fallback_reason = f"non_finite_score:{fallback_reason}"
 
         audit = {
@@ -316,8 +390,23 @@ def score_dynamic_msm2_layer(
                 [member["image_id"] for member in record["fuser_training_members_before"]]
             ),
             "fuser_retrained": fuser_retrained,
+            "training_recomputed": training_recomputed,
+            "retrain_policy": retrain_policy,
             "fallback_reason": fallback_reason,
+            "training_image_count": (
+                len(cached_training["image_ids"])
+                if cached_training is not None
+                else 0
+            ),
+            "training_patch_pair_count": (
+                int(cached_training["train_pairs"].shape[0])
+                if cached_training is not None
+                and cached_training.get("train_pairs") is not None
+                else 0
+            ),
         }
+        if "score_audit" in locals():
+            audit.update(_distance_audit(score_audit))
         if "score_audit" in locals() and score_audit.get("fuser_score") is not None:
             audit.update(
                 {

@@ -99,7 +99,7 @@ class DynamicPipelineTest(unittest.TestCase):
         clip = dino * 1.7
         timeline = scoring_timeline()
 
-        for mode in ("fuser", "fixed", "dino_only"):
+        for mode in ("fuser", "fixed", "dino_only", "clip_only"):
             scores, audits = score_dynamic_msm2_layer(
                 dino,
                 None if mode == "dino_only" else clip,
@@ -109,6 +109,8 @@ class DynamicPipelineTest(unittest.TestCase):
             self.assertEqual(scores.shape, (4, 4))
             self.assertTrue(torch.isfinite(scores).all())
             self.assertEqual(audits[0]["fallback_reason"], "first_image_unavailable")
+            if mode == "clip_only":
+                self.assertEqual(audits[1]["effective_mode"], "clip_fallback")
 
     def test_fuser_retrains_only_when_member_signature_changes(self):
         dino = synthetic_features(4)
@@ -121,6 +123,38 @@ class DynamicPipelineTest(unittest.TestCase):
 
         self.assertTrue(audits[2]["fuser_retrained"])
         self.assertFalse(audits[3]["fuser_retrained"])
+
+    def test_fixed_recomputes_scales_without_reporting_fuser_retrain(self):
+        dino = synthetic_features(4)
+        _, audits = score_dynamic_msm2_layer(
+            dino,
+            dino * 2.0,
+            scoring_timeline(),
+            fusion_mode="fixed",
+        )
+
+        self.assertTrue(audits[2]["training_recomputed"])
+        self.assertFalse(audits[2]["fuser_retrained"])
+
+    def test_fit_once_freezes_fuser_after_first_successful_fit(self):
+        dino = synthetic_features(5)
+        timeline = scoring_timeline(5)
+        timeline[4]["fuser_training_members_before"] = [
+            {"step": 0, "image_id": 0, "cluster_id": 0},
+            {"step": 1, "image_id": 1, "cluster_id": 0},
+            {"step": 2, "image_id": 2, "cluster_id": 0},
+        ]
+        _, audits = score_dynamic_msm2_layer(
+            dino,
+            dino * 2.0,
+            timeline,
+            fusion_mode="fuser",
+            retrain_policy="fit_once",
+        )
+
+        self.assertTrue(audits[2]["fuser_retrained"])
+        self.assertFalse(audits[4]["fuser_retrained"])
+        self.assertEqual(audits[4]["training_image_count"], 2)
 
 
 if __name__ == "__main__":

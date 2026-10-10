@@ -117,6 +117,21 @@ class OnlineMSMTest(unittest.TestCase):
         self.assertEqual(patch_score.shape, (2,))
         self.assertIsNone(audit["clip_distance"])
 
+    def test_clip_only_returns_clip_distance(self):
+        current = torch.zeros(2, 2)
+        expert_dino = torch.full((1, 2, 2), 2.0)
+        expert_clip = torch.full((1, 2, 2), 4.0)
+        patch_score, audit = MSM2_online(
+            current,
+            current,
+            expert_dino,
+            expert_clip,
+            fusion_mode="clip_only",
+        )
+
+        self.assertTrue(torch.equal(patch_score, audit["clip_distance"]))
+        self.assertFalse(torch.equal(patch_score, audit["dino_distance"]))
+
     def test_causal_training_is_leave_one_image_out(self):
         dino = torch.tensor(
             [

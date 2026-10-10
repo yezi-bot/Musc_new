@@ -131,7 +131,9 @@ def MSM2_online(
         raise ValueError("DINO and CLIP patch counts must match")
 
     fuser_score = None
-    if fusion_mode == "fixed":
+    if fusion_mode == "clip_only":
+        patch_score = clip_distance
+    elif fusion_mode == "fixed":
         if dino_scale is None or clip_scale is None:
             raise ValueError("fixed fusion requires historical DINO and CLIP scales")
         dino_scale = max(float(dino_scale), epsilon)
