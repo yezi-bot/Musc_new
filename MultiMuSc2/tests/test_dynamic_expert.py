@@ -148,6 +148,73 @@ class DynamicExpertManagerTest(unittest.TestCase):
         self.assertIsNone(event["candidate_route"])
         self.assertIsNone(event["admitted_expert_id"])
 
+    def test_quarantine_restarts_and_selects_from_stable_tail(self):
+        manager = DynamicExpertManager(
+            candidate_mode="dual_path",
+            novel_admission_mode="quarantine",
+            novel_quarantine_steps=8,
+            novel_quarantine_tail=4,
+            novel_ratio_threshold=0.95,
+            novel_provisional_min=0.05,
+        )
+        manager.ms_history.extend([1.0] * 8)
+        manager.support_history.extend([0.7, 0.8, 0.9])
+        short_scores = [1.2, 1.1, 1.0, 0.98, 0.96, 0.91, 0.93, 0.80, 0.90]
+        ratios = [1.0, 0.9, 0.91, 0.92, 0.90, 0.89, 0.91, 0.88, 0.92]
+
+        events = []
+        for step in range(9):
+            trigger = step < 2
+            events.append(
+                manager.advance(
+                    step=step,
+                    image_id=100 + step,
+                    dino_patch_features=patch_features(1.0 + step, 1.0),
+                    ms_score=1.2 if trigger else 0.5,
+                    channel_support=0.1,
+                    expert_channel_supports={},
+                    provisional_channel_support=0.2 if trigger else 0.0,
+                    ms_short_score=short_scores[step],
+                    ms_short_ratio=ratios[step],
+                )
+            )
+
+        self.assertEqual(events[1]["novel_quarantine"]["decision"], "restarted")
+        self.assertEqual(events[8]["admission_route"], "new_distribution_quarantine")
+        self.assertEqual(events[8]["novel_quarantine"]["selected_image_id"], 107)
+        self.assertEqual(manager.active_experts[0]["image_id"], 107)
+
+    def test_quarantine_rejects_non_shift_pool(self):
+        manager = DynamicExpertManager(
+            candidate_mode="dual_path",
+            novel_admission_mode="quarantine",
+            novel_quarantine_steps=4,
+            novel_quarantine_tail=2,
+            novel_ratio_threshold=0.95,
+        )
+        manager.ms_history.extend([1.0] * 8)
+        manager.support_history.extend([0.7, 0.8, 0.9])
+
+        events = []
+        for step in range(4):
+            events.append(
+                manager.advance(
+                    step=step,
+                    image_id=step,
+                    dino_patch_features=patch_features(1.0 + step, 1.0),
+                    ms_score=1.2 if step == 0 else 0.5,
+                    channel_support=0.1,
+                    expert_channel_supports={},
+                    provisional_channel_support=0.2 if step == 0 else 0.0,
+                    ms_short_score=1.0,
+                    ms_short_ratio=1.01,
+                )
+            )
+
+        self.assertEqual(events[-1]["novel_quarantine"]["decision"], "rejected")
+        self.assertIsNone(events[-1]["admitted_expert_id"])
+        self.assertEqual(manager.active_experts, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,10 @@ class DynamicExpertManager:
     novel_ms_quantile=0.9,
     novel_support_quantile=0.3,
     novel_provisional_min=0.05,
+    novel_admission_mode="immediate",
+    novel_quarantine_steps=8,
+    novel_quarantine_tail=4,
+    novel_ratio_threshold=0.95,
     ):
             # 历史异常的30％
       if not 0.0<=ms_quantile<=1.0:
@@ -70,6 +74,18 @@ class DynamicExpertManager:
             raise ValueError("novel_support_quantile must be within [0, 1]")
       if not 0.0 <= novel_provisional_min <= 1.0:
             raise ValueError("novel_provisional_min must be within [0, 1]")
+      if novel_admission_mode not in {"immediate", "quarantine"}:
+            raise ValueError(
+                "novel_admission_mode must be immediate or quarantine"
+            )
+      if novel_quarantine_steps < 2:
+            raise ValueError("novel_quarantine_steps must be at least 2")
+      if not 1 <= novel_quarantine_tail <= novel_quarantine_steps:
+            raise ValueError(
+                "novel_quarantine_tail must be within quarantine steps"
+            )
+      if novel_ratio_threshold <= 0.0:
+            raise ValueError("novel_ratio_threshold must be positive")
       self.ms_quantile = float(ms_quantile)
       self.support_quantile = float(support_quantile)
       self.duplicate_similarity = float(
@@ -90,6 +106,10 @@ class DynamicExpertManager:
       self.novel_ms_quantile = float(novel_ms_quantile)
       self.novel_support_quantile = float(novel_support_quantile)
       self.novel_provisional_min = float(novel_provisional_min)
+      self.novel_admission_mode = novel_admission_mode
+      self.novel_quarantine_steps = int(novel_quarantine_steps)
+      self.novel_quarantine_tail = int(novel_quarantine_tail)
+      self.novel_ratio_threshold = float(novel_ratio_threshold)
       
       self.ms_history = []
       self.support_history = []
@@ -100,6 +120,8 @@ class DynamicExpertManager:
       self.admitted_count = 0
       self.next_expert_id = 0
       self.last_step = -1
+      self.novel_quarantine = None
+      self.last_novel_quarantine_event = None
 
     def active_experts_before_step(self):
         return[
@@ -432,6 +454,167 @@ class DynamicExpertManager:
         self.active_experts = survivors
         return deleted_expert_ids, lifecycle_events
 
+    def _quarantine_member(
+        self,
+        step,
+        image_id,
+        dino_patch_features,
+        ms_score,
+        ms_short_score,
+        ms_short_ratio,
+        channel_support,
+        provisional_channel_support,
+    ):
+        return {
+            "step": int(step),
+            "image_id": int(image_id),
+            "embedding": self._image_embedding(dino_patch_features),
+            "quality": float(provisional_channel_support or 0.0),
+            "ms_score": ms_score,
+            "ms_short_score": ms_short_score,
+            "ms_short_ratio": ms_short_ratio,
+            "channel_support": channel_support,
+            "provisional_channel_support": provisional_channel_support,
+            "candidate_route": "new_distribution",
+        }
+
+    def _admit_quarantined_member(self, member, step):
+        if len(self.active_experts) >= self.committee_cap:
+            return None, None
+
+        cluster_id = len(self.clusters)
+        self.clusters.append(
+            {
+                "embedding_sum": member["embedding"].clone(),
+                "members": [member],
+                "active_expert_id": self.next_expert_id,
+            }
+        )
+        expert = {
+            "expert_id": self.next_expert_id,
+            "image_id": member["image_id"],
+            "cluster_id": cluster_id,
+            "admission_step": int(step),
+            "cluster_support_at_admission": 1,
+            "max_support_gap": 0,
+            "last_supported_step": int(step),
+            "support_count": 1,
+            "patience": self.base_ttl,
+            "ttl": self.base_ttl,
+            "deletion_step": None,
+            "last_event": "admitted",
+            "last_channel_support": None,
+            "representative_mode": self.representative_mode,
+            "admission_ttl_mode": self.admission_ttl_mode,
+            "admission_route": "new_distribution_quarantine",
+            "admission_candidate_ms_score": member["ms_score"],
+            "admission_candidate_channel_support": member[
+                "channel_support"
+            ],
+        }
+        self.active_experts.append(expert)
+        self.admitted_count += 1
+        self.next_expert_id += 1
+        return cluster_id, expert["expert_id"]
+
+    def _advance_novel_quarantine(
+        self,
+        step,
+        image_id,
+        dino_patch_features,
+        ms_score,
+        ms_short_score,
+        ms_short_ratio,
+        channel_support,
+        provisional_channel_support,
+        novel_trigger,
+    ):
+        self.last_novel_quarantine_event = None
+        if self.novel_admission_mode != "quarantine":
+            return None, None
+        if ms_short_score is None or ms_short_ratio is None:
+            return None, None
+        if self.novel_quarantine is None and not novel_trigger:
+            return None, None
+
+        member = self._quarantine_member(
+            step,
+            image_id,
+            dino_patch_features,
+            ms_score,
+            ms_short_score,
+            ms_short_ratio,
+            channel_support,
+            provisional_channel_support,
+        )
+        if self.novel_quarantine is None:
+            if not novel_trigger:
+                return None, None
+            self.novel_quarantine = [member]
+            self.last_novel_quarantine_event = {
+                "decision": "opened",
+                "start_step": int(step),
+                "size": 1,
+            }
+            return None, None
+
+        if (
+            novel_trigger
+            and ms_short_ratio
+            < self.novel_quarantine[0]["ms_short_ratio"]
+        ):
+            self.novel_quarantine = [member]
+            self.last_novel_quarantine_event = {
+                "decision": "restarted",
+                "start_step": int(step),
+                "size": 1,
+            }
+            return None, None
+
+        self.novel_quarantine.append(member)
+        if len(self.novel_quarantine) < self.novel_quarantine_steps:
+            self.last_novel_quarantine_event = {
+                "decision": "collecting",
+                "start_step": self.novel_quarantine[0]["step"],
+                "size": len(self.novel_quarantine),
+            }
+            return None, None
+
+        pool = self.novel_quarantine
+        self.novel_quarantine = None
+        median_ratio = float(
+            np.median([item["ms_short_ratio"] for item in pool])
+        )
+        if median_ratio > self.novel_ratio_threshold:
+            self.last_novel_quarantine_event = {
+                "decision": "rejected",
+                "start_step": pool[0]["step"],
+                "end_step": int(step),
+                "size": len(pool),
+                "median_ratio": median_ratio,
+                "selected_image_id": None,
+            }
+            return None, None
+
+        representative = min(
+            pool[-self.novel_quarantine_tail:],
+            key=lambda item: item["ms_short_score"],
+        )
+        cluster_id, expert_id = self._admit_quarantined_member(
+            representative,
+            step,
+        )
+        self.last_novel_quarantine_event = {
+            "decision": "admitted" if expert_id is not None else "cap_rejected",
+            "start_step": pool[0]["step"],
+            "end_step": int(step),
+            "size": len(pool),
+            "median_ratio": median_ratio,
+            "selected_image_id": representative["image_id"],
+            "selected_ms_short": representative["ms_short_score"],
+        }
+        return cluster_id, expert_id
+
 
     def _consider_candidate(
         self,
@@ -445,6 +628,8 @@ class DynamicExpertManager:
         provisional_channel_support,
         novel_ms_threshold,
         novel_support_threshold,
+        ms_short_score,
+        ms_short_ratio,
     ):
         legacy_candidate = bool(
             ms_score is not None
@@ -473,6 +658,32 @@ class DynamicExpertManager:
             if novel_candidate
             else None
         )
+
+        quarantine_cluster_id, quarantine_expert_id = (
+            self._advance_novel_quarantine(
+                step,
+                image_id,
+                dino_patch_features,
+                ms_score,
+                ms_short_score,
+                ms_short_ratio,
+                channel_support,
+                provisional_channel_support,
+                candidate_route == "new_distribution",
+            )
+        )
+        if quarantine_expert_id is not None:
+            return (
+                candidate_route is not None,
+                quarantine_cluster_id,
+                quarantine_expert_id,
+                candidate_route,
+            )
+        if (
+            candidate_route == "new_distribution"
+            and self.novel_admission_mode == "quarantine"
+        ):
+            return True, None, None, candidate_route
 
         if candidate_route is None:
             return False, None, None, None
@@ -650,6 +861,8 @@ class DynamicExpertManager:
         channel_support,
         expert_channel_supports,
         provisional_channel_support=None,
+        ms_short_score=None,
+        ms_short_ratio=None,
     ):
     # 连续性
         if step != self.last_step + 1:
@@ -683,6 +896,14 @@ class DynamicExpertManager:
             "provisional_channel_support",
             provisional_channel_support,
             unit_interval=True,
+        )
+        ms_short_score = self._optional_score(
+            "ms_short_score",
+            ms_short_score,
+        )
+        ms_short_ratio = self._optional_score(
+            "ms_short_ratio",
+            ms_short_ratio,
         )
 
 # 计算历史限制
@@ -723,6 +944,8 @@ class DynamicExpertManager:
             provisional_channel_support,
             novel_ms_threshold,
             novel_support_threshold,
+            ms_short_score,
+            ms_short_ratio,
         )
 
         if admitted_expert_id is not None:
@@ -763,11 +986,18 @@ class DynamicExpertManager:
                     "refreshed": False,
                     "deleted_this_step": False,
                     "alive_after": True,
-                    "admission_candidate_image_id": int(image_id),
-                    "admission_candidate_ms_score": ms_score,
+                    "admission_candidate_image_id": int(
+                        admitted_expert["image_id"]
+                    ),
+                    "admission_candidate_ms_score": admitted_expert.get(
+                        "admission_candidate_ms_score", ms_score
+                    ),
                     "admission_ms_threshold": ms_threshold,
                     "admission_candidate_channel_support": (
-                        channel_support
+                        admitted_expert.get(
+                            "admission_candidate_channel_support",
+                            channel_support,
+                        )
                     ),
                     "admission_support_threshold": (
                         support_threshold
@@ -806,6 +1036,16 @@ class DynamicExpertManager:
             "provisional_channel_support": provisional_channel_support,
             "is_candidate": is_candidate,
             "candidate_route": candidate_route,
+            "admission_route": (
+                next(
+                    expert["admission_route"]
+                    for expert in self.active_experts
+                    if expert["expert_id"] == admitted_expert_id
+                )
+                if admitted_expert_id is not None
+                else None
+            ),
+            "novel_quarantine": self.last_novel_quarantine_event,
             "cluster_id": cluster_id,
             "admitted_expert_id":
                 admitted_expert_id,

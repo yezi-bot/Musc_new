@@ -43,6 +43,14 @@ VARIANTS = {
         "mode": "dino_only",
         "reset": False,
         "candidate_mode": "dual_path",
+        "novel_admission_mode": "immediate",
+    },
+    "dynamic_dino_quarantine": {
+        "dynamic": True,
+        "mode": "dino_only",
+        "reset": False,
+        "candidate_mode": "dual_path",
+        "novel_admission_mode": "quarantine",
     },
     "dynamic_dino_oracle_reset": {
         "dynamic": True,
@@ -136,8 +144,12 @@ def audit_metrics(audit_path, boundary):
     novel_admissions = [
         record
         for record in timeline
-        if record.get("candidate_route") == "new_distribution"
-        and record.get("admitted_expert_id") is not None
+        if record.get("admitted_expert_id") is not None
+        and (
+            record.get("candidate_route") == "new_distribution"
+            or record.get("admission_route")
+            in {"new_distribution", "new_distribution_quarantine"}
+        )
     ]
     first_post_novel = next(
         (record["step"] for record in novel_admissions if record["step"] >= boundary),
@@ -270,6 +282,12 @@ def run_variant(base_config, args, sequence, seed, variant_name):
     cfg["models"]["dynamic_committee"]["candidate_mode"] = variant[
         "candidate_mode"
     ]
+    cfg["models"]["dynamic_committee"]["novel_admission_mode"] = variant.get(
+        "novel_admission_mode", "immediate"
+    )
+    cfg["models"]["dynamic_committee"]["novel_quarantine_steps"] = 8
+    cfg["models"]["dynamic_committee"]["novel_quarantine_tail"] = 4
+    cfg["models"]["dynamic_committee"]["novel_ratio_threshold"] = 0.95
     cfg["models"]["dynamic_committee"]["novel_ms_quantile"] = 0.9
     cfg["models"]["dynamic_committee"]["novel_support_quantile"] = 0.3
     cfg["models"]["dynamic_committee"]["novel_provisional_min"] = 0.05

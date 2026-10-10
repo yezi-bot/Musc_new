@@ -441,6 +441,24 @@ class MuSc():
                                     'novel_provisional_min', 0.05
                                 )
                             ),
+                            'novel_admission_mode': self.dynamic_committee_cfg.get(
+                                'novel_admission_mode', 'immediate'
+                            ),
+                            'novel_quarantine_steps': int(
+                                self.dynamic_committee_cfg.get(
+                                    'novel_quarantine_steps', 8
+                                )
+                            ),
+                            'novel_quarantine_tail': int(
+                                self.dynamic_committee_cfg.get(
+                                    'novel_quarantine_tail', 4
+                                )
+                            ),
+                            'novel_ratio_threshold': float(
+                                self.dynamic_committee_cfg.get(
+                                    'novel_ratio_threshold', 0.95
+                                )
+                            ),
                         },
                         reset_steps=(
                             stream_boundaries

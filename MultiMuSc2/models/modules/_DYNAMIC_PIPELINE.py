@@ -209,6 +209,8 @@ def build_dynamic_committee_timeline(
             provisional_channel_support=association_profile[
                 "recent_provisional_match_fraction"
             ],
+            ms_short_score=ms_short,
+            ms_short_ratio=ms_short_ratio,
         )
 
         if current_distances is not None:
@@ -246,6 +248,8 @@ def build_dynamic_committee_timeline(
                 "channel_support": channel_support,
                 "association_profile": association_profile,
                 "candidate_route": event["candidate_route"],
+                "admission_route": event["admission_route"],
+                "novel_quarantine": event["novel_quarantine"],
                 "novel_support_threshold": event[
                     "novel_support_threshold"
                 ],
