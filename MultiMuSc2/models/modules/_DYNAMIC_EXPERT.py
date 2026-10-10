@@ -16,6 +16,10 @@ class DynamicExpertManager:
     ttl_gap_multiplier=2.0,
     representative_mode="historical_quality",
     admission_ttl_mode="historical_gap",
+    candidate_mode="legacy",
+    novel_ms_quantile=0.9,
+    novel_support_quantile=0.3,
+    novel_provisional_min=0.05,
     ):
             # 历史异常的30％
       if not 0.0<=ms_quantile<=1.0:
@@ -58,6 +62,14 @@ class DynamicExpertManager:
             raise ValueError(
                 "admission_ttl_mode must be historical_gap or base"
             )
+      if candidate_mode not in {"legacy", "dual_path"}:
+            raise ValueError("candidate_mode must be legacy or dual_path")
+      if not 0.0 <= novel_ms_quantile <= 1.0:
+            raise ValueError("novel_ms_quantile must be within [0, 1]")
+      if not 0.0 <= novel_support_quantile <= 1.0:
+            raise ValueError("novel_support_quantile must be within [0, 1]")
+      if not 0.0 <= novel_provisional_min <= 1.0:
+            raise ValueError("novel_provisional_min must be within [0, 1]")
       self.ms_quantile = float(ms_quantile)
       self.support_quantile = float(support_quantile)
       self.duplicate_similarity = float(
@@ -74,6 +86,10 @@ class DynamicExpertManager:
         )
       self.representative_mode = representative_mode
       self.admission_ttl_mode = admission_ttl_mode
+      self.candidate_mode = candidate_mode
+      self.novel_ms_quantile = float(novel_ms_quantile)
+      self.novel_support_quantile = float(novel_support_quantile)
+      self.novel_provisional_min = float(novel_provisional_min)
       
       self.ms_history = []
       self.support_history = []
@@ -127,6 +143,7 @@ class DynamicExpertManager:
                 "admission_ttl_mode": expert[
                     "admission_ttl_mode"
                 ],
+                "admission_route": expert.get("admission_route", "legacy"),
             }
             for expert in self.active_experts
         ]
@@ -200,6 +217,24 @@ class DynamicExpertManager:
             else None
         )
         return ms_threshold,support_threshold
+
+    def _novel_thresholds(self):
+        novel_ms_threshold = (
+            float(np.quantile(self.ms_history, self.novel_ms_quantile))
+            if self.ms_history
+            else None
+        )
+        novel_support_threshold = (
+            float(
+                np.quantile(
+                    self.support_history,
+                    self.novel_support_quantile,
+                )
+            )
+            if self.support_history
+            else None
+        )
+        return novel_ms_threshold, novel_support_threshold
 
     @staticmethod
     # 检查外部传入的分数是否合法
@@ -388,6 +423,9 @@ class DynamicExpertManager:
                     "admission_ttl_mode": expert[
                         "admission_ttl_mode"
                     ],
+                    "admission_route": expert.get(
+                        "admission_route", "legacy"
+                    ),
                 }
             )
 
@@ -404,8 +442,11 @@ class DynamicExpertManager:
         channel_support,
         ms_threshold,
         support_threshold,
+        provisional_channel_support,
+        novel_ms_threshold,
+        novel_support_threshold,
     ):
-        is_candidate = bool(
+        legacy_candidate = bool(
             ms_score is not None
             and channel_support is not None
             and ms_threshold is not None
@@ -414,25 +455,45 @@ class DynamicExpertManager:
             and channel_support
             >= support_threshold
         )
+        novel_candidate = bool(
+            self.candidate_mode == "dual_path"
+            and ms_score is not None
+            and channel_support is not None
+            and novel_ms_threshold is not None
+            and novel_support_threshold is not None
+            and provisional_channel_support is not None
+            and ms_score >= novel_ms_threshold
+            and channel_support <= novel_support_threshold
+            and provisional_channel_support >= self.novel_provisional_min
+        )
+        candidate_route = (
+            "legacy"
+            if legacy_candidate
+            else "new_distribution"
+            if novel_candidate
+            else None
+        )
 
-        if not is_candidate:
-            return False, None, None
+        if candidate_route is None:
+            return False, None, None, None
         # 特征平均归一化
         embedding = self._image_embedding(
             dino_patch_features
         )
-          
-        # 候选质量  
-        quality = (
-            channel_support
-            / max(support_threshold, 1e-12)
-            - ms_score
-            / max(ms_threshold, 1e-12)
-        )
+
+        if candidate_route == "legacy":
+            quality = (
+                channel_support
+                / max(support_threshold, 1e-12)
+                - ms_score
+                / max(ms_threshold, 1e-12)
+            )
+        else:
+            quality = float(provisional_channel_support)
 
         cluster_id = None
 
-        if self.clusters:
+        if candidate_route == "legacy" and self.clusters:
             centroids = torch.stack(
                 [
                     F.normalize(
@@ -483,26 +544,29 @@ class DynamicExpertManager:
                 "ms_threshold": ms_threshold,
                 "support_threshold":
                     support_threshold,
+                "candidate_route": candidate_route,
+                "provisional_channel_support": provisional_channel_support,
             }
         )
         # 更新 cluster 中心
         cluster["embedding_sum"] += embedding
         # cluster能否进入专家
         if cluster["active_expert_id"] is not None:
-            return True, cluster_id, None
+            return True, cluster_id, None, candidate_route
 
-        # 两张图片支持
         if (
+            candidate_route == "legacy"
+            and
             len(cluster["members"])
             < self.min_cluster_support
         ):
-            return True, cluster_id, None
+            return True, cluster_id, None, candidate_route
 
         if (
             len(self.active_experts)
             >= self.committee_cap
         ):
-            return True, cluster_id, None
+            return True, cluster_id, None, candidate_route
 
         # 选择代表
         if self.representative_mode == "historical_quality":
@@ -519,14 +583,20 @@ class DynamicExpertManager:
         )
 
         historical_max_support_gap = max(
-            later - earlier
-            for earlier, later in zip(
-                member_steps,
-                member_steps[1:],
-            )
+            (
+                later - earlier
+                for earlier, later in zip(
+                    member_steps,
+                    member_steps[1:],
+                )
+            ),
+            default=0,
         )
 
-        if self.admission_ttl_mode == "historical_gap":
+        if (
+            candidate_route == "legacy"
+            and self.admission_ttl_mode == "historical_gap"
+        ):
             max_support_gap = historical_max_support_gap
             patience = self._patience_from_gap(
                 max_support_gap
@@ -554,6 +624,7 @@ class DynamicExpertManager:
             "last_channel_support": None,
             "representative_mode": self.representative_mode,
             "admission_ttl_mode": self.admission_ttl_mode,
+            "admission_route": candidate_route,
         }
 
         cluster["active_expert_id"] = self.next_expert_id
@@ -566,6 +637,7 @@ class DynamicExpertManager:
             True,
             cluster_id,
             expert["expert_id"],
+            candidate_route,
         )
 
 # 每处理一张图时调用一次的总入口
@@ -577,6 +649,7 @@ class DynamicExpertManager:
         ms_score,
         channel_support,
         expert_channel_supports,
+        provisional_channel_support=None,
     ):
     # 连续性
         if step != self.last_step + 1:
@@ -606,12 +679,21 @@ class DynamicExpertManager:
             channel_support,
             unit_interval=True,
         )
+        provisional_channel_support = self._optional_score(
+            "provisional_channel_support",
+            provisional_channel_support,
+            unit_interval=True,
+        )
 
 # 计算历史限制
         (
             ms_threshold,
             support_threshold,
         ) = self._historical_thresholds()
+        (
+            novel_ms_threshold,
+            novel_support_threshold,
+        ) = self._novel_thresholds()
 
         (
             deleted_expert_ids,
@@ -629,6 +711,7 @@ class DynamicExpertManager:
             is_candidate,
             cluster_id,
             admitted_expert_id,
+            candidate_route,
         ) = self._consider_candidate(
             step,
             int(image_id),
@@ -637,6 +720,9 @@ class DynamicExpertManager:
             channel_support,
             ms_threshold,
             support_threshold,
+            provisional_channel_support,
+            novel_ms_threshold,
+            novel_support_threshold,
         )
 
         if admitted_expert_id is not None:
@@ -692,6 +778,9 @@ class DynamicExpertManager:
                     "admission_ttl_mode": admitted_expert[
                         "admission_ttl_mode"
                     ],
+                    "admission_route": admitted_expert[
+                        "admission_route"
+                    ],
                 }
             )
 
@@ -712,7 +801,11 @@ class DynamicExpertManager:
             "ms_threshold": ms_threshold,
             "support_threshold":
                 support_threshold,
+            "novel_support_threshold": novel_support_threshold,
+            "novel_ms_threshold": novel_ms_threshold,
+            "provisional_channel_support": provisional_channel_support,
             "is_candidate": is_candidate,
+            "candidate_route": candidate_route,
             "cluster_id": cluster_id,
             "admitted_expert_id":
                 admitted_expert_id,

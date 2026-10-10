@@ -123,6 +123,11 @@ def build_dynamic_committee_timeline(
             grid_size,
             distance_threshold,
         )
+        association_profile = memory.association_profile(
+            current,
+            grid_size,
+            current_image_id=step,
+        )
 
         expert_supports = {}
         for expert in active_before:
@@ -142,6 +147,9 @@ def build_dynamic_committee_timeline(
             ms_score=ms_score,
             channel_support=channel_support,
             expert_channel_supports=expert_supports,
+            provisional_channel_support=association_profile[
+                "recent_provisional_match_fraction"
+            ],
         )
 
         if current_distances is not None:
@@ -168,6 +176,12 @@ def build_dynamic_committee_timeline(
                 "ms_score": ms_score,
                 "channel_distance_threshold": distance_threshold,
                 "channel_support": channel_support,
+                "association_profile": association_profile,
+                "candidate_route": event["candidate_route"],
+                "novel_support_threshold": event[
+                    "novel_support_threshold"
+                ],
+                "novel_ms_threshold": event["novel_ms_threshold"],
                 "expert_channel_supports": expert_supports,
                 "admitted_expert_id": event["admitted_expert_id"],
                 "deleted_expert_ids": event["deleted_expert_ids"],

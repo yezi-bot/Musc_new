@@ -101,6 +101,53 @@ class DynamicExpertManagerTest(unittest.TestCase):
             ],
         )
 
+    def test_new_distribution_route_uses_repeated_provisional_channels(self):
+        manager = DynamicExpertManager(
+            candidate_mode="dual_path",
+            novel_support_quantile=0.3,
+            novel_provisional_min=0.05,
+            min_cluster_support=2,
+        )
+        manager.ms_history.append(1.0)
+        manager.support_history.extend([0.7, 0.8, 0.9])
+
+        event = manager.advance(
+            step=0,
+            image_id=10,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=1.2,
+            channel_support=0.1,
+            expert_channel_supports={},
+            provisional_channel_support=0.2,
+        )
+
+        self.assertEqual(event["candidate_route"], "new_distribution")
+        self.assertEqual(event["admitted_expert_id"], 0)
+        self.assertEqual(manager.active_experts[0]["admission_route"], "new_distribution")
+
+    def test_new_distribution_route_requires_high_ms_score(self):
+        manager = DynamicExpertManager(
+            candidate_mode="dual_path",
+            novel_ms_quantile=0.9,
+            novel_support_quantile=0.3,
+            novel_provisional_min=0.05,
+        )
+        manager.ms_history.extend([0.8, 1.0, 1.2])
+        manager.support_history.extend([0.7, 0.8, 0.9])
+
+        event = manager.advance(
+            step=0,
+            image_id=10,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=1.0,
+            channel_support=0.1,
+            expert_channel_supports={},
+            provisional_channel_support=0.2,
+        )
+
+        self.assertIsNone(event["candidate_route"])
+        self.assertIsNone(event["admitted_expert_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

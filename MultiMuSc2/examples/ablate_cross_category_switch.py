@@ -24,21 +24,31 @@ VARIANTS = {
         "dynamic": False,
         "mode": "fuser",
         "reset": False,
+        "candidate_mode": "legacy",
     },
     "strict_history_dino": {
         "dynamic": True,
         "mode": "strict_history_dino",
         "reset": False,
+        "candidate_mode": "legacy",
     },
     "dynamic_dino_no_reset": {
         "dynamic": True,
         "mode": "dino_only",
         "reset": False,
+        "candidate_mode": "legacy",
+    },
+    "dynamic_dino_new_distribution": {
+        "dynamic": True,
+        "mode": "dino_only",
+        "reset": False,
+        "candidate_mode": "dual_path",
     },
     "dynamic_dino_oracle_reset": {
         "dynamic": True,
         "mode": "dino_only",
         "reset": True,
+        "candidate_mode": "legacy",
     },
 }
 
@@ -84,8 +94,15 @@ def audit_metrics(audit_path, boundary):
             "old_expert_clear_latency": None,
             "state_reset_count": None,
             "causal_reference_violations": None,
+            "new_distribution_admissions": None,
+            "pre_new_distribution_admissions": None,
+            "post_new_distribution_admissions": None,
+            "new_distribution_admission_latency": None,
+            "post_median_provisional_support": None,
+            "post_median_recent_provisional_support": None,
         }
     audit = json.loads(Path(audit_path).read_text(encoding="utf-8"))
+    timeline = audit["timeline"]
     scoring = audit["scoring"]
     post = [record for record in scoring if record["step"] >= boundary]
     old_reference_records = [
@@ -114,6 +131,36 @@ def audit_metrics(audit_path, boundary):
         for record in scoring
         for image_id in record["expert_image_ids"]
     )
+    novel_admissions = [
+        record
+        for record in timeline
+        if record.get("candidate_route") == "new_distribution"
+        and record.get("admitted_expert_id") is not None
+    ]
+    first_post_novel = next(
+        (record["step"] for record in novel_admissions if record["step"] >= boundary),
+        None,
+    )
+    post_provisional_support = [
+        record.get("association_profile", {}).get(
+            "provisional_match_fraction"
+        )
+        for record in timeline
+        if record["step"] >= boundary
+    ]
+    post_provisional_support = [
+        value for value in post_provisional_support if value is not None
+    ]
+    post_recent_provisional_support = [
+        record.get("association_profile", {}).get(
+            "recent_provisional_match_fraction"
+        )
+        for record in timeline
+        if record["step"] >= boundary
+    ]
+    post_recent_provisional_support = [
+        value for value in post_recent_provisional_support if value is not None
+    ]
     return {
         "post_old_expert_reference_fraction": (
             len(old_reference_records) / len(post) if post else None
@@ -128,6 +175,26 @@ def audit_metrics(audit_path, boundary):
             record.get("state_reset_before", False) for record in scoring
         ),
         "causal_reference_violations": int(violations),
+        "new_distribution_admissions": len(novel_admissions),
+        "pre_new_distribution_admissions": sum(
+            record["step"] < boundary for record in novel_admissions
+        ),
+        "post_new_distribution_admissions": sum(
+            record["step"] >= boundary for record in novel_admissions
+        ),
+        "new_distribution_admission_latency": (
+            first_post_novel - boundary if first_post_novel is not None else None
+        ),
+        "post_median_provisional_support": (
+            float(np.median(post_provisional_support))
+            if post_provisional_support
+            else None
+        ),
+        "post_median_recent_provisional_support": (
+            float(np.median(post_recent_provisional_support))
+            if post_recent_provisional_support
+            else None
+        ),
     }
 
 
@@ -154,6 +221,12 @@ def run_variant(base_config, args, sequence, seed, variant_name):
     cfg["models"]["dynamic_committee"][
         "reset_at_category_boundaries"
     ] = variant["reset"]
+    cfg["models"]["dynamic_committee"]["candidate_mode"] = variant[
+        "candidate_mode"
+    ]
+    cfg["models"]["dynamic_committee"]["novel_ms_quantile"] = 0.9
+    cfg["models"]["dynamic_committee"]["novel_support_quantile"] = 0.3
+    cfg["models"]["dynamic_committee"]["novel_provisional_min"] = 0.05
     cfg["models"].setdefault("dynamic_fusion", {})["mode"] = variant["mode"]
 
     model = MuSc(cfg, seed=seed)

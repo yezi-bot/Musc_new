@@ -417,6 +417,24 @@ class MuSc():
                                     'ttl_gap_multiplier', 2.0
                                 )
                             ),
+                            'candidate_mode': self.dynamic_committee_cfg.get(
+                                'candidate_mode', 'legacy'
+                            ),
+                            'novel_ms_quantile': float(
+                                self.dynamic_committee_cfg.get(
+                                    'novel_ms_quantile', 0.9
+                                )
+                            ),
+                            'novel_support_quantile': float(
+                                self.dynamic_committee_cfg.get(
+                                    'novel_support_quantile', 0.3
+                                )
+                            ),
+                            'novel_provisional_min': float(
+                                self.dynamic_committee_cfg.get(
+                                    'novel_provisional_min', 0.05
+                                )
+                            ),
                         },
                         reset_steps=(
                             stream_boundaries

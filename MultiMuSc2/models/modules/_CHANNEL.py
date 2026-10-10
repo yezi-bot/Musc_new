@@ -97,6 +97,73 @@ class ChannelMemory:
             if channel.effective_span >= self.mature_span
         ]
 
+    def association_profile(self, features, grid_size, current_image_id=None):
+        self._validate_features(features, grid_size)
+        patch_count = features.shape[0]
+        eligible = [
+            (index, channel)
+            for index, channel in enumerate(self.channels)
+            if channel.ttl > 1
+        ]
+        if not eligible:
+            return {
+                "matched_fraction": 0.0,
+                "mature_match_fraction": 0.0,
+                "provisional_match_fraction": 0.0,
+                "recent_provisional_match_fraction": 0.0,
+                "matched_channel_ids": [],
+                "provisional_channel_ids": [],
+            }
+
+        current = features.detach().float().to(self.device)
+        candidates = torch.stack(
+            [channel.seed for _, channel in eligible]
+        ).float().to(self.device)
+        distances = torch.cdist(current, candidates)
+        valid = self._position_mask(
+            patch_count,
+            [channel.latest_patch_id for _, channel in eligible],
+            grid_size,
+        )
+        distances = distances.masked_fill(~valid, float("inf"))
+        patch_to_channel = distances.argmin(dim=1)
+        channel_to_patch = distances.argmin(dim=0)
+
+        matched_channel_ids = []
+        provisional_channel_ids = []
+        recent_provisional_count = 0
+        mature_count = 0
+        for patch_id in range(patch_count):
+            local_channel_id = int(patch_to_channel[patch_id])
+            if not torch.isfinite(distances[patch_id, local_channel_id]):
+                continue
+            if int(channel_to_patch[local_channel_id]) != patch_id:
+                continue
+            channel_id, channel = eligible[local_channel_id]
+            matched_channel_ids.append(channel_id)
+            if channel.effective_span >= self.mature_span:
+                mature_count += 1
+            else:
+                provisional_channel_ids.append(channel_id)
+                if (
+                    current_image_id is not None
+                    and channel.seed_image_id == current_image_id - 1
+                ):
+                    recent_provisional_count += 1
+
+        matched_count = len(matched_channel_ids)
+        provisional_count = len(provisional_channel_ids)
+        return {
+            "matched_fraction": matched_count / patch_count,
+            "mature_match_fraction": mature_count / patch_count,
+            "provisional_match_fraction": provisional_count / patch_count,
+            "recent_provisional_match_fraction": (
+                recent_provisional_count / patch_count
+            ),
+            "matched_channel_ids": matched_channel_ids,
+            "provisional_channel_ids": provisional_channel_ids,
+        }
+
 
     def patch_to_mature_distances(self, features, grid_size):
         self._validate_features(features, grid_size)
