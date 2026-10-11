@@ -4,6 +4,7 @@ import torch
 
 from MultiMuSc2.models.modules._DYNAMIC_PIPELINE import (
     _image_msm_score,
+    _positioned_memory_scores,
     _strict_history_fallback,
     build_dynamic_committee_timeline,
     score_dynamic_msm2_layer,
@@ -62,6 +63,63 @@ def scoring_timeline(image_count=4):
 
 
 class DynamicPipelineTest(unittest.TestCase):
+    def test_positioned_memory_scores_leave_uncovered_patches_invalid(self):
+        features = synthetic_features(2)
+        scores, valid = _positioned_memory_scores(
+            features[1],
+            [features[0]],
+            [[0]],
+            grid_size=2,
+            position_radius=0,
+        )
+
+        self.assertEqual(valid.tolist(), [True, False, False, False])
+        self.assertAlmostEqual(float(scores[0]), 0.05, places=6)
+        self.assertTrue(torch.equal(scores[1:], torch.zeros(3)))
+
+    def test_irbank_replaces_only_position_covered_dino_scores(self):
+        dino = synthetic_features(4)
+        timeline = scoring_timeline()
+        timeline[3]["provisional_expert_before"] = {
+            "image_id": 1,
+            "image_ids": [1],
+            "memory_members": [{"image_id": 1, "patch_ids": [0]}],
+            "representative_step": 1,
+            "start_step": 0,
+            "pool_size": 1,
+            "weight": 1.0,
+            "state": "confirmed_irbank",
+        }
+        base_score, _ = MSM2_online(
+            dino[3],
+            None,
+            dino[[0]],
+            None,
+            fusion_mode="dino_only",
+            topmin_min=0.02,
+            topmin_max=0.3,
+        )
+
+        scores, audits = score_dynamic_msm2_layer(
+            dino,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+            position_radius=0,
+        )
+
+        self.assertAlmostEqual(float(scores[3, 0]), 0.1, places=6)
+        self.assertTrue(torch.allclose(scores[3, 1:], base_score[1:]))
+        self.assertEqual(audits[3]["effective_mode"], "dino_channel_irbank")
+        self.assertEqual(audits[3]["memory_patch_count"], 1)
+        self.assertEqual(audits[3]["memory_valid_fraction"], 0.25)
+        self.assertAlmostEqual(audits[3]["memory_score_max"], 0.1, places=6)
+        self.assertAlmostEqual(
+            audits[3]["base_score_max_before_memory"],
+            float(base_score.max()),
+            places=6,
+        )
+
     def test_chunked_online_msm_matches_unchunked_result(self):
         features = synthetic_features(6)
         expected = float(

@@ -338,6 +338,69 @@ class DynamicExpertManagerTest(unittest.TestCase):
             )
         self.assertIsNone(manager.provisional_expert_before_step())
 
+    def test_channel_irbank_rebuilds_from_lower_half_and_refreshes_ttl(self):
+        manager = DynamicExpertManager(
+            candidate_mode="dual_path",
+            novel_admission_mode="channel_irbank",
+            novel_quarantine_steps=4,
+            novel_quarantine_tail=4,
+            novel_ratio_threshold=0.95,
+            novel_confirmed_ttl=2,
+            novel_memory_window=6,
+            novel_memory_keep_fraction=0.5,
+        )
+        manager.ms_history.extend([1.0] * 8)
+        manager.support_history.extend([0.7, 0.8, 0.9])
+
+        events = []
+        for step, short_score in enumerate([1.1, 1.0, 0.8, 0.9]):
+            events.append(
+                manager.advance(
+                    step=step,
+                    image_id=10 + step,
+                    dino_patch_features=patch_features(1.0 + step, 1.0),
+                    ms_score=1.2 if step == 0 else 0.5,
+                    channel_support=0.1,
+                    expert_channel_supports={},
+                    provisional_channel_support=0.2 if step == 0 else 0.0,
+                    ms_short_score=short_score,
+                    ms_short_ratio=0.9,
+                    memory_patch_ids=[0],
+                )
+            )
+
+        snapshot = manager.provisional_expert_before_step()
+        self.assertEqual(
+            events[-1]["novel_quarantine"]["decision"],
+            "confirmed_irbank",
+        )
+        self.assertEqual(snapshot["image_ids"], [12, 13])
+        self.assertEqual(snapshot["state"], "confirmed_irbank")
+        self.assertEqual(
+            snapshot["memory_members"],
+            [
+                {"image_id": 12, "patch_ids": [0]},
+                {"image_id": 13, "patch_ids": [0]},
+            ],
+        )
+        self.assertEqual(manager.active_experts, [])
+
+        manager.advance(
+            step=4,
+            image_id=14,
+            dino_patch_features=patch_features(5.0, 1.0),
+            ms_score=0.5,
+            channel_support=0.1,
+            expert_channel_supports={},
+            provisional_channel_support=0.0,
+            ms_short_score=0.1,
+            ms_short_ratio=0.9,
+            memory_patch_ids=[1],
+        )
+        refreshed = manager.provisional_expert_before_step()
+        self.assertEqual(refreshed["image_ids"], [14, 12, 13])
+        self.assertEqual(manager.confirmed_provisional["ttl"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

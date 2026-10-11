@@ -109,12 +109,17 @@ def build_dynamic_committee_timeline(
     channel_ttl=5,
     mature_span=3.0,
     density_k=5,
+    memory_reliability_threshold=0.5,
     ms_short_windows=(8, 16, 32),
     manager_kwargs=None,
     reset_steps=None,
 ):
     if committee_features.ndim != 3:
         raise ValueError("committee_features must have shape [image, patch, feature]")
+    if not 0.0 <= memory_reliability_threshold <= 1.0:
+        raise ValueError(
+            "memory_reliability_threshold must be within [0, 1]"
+        )
     ms_short_windows = tuple(int(window) for window in ms_short_windows)
     grid_size = math.isqrt(committee_features.shape[1])
     if grid_size * grid_size != committee_features.shape[1]:
@@ -188,6 +193,13 @@ def build_dynamic_committee_timeline(
             grid_size,
             current_image_id=step,
         )
+        channel_ids, _ = memory.patch_associations(current, grid_size)
+        _, reliability = memory.patch_reliability(current, grid_size)
+        memory_patch_ids = torch.nonzero(
+            (channel_ids >= 0)
+            & (reliability >= memory_reliability_threshold),
+            as_tuple=False,
+        ).flatten().tolist()
 
         expert_supports = {}
         for expert in active_before:
@@ -212,13 +224,13 @@ def build_dynamic_committee_timeline(
             ],
             ms_short_score=ms_short,
             ms_short_ratio=ms_short_ratio,
+            memory_patch_ids=memory_patch_ids,
         )
 
         if current_distances is not None:
             finite = current_distances[torch.isfinite(current_distances)]
             distance_history.extend(finite.tolist())
 
-        _, reliability = memory.patch_reliability(current, grid_size)
         soft_reliability = reliability_alpha + (1.0 - reliability_alpha) * reliability
         memory.update(
             current,
@@ -249,6 +261,8 @@ def build_dynamic_committee_timeline(
                 "channel_distance_threshold": distance_threshold,
                 "channel_support": channel_support,
                 "association_profile": association_profile,
+                "memory_patch_candidate_count": len(memory_patch_ids),
+                "memory_reliability_threshold": memory_reliability_threshold,
                 "candidate_route": event["candidate_route"],
                 "admission_route": event["admission_route"],
                 "novel_quarantine": event["novel_quarantine"],
@@ -318,6 +332,74 @@ def _strict_history_clip_fallback(current_clip, clip_history):
     )
 
 
+def _positioned_memory_scores(
+    query,
+    member_features,
+    member_patch_ids,
+    grid_size,
+    position_radius=1,
+    topmin_min=0.02,
+    topmin_max=0.3,
+):
+    if query.ndim != 2:
+        raise ValueError("query must have shape [patch_count, feature_dim]")
+    if grid_size * grid_size != query.shape[0]:
+        raise ValueError("query patch count must match grid_size")
+    if len(member_features) != len(member_patch_ids):
+        raise ValueError("member feature and patch-id counts must match")
+    if position_radius < 0:
+        raise ValueError("position_radius must be non-negative")
+
+    patch_count = query.shape[0]
+    query_ids = torch.arange(patch_count, device=query.device)
+    query_rows = query_ids // grid_size
+    query_cols = query_ids % grid_size
+    per_member = []
+    for features, patch_ids in zip(member_features, member_patch_ids):
+        patch_ids = torch.as_tensor(
+            patch_ids,
+            device=query.device,
+            dtype=torch.long,
+        )
+        if patch_ids.numel() == 0:
+            continue
+        references = features.to(query.device)[patch_ids]
+        reference_rows = patch_ids // grid_size
+        reference_cols = patch_ids % grid_size
+        valid = (
+            (query_rows[:, None] - reference_rows[None, :]).abs()
+            <= position_radius
+        ) & (
+            (query_cols[:, None] - reference_cols[None, :]).abs()
+            <= position_radius
+        )
+        distances = torch.cdist(query.float(), references.float())
+        nearest = distances.masked_fill(~valid, float("inf")).amin(dim=1)
+        per_member.append(nearest)
+
+    if not per_member:
+        return torch.zeros(patch_count, device=query.device), torch.zeros(
+            patch_count,
+            device=query.device,
+            dtype=torch.bool,
+        )
+    distances = torch.stack(per_member, dim=1)
+    valid_counts = torch.isfinite(distances).sum(dim=1)
+    scores = torch.zeros(patch_count, device=query.device)
+    for reference_count in torch.unique(valid_counts).tolist():
+        if reference_count == 0:
+            continue
+        mask = valid_counts == reference_count
+        finite = distances[mask]
+        finite = finite[torch.isfinite(finite)].reshape(-1, reference_count)
+        scores[mask] = interval_average(
+            finite,
+            topmin_min=topmin_min,
+            topmin_max=topmin_max,
+        )
+    return scores, valid_counts > 0
+
+
 def _distance_audit(score_audit):
     result = {}
     dino_distance = score_audit.get("dino_distance")
@@ -359,6 +441,7 @@ def score_dynamic_msm2_layer(
     committee_stable_steps=2,
     committee_change_ratio=0.4,
     committee_retrain_cooldown=5,
+    position_radius=1,
 ):
     if dino_features.ndim != 3:
         raise ValueError("dino_features must have shape [image, patch, feature]")
@@ -618,25 +701,74 @@ def score_dynamic_msm2_layer(
                 raise ValueError(
                     "provisional expert must be strictly historical"
                 )
-            provisional_weight = float(provisional["weight"])
-            if not 0.0 <= provisional_weight <= 1.0:
-                raise ValueError(
-                    "provisional expert weight must be within [0, 1]"
+            if provisional.get("state") in {
+                "collecting_irbank",
+                "confirmed_irbank",
+            }:
+                memory_members = provisional.get("memory_members", [])
+                member_features = [
+                    dino_features[int(member["image_id"])]
+                    for member in memory_members
+                ]
+                member_patch_ids = [
+                    member.get("patch_ids", []) for member in memory_members
+                ]
+                memory_score, memory_valid = _positioned_memory_scores(
+                    current_dino,
+                    member_features,
+                    member_patch_ids,
+                    grid_size=math.isqrt(current_dino.shape[0]),
+                    position_radius=position_radius,
+                    topmin_min=topmin_min,
+                    topmin_max=topmin_max,
                 )
-            provisional_score, provisional_score_audit = MSM2_online(
-                current_dino,
-                None,
-                dino_features[provisional_image_ids],
-                None,
-                fusion_mode="dino_only",
-                topmin_min=topmin_min,
-                topmin_max=topmin_max,
-            )
-            patch_score = (
-                (1.0 - provisional_weight) * patch_score
-                + provisional_weight * provisional_score
-            )
-            effective_mode = "dino_provisional"
+                base_before_memory = patch_score
+                patch_score = torch.where(
+                    memory_valid,
+                    memory_score,
+                    patch_score,
+                )
+                effective_mode = "dino_channel_irbank"
+                provisional_score_audit = {
+                    "memory_patch_count": sum(
+                        len(patch_ids) for patch_ids in member_patch_ids
+                    ),
+                    "memory_valid_fraction": float(
+                        memory_valid.float().mean().cpu()
+                    ),
+                    "memory_score_mean": float(
+                        memory_score[memory_valid].mean().cpu()
+                    ),
+                    "memory_score_max": float(
+                        memory_score[memory_valid].max().cpu()
+                    ),
+                    "base_score_mean_before_memory": float(
+                        base_before_memory.mean().cpu()
+                    ),
+                    "base_score_max_before_memory": float(
+                        base_before_memory.max().cpu()
+                    ),
+                }
+            else:
+                provisional_weight = float(provisional["weight"])
+                if not 0.0 <= provisional_weight <= 1.0:
+                    raise ValueError(
+                        "provisional expert weight must be within [0, 1]"
+                    )
+                provisional_score, provisional_score_audit = MSM2_online(
+                    current_dino,
+                    None,
+                    dino_features[provisional_image_ids],
+                    None,
+                    fusion_mode="dino_only",
+                    topmin_min=topmin_min,
+                    topmin_max=topmin_max,
+                )
+                patch_score = (
+                    (1.0 - provisional_weight) * patch_score
+                    + provisional_weight * provisional_score
+                )
+                effective_mode = "dino_provisional"
 
         if not torch.isfinite(patch_score).all():
             if fusion_mode == "clip_only":
@@ -717,7 +849,9 @@ def score_dynamic_msm2_layer(
         }
         if score_audit is not None:
             audit.update(_distance_audit(score_audit))
-        if provisional_score_audit is not None:
+        if provisional_score_audit is not None and "memory_patch_count" in provisional_score_audit:
+            audit.update(provisional_score_audit)
+        elif provisional_score_audit is not None:
             provisional_distance_audit = _distance_audit(
                 provisional_score_audit
             )

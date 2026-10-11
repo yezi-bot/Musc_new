@@ -74,6 +74,13 @@ VARIANTS = {
         "novel_admission_mode": "soft_confirmed",
         "novel_confirmed_members": 2,
     },
+    "dynamic_dino_channel_irbank": {
+        "dynamic": True,
+        "mode": "dino_only",
+        "reset": False,
+        "candidate_mode": "dual_path",
+        "novel_admission_mode": "channel_irbank",
+    },
     "dynamic_dino_oracle_reset": {
         "dynamic": True,
         "mode": "dino_only",
@@ -136,6 +143,8 @@ def audit_metrics(audit_path, boundary):
             "pre_soft_confirmations": None,
             "post_soft_confirmations": None,
             "soft_confirmation_latency": None,
+            "irbank_confirmations": None,
+            "irbank_confirmation_latency": None,
         }
     audit = json.loads(Path(audit_path).read_text(encoding="utf-8"))
     timeline = audit["timeline"]
@@ -198,6 +207,20 @@ def audit_metrics(audit_path, boundary):
         (
             record["step"]
             for record in soft_confirmations
+            if record["step"] >= boundary
+        ),
+        None,
+    )
+    irbank_confirmations = [
+        record
+        for record in timeline
+        if (record.get("novel_quarantine") or {}).get("decision")
+        == "confirmed_irbank"
+    ]
+    first_post_irbank = next(
+        (
+            record["step"]
+            for record in irbank_confirmations
             if record["step"] >= boundary
         ),
         None,
@@ -266,6 +289,12 @@ def audit_metrics(audit_path, boundary):
         "soft_confirmation_latency": (
             first_post_soft - boundary
             if first_post_soft is not None
+            else None
+        ),
+        "irbank_confirmations": len(irbank_confirmations),
+        "irbank_confirmation_latency": (
+            first_post_irbank - boundary
+            if first_post_irbank is not None
             else None
         ),
     }
@@ -350,6 +379,11 @@ def run_variant(base_config, args, sequence, seed, variant_name):
     cfg["models"]["dynamic_committee"]["novel_provisional_weight"] = 0.25
     cfg["models"]["dynamic_committee"]["novel_confirmed_weight"] = 0.5
     cfg["models"]["dynamic_committee"]["novel_confirmed_ttl"] = 16
+    cfg["models"]["dynamic_committee"]["novel_memory_window"] = 16
+    cfg["models"]["dynamic_committee"]["novel_memory_keep_fraction"] = 0.5
+    cfg["models"]["dynamic_committee"][
+        "memory_reliability_threshold"
+    ] = 0.5
     cfg["models"]["dynamic_committee"][
         "novel_confirmed_members"
     ] = variant.get("novel_confirmed_members", 1)

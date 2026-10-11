@@ -28,6 +28,8 @@ class DynamicExpertManager:
     novel_confirmed_weight=0.5,
     novel_confirmed_ttl=16,
     novel_confirmed_members=1,
+    novel_memory_window=16,
+    novel_memory_keep_fraction=0.5,
     ):
             # 历史异常的30％
       if not 0.0<=ms_quantile<=1.0:
@@ -83,10 +85,11 @@ class DynamicExpertManager:
             "quarantine",
             "provisional",
             "soft_confirmed",
+            "channel_irbank",
       }:
             raise ValueError(
                 "novel_admission_mode must be immediate, quarantine, "
-                "provisional, or soft_confirmed"
+                "provisional, soft_confirmed, or channel_irbank"
             )
       if novel_quarantine_steps < 2:
             raise ValueError("novel_quarantine_steps must be at least 2")
@@ -111,6 +114,14 @@ class DynamicExpertManager:
       if novel_confirmed_members > novel_quarantine_tail:
             raise ValueError(
                 "novel_confirmed_members must not exceed quarantine tail"
+            )
+      if novel_memory_window < novel_quarantine_steps:
+            raise ValueError(
+                "novel_memory_window must be at least quarantine steps"
+            )
+      if not 0.0 < novel_memory_keep_fraction <= 1.0:
+            raise ValueError(
+                "novel_memory_keep_fraction must be within (0, 1]"
             )
       self.ms_quantile = float(ms_quantile)
       self.support_quantile = float(support_quantile)
@@ -140,6 +151,10 @@ class DynamicExpertManager:
       self.novel_confirmed_weight = float(novel_confirmed_weight)
       self.novel_confirmed_ttl = int(novel_confirmed_ttl)
       self.novel_confirmed_members = int(novel_confirmed_members)
+      self.novel_memory_window = int(novel_memory_window)
+      self.novel_memory_keep_fraction = float(
+            novel_memory_keep_fraction
+        )
       
       self.ms_history = []
       self.support_history = []
@@ -157,25 +172,39 @@ class DynamicExpertManager:
     def provisional_expert_before_step(self):
         if (
             self.novel_admission_mode
-            not in {"provisional", "soft_confirmed"}
+            not in {"provisional", "soft_confirmed", "channel_irbank"}
         ):
             return None
         if self.novel_quarantine:
-            representative = min(
-                self.novel_quarantine[-self.novel_quarantine_tail:],
-                key=lambda item: item["ms_short_score"],
-            )
+            if self.novel_admission_mode == "channel_irbank":
+                representatives = self._select_irbank_members(
+                    self.novel_quarantine
+                )
+                if not representatives:
+                    return None
+                representative = representatives[0]
+                state = "collecting_irbank"
+            else:
+                representative = min(
+                    self.novel_quarantine[-self.novel_quarantine_tail:],
+                    key=lambda item: item["ms_short_score"],
+                )
+                representatives = [representative]
+                state = "collecting"
             start_step = self.novel_quarantine[0]["step"]
             pool_size = len(self.novel_quarantine)
             weight = self.novel_provisional_weight
-            state = "collecting"
         elif self.confirmed_provisional is not None:
             representatives = self.confirmed_provisional["members"]
             representative = representatives[0]
             start_step = self.confirmed_provisional["start_step"]
             pool_size = self.novel_quarantine_steps
             weight = self.novel_confirmed_weight
-            state = "confirmed"
+            state = (
+                "confirmed_irbank"
+                if self.novel_admission_mode == "channel_irbank"
+                else "confirmed"
+            )
         else:
             return None
         return {
@@ -184,9 +213,17 @@ class DynamicExpertManager:
                 int(member["image_id"])
                 for member in (
                     representatives
-                    if state == "confirmed"
+                    if state in {"confirmed", "confirmed_irbank"}
+                    or self.novel_admission_mode == "channel_irbank"
                     else [representative]
                 )
+            ],
+            "memory_members": [
+                {
+                    "image_id": int(member["image_id"]),
+                    "patch_ids": list(member.get("memory_patch_ids", [])),
+                }
+                for member in representatives
             ],
             "representative_step": int(representative["step"]),
             "start_step": int(start_step),
@@ -536,6 +573,7 @@ class DynamicExpertManager:
         ms_short_ratio,
         channel_support,
         provisional_channel_support,
+        memory_patch_ids=None,
     ):
         return {
             "step": int(step),
@@ -548,7 +586,23 @@ class DynamicExpertManager:
             "channel_support": channel_support,
             "provisional_channel_support": provisional_channel_support,
             "candidate_route": "new_distribution",
+            "memory_patch_ids": list(memory_patch_ids or []),
         }
+
+    def _select_irbank_members(self, pool):
+        eligible = [
+            member for member in pool if member.get("memory_patch_ids")
+        ]
+        if not eligible:
+            return []
+        keep = max(
+            1,
+            int(math.ceil(len(eligible) * self.novel_memory_keep_fraction)),
+        )
+        return sorted(
+            eligible,
+            key=lambda item: item["ms_short_score"],
+        )[:keep]
 
     def _admit_quarantined_member(self, member, step):
         if len(self.active_experts) >= self.committee_cap:
@@ -604,23 +658,18 @@ class DynamicExpertManager:
         channel_support,
         provisional_channel_support,
         novel_trigger,
+        memory_patch_ids=None,
     ):
         self.last_novel_quarantine_event = None
         if self.novel_admission_mode not in {
             "quarantine",
             "provisional",
             "soft_confirmed",
+            "channel_irbank",
         }:
             return None, None
         if ms_short_score is None or ms_short_ratio is None:
             return None, None
-        if self.novel_quarantine is None and not novel_trigger:
-            if self.confirmed_provisional is not None:
-                self.confirmed_provisional["ttl"] -= 1
-                if self.confirmed_provisional["ttl"] <= 0:
-                    self.confirmed_provisional = None
-            return None, None
-
         member = self._quarantine_member(
             step,
             image_id,
@@ -630,7 +679,30 @@ class DynamicExpertManager:
             ms_short_ratio,
             channel_support,
             provisional_channel_support,
+            memory_patch_ids,
         )
+        if self.novel_quarantine is None and not novel_trigger:
+            if self.confirmed_provisional is not None:
+                if self.novel_admission_mode == "channel_irbank":
+                    candidates = self.confirmed_provisional["candidates"]
+                    candidates.append(member)
+                    del candidates[:-self.novel_memory_window]
+                    selected = self._select_irbank_members(candidates)
+                    self.confirmed_provisional["members"] = selected
+                    if any(
+                        selected_member["image_id"] == image_id
+                        for selected_member in selected
+                    ):
+                        self.confirmed_provisional["ttl"] = (
+                            self.novel_confirmed_ttl
+                        )
+                    else:
+                        self.confirmed_provisional["ttl"] -= 1
+                else:
+                    self.confirmed_provisional["ttl"] -= 1
+                if self.confirmed_provisional["ttl"] <= 0:
+                    self.confirmed_provisional = None
+            return None, None
         if self.novel_quarantine is None:
             if not novel_trigger:
                 return None, None
@@ -685,19 +757,37 @@ class DynamicExpertManager:
             pool[-self.novel_quarantine_tail:],
             key=lambda item: item["ms_short_score"],
         )
-        if self.novel_admission_mode == "soft_confirmed":
-            representatives = sorted(
-                pool[-self.novel_quarantine_tail:],
-                key=lambda item: item["ms_short_score"],
-            )[:self.novel_confirmed_members]
+        if self.novel_admission_mode in {"soft_confirmed", "channel_irbank"}:
+            if self.novel_admission_mode == "channel_irbank":
+                representatives = self._select_irbank_members(pool)
+            else:
+                representatives = sorted(
+                    pool[-self.novel_quarantine_tail:],
+                    key=lambda item: item["ms_short_score"],
+                )[:self.novel_confirmed_members]
+            if not representatives:
+                self.last_novel_quarantine_event = {
+                    "decision": "rejected_no_reliable_patches",
+                    "start_step": pool[0]["step"],
+                    "end_step": int(step),
+                    "size": len(pool),
+                    "median_ratio": median_ratio,
+                    "selected_image_id": None,
+                }
+                return None, None
             self.confirmed_provisional = {
                 "members": representatives,
+                "candidates": list(pool),
                 "start_step": pool[0]["step"],
                 "confirmation_step": int(step),
                 "ttl": self.novel_confirmed_ttl,
             }
             self.last_novel_quarantine_event = {
-                "decision": "confirmed_soft",
+                "decision": (
+                    "confirmed_irbank"
+                    if self.novel_admission_mode == "channel_irbank"
+                    else "confirmed_soft"
+                ),
                 "start_step": pool[0]["step"],
                 "end_step": int(step),
                 "size": len(pool),
@@ -710,6 +800,10 @@ class DynamicExpertManager:
                     int(member["image_id"])
                     for member in representatives
                 ],
+                "confirmed_patch_count": sum(
+                    len(member.get("memory_patch_ids", []))
+                    for member in representatives
+                ),
             }
             return None, None
         cluster_id, expert_id = self._admit_quarantined_member(
@@ -742,6 +836,7 @@ class DynamicExpertManager:
         novel_support_threshold,
         ms_short_score,
         ms_short_ratio,
+        memory_patch_ids,
     ):
         legacy_candidate = bool(
             ms_score is not None
@@ -782,6 +877,7 @@ class DynamicExpertManager:
                 channel_support,
                 provisional_channel_support,
                 candidate_route == "new_distribution",
+                memory_patch_ids,
             )
         )
         if quarantine_expert_id is not None:
@@ -794,7 +890,12 @@ class DynamicExpertManager:
         if (
             candidate_route == "new_distribution"
             and self.novel_admission_mode
-            in {"quarantine", "provisional", "soft_confirmed"}
+            in {
+                "quarantine",
+                "provisional",
+                "soft_confirmed",
+                "channel_irbank",
+            }
         ):
             return True, None, None, candidate_route
 
@@ -976,6 +1077,7 @@ class DynamicExpertManager:
         provisional_channel_support=None,
         ms_short_score=None,
         ms_short_ratio=None,
+        memory_patch_ids=None,
     ):
     # 连续性
         if step != self.last_step + 1:
@@ -1018,6 +1120,16 @@ class DynamicExpertManager:
             "ms_short_ratio",
             ms_short_ratio,
         )
+        if memory_patch_ids is not None:
+            patch_count = int(dino_patch_features.shape[0])
+            memory_patch_ids = sorted(
+                {int(patch_id) for patch_id in memory_patch_ids}
+            )
+            if any(
+                patch_id < 0 or patch_id >= patch_count
+                for patch_id in memory_patch_ids
+            ):
+                raise ValueError("memory_patch_ids contains an invalid patch")
 
 # 计算历史限制
         (
@@ -1059,6 +1171,7 @@ class DynamicExpertManager:
             novel_support_threshold,
             ms_short_score,
             ms_short_ratio,
+            memory_patch_ids,
         )
 
         if admitted_expert_id is not None:

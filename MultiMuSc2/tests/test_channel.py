@@ -27,6 +27,7 @@ class ChannelMemoryTest(unittest.TestCase):
         )
         memory.update(features, 2, 2, reliability)
         mature = memory.association_profile(features, 2)
+        channel_ids, mature_mask = memory.patch_associations(features, 2)
 
         self.assertEqual(provisional["provisional_match_fraction"], 1.0)
         self.assertEqual(
@@ -38,6 +39,8 @@ class ChannelMemoryTest(unittest.TestCase):
         )
         self.assertEqual(mature["mature_match_fraction"], 1.0)
         self.assertEqual(mature["provisional_match_fraction"], 0.0)
+        self.assertEqual(channel_ids.tolist(), [0, 1, 2, 3])
+        self.assertEqual(mature_mask.tolist(), [True, True, True, True])
 
 
 if __name__ == "__main__":

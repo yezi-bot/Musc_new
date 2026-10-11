@@ -386,6 +386,11 @@ class MuSc():
                         reliability_alpha=float(
                             self.dynamic_committee_cfg.get('reliability_alpha', 0.5)
                         ),
+                        memory_reliability_threshold=float(
+                            self.dynamic_committee_cfg.get(
+                                'memory_reliability_threshold', 0.5
+                            )
+                        ),
                         ms_short_windows=tuple(
                             int(window)
                             for window in self.dynamic_committee_cfg.get(
@@ -477,6 +482,16 @@ class MuSc():
                             'novel_confirmed_members': int(
                                 self.dynamic_committee_cfg.get(
                                     'novel_confirmed_members', 1
+                                )
+                            ),
+                            'novel_memory_window': int(
+                                self.dynamic_committee_cfg.get(
+                                    'novel_memory_window', 16
+                                )
+                            ),
+                            'novel_memory_keep_fraction': float(
+                                self.dynamic_committee_cfg.get(
+                                    'novel_memory_keep_fraction', 0.5
                                 )
                             ),
                         },
@@ -619,6 +634,11 @@ class MuSc():
                             committee_change_ratio=float(
                                 self.dynamic_fusion_cfg.get(
                                     'committee_change_ratio', 0.4
+                                )
+                            ),
+                            position_radius=int(
+                                self.dynamic_committee_cfg.get(
+                                    'position_radius', 1
                                 )
                             ),
                             committee_retrain_cooldown=int(

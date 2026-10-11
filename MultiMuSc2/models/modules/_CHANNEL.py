@@ -97,23 +97,22 @@ class ChannelMemory:
             if channel.effective_span >= self.mature_span
         ]
 
-    def association_profile(self, features, grid_size, current_image_id=None):
+    def patch_associations(self, features, grid_size):
         self._validate_features(features, grid_size)
         patch_count = features.shape[0]
+        channel_ids = torch.full(
+            (patch_count,),
+            -1,
+            dtype=torch.long,
+        )
+        mature = torch.zeros(patch_count, dtype=torch.bool)
         eligible = [
             (index, channel)
             for index, channel in enumerate(self.channels)
             if channel.ttl > 1
         ]
         if not eligible:
-            return {
-                "matched_fraction": 0.0,
-                "mature_match_fraction": 0.0,
-                "provisional_match_fraction": 0.0,
-                "recent_provisional_match_fraction": 0.0,
-                "matched_channel_ids": [],
-                "provisional_channel_ids": [],
-            }
+            return channel_ids, mature
 
         current = features.detach().float().to(self.device)
         candidates = torch.stack(
@@ -128,28 +127,64 @@ class ChannelMemory:
         distances = distances.masked_fill(~valid, float("inf"))
         patch_to_channel = distances.argmin(dim=1)
         channel_to_patch = distances.argmin(dim=0)
+        patch_ids = torch.arange(patch_count, device=self.device)
+        finite = torch.isfinite(
+            distances[patch_ids, patch_to_channel]
+        )
+        mutual = channel_to_patch[patch_to_channel] == patch_ids
+        matched = finite & mutual
+        if not matched.any():
+            return channel_ids, mature
 
-        matched_channel_ids = []
-        provisional_channel_ids = []
-        recent_provisional_count = 0
-        mature_count = 0
-        for patch_id in range(patch_count):
-            local_channel_id = int(patch_to_channel[patch_id])
-            if not torch.isfinite(distances[patch_id, local_channel_id]):
-                continue
-            if int(channel_to_patch[local_channel_id]) != patch_id:
-                continue
-            channel_id, channel = eligible[local_channel_id]
-            matched_channel_ids.append(channel_id)
-            if channel.effective_span >= self.mature_span:
-                mature_count += 1
-            else:
-                provisional_channel_ids.append(channel_id)
-                if (
-                    current_image_id is not None
-                    and channel.seed_image_id == current_image_id - 1
-                ):
-                    recent_provisional_count += 1
+        eligible_ids = torch.as_tensor(
+            [index for index, _ in eligible],
+            device=self.device,
+            dtype=torch.long,
+        )
+        selected_ids = eligible_ids[patch_to_channel[matched]].cpu()
+        matched_cpu = matched.cpu()
+        channel_ids[matched_cpu] = selected_ids
+        mature_values = torch.as_tensor(
+            [
+                channel.effective_span >= self.mature_span
+                for _, channel in eligible
+            ],
+            device=self.device,
+            dtype=torch.bool,
+        )
+        mature[matched_cpu] = mature_values[
+            patch_to_channel[matched]
+        ].cpu()
+        return channel_ids, mature
+
+    def association_profile(self, features, grid_size, current_image_id=None):
+        self._validate_features(features, grid_size)
+        patch_count = features.shape[0]
+        channel_ids, mature = self.patch_associations(
+            features,
+            grid_size,
+        )
+        matched_mask = channel_ids >= 0
+        if not matched_mask.any():
+            return {
+                "matched_fraction": 0.0,
+                "mature_match_fraction": 0.0,
+                "provisional_match_fraction": 0.0,
+                "recent_provisional_match_fraction": 0.0,
+                "matched_channel_ids": [],
+                "provisional_channel_ids": [],
+            }
+
+        matched_channel_ids = channel_ids[matched_mask].tolist()
+        provisional_mask = matched_mask & ~mature
+        provisional_channel_ids = channel_ids[provisional_mask].tolist()
+        mature_count = int(mature.sum().item())
+        recent_provisional_count = sum(
+            current_image_id is not None
+            and self.channels[channel_id].seed_image_id
+            == current_image_id - 1
+            for channel_id in provisional_channel_ids
+        )
 
         matched_count = len(matched_channel_ids)
         provisional_count = len(provisional_channel_ids)
