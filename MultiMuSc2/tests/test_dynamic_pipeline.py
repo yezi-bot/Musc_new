@@ -120,6 +120,48 @@ class DynamicPipelineTest(unittest.TestCase):
             places=6,
         )
 
+    def test_channel_gate_uses_recent_strict_history_fallback(self):
+        dino = synthetic_features(5)
+        timeline = scoring_timeline(5)
+        timeline[4]["provisional_expert_before"] = {
+            "image_id": 3,
+            "image_ids": [2, 3],
+            "memory_members": [
+                {"image_id": 2, "patch_ids": [0]},
+                {"image_id": 3, "patch_ids": [0]},
+            ],
+            "representative_step": 3,
+            "start_step": 2,
+            "pool_size": 2,
+            "weight": 0.25,
+            "state": "collecting_channel_gate",
+        }
+        expected, _ = _strict_history_fallback(
+            dino[4],
+            dino[2:4],
+            "expected",
+        )
+
+        scores, audits = score_dynamic_msm2_layer(
+            dino,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+            transition_fallback_window=2,
+        )
+
+        self.assertTrue(torch.allclose(scores[4], expected))
+        self.assertEqual(
+            audits[4]["effective_mode"],
+            "recent_history_dino_fallback",
+        )
+        self.assertEqual(
+            audits[4]["fallback_reason"],
+            "category_transition_recent_history",
+        )
+        self.assertEqual(audits[4]["fallback_history_image_ids"], [2, 3])
+        self.assertNotIn("memory_patch_count", audits[4])
+
     def test_chunked_online_msm_matches_unchunked_result(self):
         features = synthetic_features(6)
         expected = float(

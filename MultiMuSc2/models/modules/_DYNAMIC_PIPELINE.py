@@ -442,11 +442,14 @@ def score_dynamic_msm2_layer(
     committee_change_ratio=0.4,
     committee_retrain_cooldown=5,
     position_radius=1,
+    transition_fallback_window=8,
 ):
     if dino_features.ndim != 3:
         raise ValueError("dino_features must have shape [image, patch, feature]")
     if len(timeline) != dino_features.shape[0]:
         raise ValueError("timeline and feature image counts must match")
+    if transition_fallback_window < 1:
+        raise ValueError("transition_fallback_window must be at least 1")
     if retrain_policy not in {"on_change", "fit_once", "committee_gate"}:
         raise ValueError(f"unsupported retrain_policy: {retrain_policy}")
     if training_source not in {"cluster_history", "active_committee"}:
@@ -498,6 +501,7 @@ def score_dynamic_msm2_layer(
         change_ratio = None
         provisional = record.get("provisional_expert_before")
         provisional_score_audit = None
+        fallback_history_image_ids = []
 
         if fusion_mode == "strict_history_dino":
             patch_score, fallback_reason = _strict_history_dino_fallback(
@@ -701,7 +705,23 @@ def score_dynamic_msm2_layer(
                 raise ValueError(
                     "provisional expert must be strictly historical"
                 )
-            if provisional.get("state") in {
+            if provisional.get("state") == "collecting_channel_gate":
+                fallback_start = max(
+                    history_start,
+                    step - transition_fallback_window,
+                )
+                fallback_history_image_ids = list(
+                    range(fallback_start, step)
+                )
+                patch_score, fallback_reason = (
+                    _strict_history_dino_fallback(
+                        current_dino,
+                        dino_features[fallback_start:step],
+                    )
+                )
+                fallback_reason = "category_transition_recent_history"
+                effective_mode = "recent_history_dino_fallback"
+            elif provisional.get("state") in {
                 "collecting_irbank",
                 "confirmed_irbank",
             }:
@@ -835,6 +855,7 @@ def score_dynamic_msm2_layer(
                 change_ratio
             ),
             "fallback_reason": fallback_reason,
+            "fallback_history_image_ids": fallback_history_image_ids,
             "training_image_count": (
                 len(cached_training["image_ids"])
                 if cached_training is not None

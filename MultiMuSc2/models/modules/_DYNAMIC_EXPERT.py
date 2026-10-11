@@ -86,10 +86,11 @@ class DynamicExpertManager:
             "provisional",
             "soft_confirmed",
             "channel_irbank",
+            "channel_gate",
       }:
             raise ValueError(
                 "novel_admission_mode must be immediate, quarantine, "
-                "provisional, soft_confirmed, or channel_irbank"
+                "provisional, soft_confirmed, channel_irbank, or channel_gate"
             )
       if novel_quarantine_steps < 2:
             raise ValueError("novel_quarantine_steps must be at least 2")
@@ -172,18 +173,30 @@ class DynamicExpertManager:
     def provisional_expert_before_step(self):
         if (
             self.novel_admission_mode
-            not in {"provisional", "soft_confirmed", "channel_irbank"}
+            not in {
+                "provisional",
+                "soft_confirmed",
+                "channel_irbank",
+                "channel_gate",
+            }
         ):
             return None
         if self.novel_quarantine:
-            if self.novel_admission_mode == "channel_irbank":
+            if self.novel_admission_mode in {
+                "channel_irbank",
+                "channel_gate",
+            }:
                 representatives = self._select_irbank_members(
                     self.novel_quarantine
                 )
                 if not representatives:
                     return None
                 representative = representatives[0]
-                state = "collecting_irbank"
+                state = (
+                    "collecting_channel_gate"
+                    if self.novel_admission_mode == "channel_gate"
+                    else "collecting_irbank"
+                )
             else:
                 representative = min(
                     self.novel_quarantine[-self.novel_quarantine_tail:],
@@ -214,7 +227,8 @@ class DynamicExpertManager:
                 for member in (
                     representatives
                     if state in {"confirmed", "confirmed_irbank"}
-                    or self.novel_admission_mode == "channel_irbank"
+                    or self.novel_admission_mode
+                    in {"channel_irbank", "channel_gate"}
                     else [representative]
                 )
             ],
@@ -635,6 +649,8 @@ class DynamicExpertManager:
             "admission_route": (
                 "new_distribution_provisional"
                 if self.novel_admission_mode == "provisional"
+                else "new_distribution_channel_gate"
+                if self.novel_admission_mode == "channel_gate"
                 else "new_distribution_quarantine"
             ),
             "admission_candidate_ms_score": member["ms_score"],
@@ -666,6 +682,7 @@ class DynamicExpertManager:
             "provisional",
             "soft_confirmed",
             "channel_irbank",
+            "channel_gate",
         }:
             return None, None
         if ms_short_score is None or ms_short_ratio is None:
@@ -757,8 +774,15 @@ class DynamicExpertManager:
             pool[-self.novel_quarantine_tail:],
             key=lambda item: item["ms_short_score"],
         )
-        if self.novel_admission_mode in {"soft_confirmed", "channel_irbank"}:
-            if self.novel_admission_mode == "channel_irbank":
+        if self.novel_admission_mode in {
+            "soft_confirmed",
+            "channel_irbank",
+            "channel_gate",
+        }:
+            if self.novel_admission_mode in {
+                "channel_irbank",
+                "channel_gate",
+            }:
                 representatives = self._select_irbank_members(pool)
             else:
                 representatives = sorted(
@@ -775,6 +799,34 @@ class DynamicExpertManager:
                     "selected_image_id": None,
                 }
                 return None, None
+            if self.novel_admission_mode == "channel_gate":
+                representative = representatives[0]
+                cluster_id, expert_id = self._admit_quarantined_member(
+                    representative,
+                    step,
+                )
+                self.last_novel_quarantine_event = {
+                    "decision": (
+                        "confirmed_channel_gate"
+                        if expert_id is not None
+                        else "cap_rejected"
+                    ),
+                    "start_step": pool[0]["step"],
+                    "end_step": int(step),
+                    "size": len(pool),
+                    "median_ratio": median_ratio,
+                    "selected_image_id": representative["image_id"],
+                    "selected_ms_short": representative["ms_short_score"],
+                    "confirmed_image_ids": [
+                        int(member["image_id"])
+                        for member in representatives
+                    ],
+                    "confirmed_patch_count": sum(
+                        len(member.get("memory_patch_ids", []))
+                        for member in representatives
+                    ),
+                }
+                return cluster_id, expert_id
             self.confirmed_provisional = {
                 "members": representatives,
                 "candidates": list(pool),
@@ -895,6 +947,7 @@ class DynamicExpertManager:
                 "provisional",
                 "soft_confirmed",
                 "channel_irbank",
+                "channel_gate",
             }
         ):
             return True, None, None, candidate_route

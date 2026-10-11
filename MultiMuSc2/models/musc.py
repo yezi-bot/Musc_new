@@ -641,6 +641,11 @@ class MuSc():
                                     'position_radius', 1
                                 )
                             ),
+                            transition_fallback_window=int(
+                                self.dynamic_fusion_cfg.get(
+                                    'transition_fallback_window', 8
+                                )
+                            ),
                             committee_retrain_cooldown=int(
                                 self.dynamic_fusion_cfg.get(
                                     'committee_retrain_cooldown', 5

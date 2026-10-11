@@ -81,6 +81,13 @@ VARIANTS = {
         "candidate_mode": "dual_path",
         "novel_admission_mode": "channel_irbank",
     },
+    "dynamic_dino_channel_gate": {
+        "dynamic": True,
+        "mode": "dino_only",
+        "reset": False,
+        "candidate_mode": "dual_path",
+        "novel_admission_mode": "channel_gate",
+    },
     "dynamic_dino_oracle_reset": {
         "dynamic": True,
         "mode": "dino_only",
@@ -145,6 +152,8 @@ def audit_metrics(audit_path, boundary):
             "soft_confirmation_latency": None,
             "irbank_confirmations": None,
             "irbank_confirmation_latency": None,
+            "channel_gate_confirmations": None,
+            "channel_gate_confirmation_latency": None,
         }
     audit = json.loads(Path(audit_path).read_text(encoding="utf-8"))
     timeline = audit["timeline"]
@@ -177,6 +186,7 @@ def audit_metrics(audit_path, boundary):
         for image_id in (
             record["expert_image_ids"]
             + record.get("provisional_expert_image_ids", [])
+            + record.get("fallback_history_image_ids", [])
         )
     )
     novel_admissions = [
@@ -190,6 +200,7 @@ def audit_metrics(audit_path, boundary):
                 "new_distribution",
                 "new_distribution_quarantine",
                 "new_distribution_provisional",
+                "new_distribution_channel_gate",
             }
         )
     ]
@@ -221,6 +232,20 @@ def audit_metrics(audit_path, boundary):
         (
             record["step"]
             for record in irbank_confirmations
+            if record["step"] >= boundary
+        ),
+        None,
+    )
+    channel_gate_confirmations = [
+        record
+        for record in timeline
+        if (record.get("novel_quarantine") or {}).get("decision")
+        == "confirmed_channel_gate"
+    ]
+    first_post_channel_gate = next(
+        (
+            record["step"]
+            for record in channel_gate_confirmations
             if record["step"] >= boundary
         ),
         None,
@@ -295,6 +320,12 @@ def audit_metrics(audit_path, boundary):
         "irbank_confirmation_latency": (
             first_post_irbank - boundary
             if first_post_irbank is not None
+            else None
+        ),
+        "channel_gate_confirmations": len(channel_gate_confirmations),
+        "channel_gate_confirmation_latency": (
+            first_post_channel_gate - boundary
+            if first_post_channel_gate is not None
             else None
         ),
     }
@@ -394,6 +425,7 @@ def run_variant(base_config, args, sequence, seed, variant_name):
         MS_SHORT_WINDOWS
     )
     cfg["models"].setdefault("dynamic_fusion", {})["mode"] = variant["mode"]
+    cfg["models"]["dynamic_fusion"]["transition_fallback_window"] = 8
 
     model = MuSc(cfg, seed=seed)
     if torch.cuda.is_available():
