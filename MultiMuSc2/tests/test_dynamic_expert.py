@@ -22,6 +22,26 @@ def prepared_manager(committee_cap=1):
 
 
 class DynamicExpertManagerTest(unittest.TestCase):
+    def test_latest_candidate_selects_newest_cluster_member(self):
+        manager = DynamicExpertManager(
+            representative_mode="latest_candidate",
+            min_cluster_support=2,
+            committee_cap=1,
+        )
+        manager.ms_history.append(1.0)
+        manager.support_history.append(0.5)
+        features = patch_features(1.0, 0.0)
+
+        self.advance_candidate(manager, 0, 10, features)
+        admitted = self.advance_candidate(manager, 1, 11, features)
+
+        self.assertEqual(admitted["admitted_expert_id"], 0)
+        self.assertEqual(manager.active_experts[0]["image_id"], 11)
+        self.assertEqual(
+            manager.active_experts[0]["representative_mode"],
+            "latest_candidate",
+        )
+
     def test_confirmed_member_count_cannot_exceed_tail(self):
         with self.assertRaisesRegex(ValueError, "must not exceed"):
             DynamicExpertManager(

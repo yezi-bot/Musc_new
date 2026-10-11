@@ -88,6 +88,15 @@ VARIANTS = {
         "candidate_mode": "dual_path",
         "novel_admission_mode": "channel_gate",
     },
+    "dynamic_dino_channel_gate_latest": {
+        "dynamic": True,
+        "mode": "dino_only",
+        "reset": False,
+        "candidate_mode": "dual_path",
+        "novel_admission_mode": "channel_gate",
+        "representative_mode": "latest_candidate",
+        "admission_ttl_mode": "historical_gap",
+    },
     "dynamic_dino_oracle_reset": {
         "dynamic": True,
         "mode": "dino_only",
@@ -401,6 +410,12 @@ def run_variant(base_config, args, sequence, seed, variant_name):
     cfg["models"]["dynamic_committee"]["candidate_mode"] = variant[
         "candidate_mode"
     ]
+    cfg["models"]["dynamic_committee"]["representative_mode"] = variant.get(
+        "representative_mode", "historical_quality"
+    )
+    cfg["models"]["dynamic_committee"]["admission_ttl_mode"] = variant.get(
+        "admission_ttl_mode", "historical_gap"
+    )
     cfg["models"]["dynamic_committee"]["novel_admission_mode"] = variant.get(
         "novel_admission_mode", "immediate"
     )
@@ -462,6 +477,12 @@ def run_variant(base_config, args, sequence, seed, variant_name):
         "sequence": "->".join(sequence),
         "seed": seed,
         "variant": variant_name,
+        "representative_mode": cfg["models"]["dynamic_committee"][
+            "representative_mode"
+        ],
+        "admission_ttl_mode": cfg["models"]["dynamic_committee"][
+            "admission_ttl_mode"
+        ],
         "segment_samples": args.segment_samples,
         "boundary": boundary,
         "image_auroc": float(image_metric[0]),

@@ -428,6 +428,18 @@ class MuSc():
                                     'ttl_gap_multiplier', 2.0
                                 )
                             ),
+                            'representative_mode': (
+                                self.dynamic_committee_cfg.get(
+                                    'representative_mode',
+                                    'historical_quality',
+                                )
+                            ),
+                            'admission_ttl_mode': (
+                                self.dynamic_committee_cfg.get(
+                                    'admission_ttl_mode',
+                                    'historical_gap',
+                                )
+                            ),
                             'candidate_mode': self.dynamic_committee_cfg.get(
                                 'candidate_mode', 'legacy'
                             ),
