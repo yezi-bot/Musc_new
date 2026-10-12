@@ -51,6 +51,7 @@ VARIANTS = {
         "reset": False,
         "candidate_mode": "dual_path",
         "novel_admission_mode": "quarantine",
+        "transition_fallback_window": 0,
     },
     "dynamic_dino_provisional": {
         "dynamic": True,
@@ -87,6 +88,15 @@ VARIANTS = {
         "reset": False,
         "candidate_mode": "dual_path",
         "novel_admission_mode": "channel_gate",
+        "transition_fallback_window": 8,
+    },
+    "dynamic_dino_channel_gate_no_fallback": {
+        "dynamic": True,
+        "mode": "dino_only",
+        "reset": False,
+        "candidate_mode": "dual_path",
+        "novel_admission_mode": "channel_gate",
+        "transition_fallback_window": 0,
     },
     "dynamic_dino_channel_gate_latest": {
         "dynamic": True,
@@ -163,11 +173,18 @@ def audit_metrics(audit_path, boundary):
             "irbank_confirmation_latency": None,
             "channel_gate_confirmations": None,
             "channel_gate_confirmation_latency": None,
+            "transition_fallback_steps": None,
+            "post_transition_fallback_steps": None,
         }
     audit = json.loads(Path(audit_path).read_text(encoding="utf-8"))
     timeline = audit["timeline"]
     scoring = audit["scoring"]
     post = [record for record in scoring if record["step"] >= boundary]
+    transition_fallback_records = [
+        record
+        for record in scoring
+        if record.get("fallback_reason") == "category_transition_recent_history"
+    ]
     old_reference_records = [
         record
         for record in post
@@ -337,6 +354,11 @@ def audit_metrics(audit_path, boundary):
             if first_post_channel_gate is not None
             else None
         ),
+        "transition_fallback_steps": len(transition_fallback_records),
+        "post_transition_fallback_steps": sum(
+            record["step"] >= boundary
+            for record in transition_fallback_records
+        ),
     }
 
 
@@ -440,7 +462,9 @@ def run_variant(base_config, args, sequence, seed, variant_name):
         MS_SHORT_WINDOWS
     )
     cfg["models"].setdefault("dynamic_fusion", {})["mode"] = variant["mode"]
-    cfg["models"]["dynamic_fusion"]["transition_fallback_window"] = 8
+    cfg["models"]["dynamic_fusion"]["transition_fallback_window"] = int(
+        variant.get("transition_fallback_window", 8)
+    )
 
     model = MuSc(cfg, seed=seed)
     if torch.cuda.is_available():
@@ -482,6 +506,9 @@ def run_variant(base_config, args, sequence, seed, variant_name):
         ],
         "admission_ttl_mode": cfg["models"]["dynamic_committee"][
             "admission_ttl_mode"
+        ],
+        "transition_fallback_window": cfg["models"]["dynamic_fusion"][
+            "transition_fallback_window"
         ],
         "segment_samples": args.segment_samples,
         "boundary": boundary,

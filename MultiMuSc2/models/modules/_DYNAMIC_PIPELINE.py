@@ -448,8 +448,8 @@ def score_dynamic_msm2_layer(
         raise ValueError("dino_features must have shape [image, patch, feature]")
     if len(timeline) != dino_features.shape[0]:
         raise ValueError("timeline and feature image counts must match")
-    if transition_fallback_window < 1:
-        raise ValueError("transition_fallback_window must be at least 1")
+    if transition_fallback_window < 0:
+        raise ValueError("transition_fallback_window must be non-negative")
     if retrain_policy not in {"on_change", "fit_once", "committee_gate"}:
         raise ValueError(f"unsupported retrain_policy: {retrain_policy}")
     if training_source not in {"cluster_history", "active_committee"}:
@@ -705,7 +705,10 @@ def score_dynamic_msm2_layer(
                 raise ValueError(
                     "provisional expert must be strictly historical"
                 )
-            if provisional.get("state") == "collecting_channel_gate":
+            if (
+                provisional.get("state") == "collecting_channel_gate"
+                and transition_fallback_window > 0
+            ):
                 fallback_start = max(
                     history_start,
                     step - transition_fallback_window,

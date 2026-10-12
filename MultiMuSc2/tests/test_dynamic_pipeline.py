@@ -162,6 +162,53 @@ class DynamicPipelineTest(unittest.TestCase):
         self.assertEqual(audits[4]["fallback_history_image_ids"], [2, 3])
         self.assertNotIn("memory_patch_count", audits[4])
 
+    def test_channel_gate_can_disable_recent_history_fallback(self):
+        features = torch.tensor(
+            [
+                [[1.0, 0.0]],
+                [[0.9, 0.1]],
+                [[0.0, 1.0]],
+            ],
+            dtype=torch.float32,
+        )
+        timeline = [
+            {
+                "active_experts_before": [],
+                "provisional_expert_before": None,
+                "fuser_training_members_before": [],
+            },
+            {
+                "active_experts_before": [],
+                "provisional_expert_before": None,
+                "fuser_training_members_before": [],
+            },
+            {
+                "active_experts_before": [{"expert_id": 0, "image_id": 0}],
+                "provisional_expert_before": {
+                    "image_id": 1,
+                    "image_ids": [1],
+                    "weight": 0.25,
+                    "pool_size": 1,
+                    "state": "collecting_channel_gate",
+                },
+                "fuser_training_members_before": [],
+            },
+        ]
+
+        _, audits = score_dynamic_msm2_layer(
+            features,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+            transition_fallback_window=0,
+        )
+
+        self.assertEqual(audits[2]["fallback_history_image_ids"], [])
+        self.assertNotEqual(
+            audits[2]["fallback_reason"],
+            "category_transition_recent_history",
+        )
+
     def test_chunked_online_msm_matches_unchunked_result(self):
         features = synthetic_features(6)
         expected = float(
