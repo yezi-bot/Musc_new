@@ -46,6 +46,7 @@ class MuSc():
         self.vis = cfg['testing']['vis']
         self.vis_type = cfg['testing']['vis_type']
         self.save_excel = cfg['testing']['save_excel']
+        self.use_rscin = bool(cfg['testing'].get('use_rscin', True))
         self.max_samples = cfg['testing'].get('max_samples')
         if self.max_samples is not None and int(self.max_samples) < 2:
             raise ValueError('testing.max_samples must be at least 2')
@@ -307,7 +308,11 @@ class MuSc():
                     #'dinov2'
                     #局部特征和全局特征
                     patch_tokens1 = self.dino_model.get_intermediate_layers(x=input_image, n=[l-1 for l in self.features_list], return_class_token=False)
-                    image_features1 = self.dino_model(input_image)
+                    image_features1 = (
+                        self.dino_model(input_image)
+                        if self.use_rscin
+                        else None
+                    )
                     # 从cpu移动到gpu
                     patch_tokens1 = [patch_tokens1[l].cpu() for l in range(len(self.features_list))]
                     fake_cls = [torch.zeros_like(p)[:, 0:1, :] for p in patch_tokens1]
@@ -320,8 +325,9 @@ class MuSc():
                     image_features2 /= image_features2.norm(dim=-1, keepdim=True)
                     patch_tokens2 = [patch_tokens2[l].cpu() for l in range(len(self.features_list))]
                 # 转成numpy图像特征
-                image_features1 = [image_features1[bi].squeeze().cpu().numpy() for bi in range(image_features1.shape[0])]
-                class_tokens1.extend(image_features1)
+                if image_features1 is not None:
+                    image_features1 = [image_features1[bi].squeeze().cpu().numpy() for bi in range(image_features1.shape[0])]
+                    class_tokens1.extend(image_features1)
                 patch_tokens_list1.append(patch_tokens1)  # (批次图片数量, patch数量L+1, 特征维度C)
                 patch_tokens_list2.append(patch_tokens2)  # (批次图片数量, L+1, C)
             end_time = time.time()
@@ -787,7 +793,11 @@ class MuSc():
         else:
             k_score = [1, 2, 3]
                                                         # 之前保存的每张图片的 DINO 整图特征
-        scores_cls = RsCIN(ac_score, class_tokens1, k_list=k_score)
+        scores_cls = (
+            RsCIN(ac_score, class_tokens1, k_list=k_score)
+            if self.use_rscin
+            else ac_score
+        )
 
         print('computing metrics...')
         # 每张图真实是否异常的标签

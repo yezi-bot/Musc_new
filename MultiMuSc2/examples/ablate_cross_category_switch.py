@@ -418,6 +418,7 @@ def run_variant(base_config, args, sequence, seed, variant_name):
     cfg["testing"]["output_dir"] = str(run_output)
     cfg["testing"]["vis"] = False
     cfg["testing"]["save_excel"] = False
+    cfg["testing"]["use_rscin"] = False
     cfg["testing"]["shuffle_stream"] = True
     cfg["testing"]["max_samples"] = args.segment_samples
     cfg["models"]["feature_layers"] = [23]
@@ -512,6 +513,7 @@ def run_variant(base_config, args, sequence, seed, variant_name):
         ],
         "segment_samples": args.segment_samples,
         "boundary": boundary,
+        "use_rscin": False,
         "image_auroc": float(image_metric[0]),
         "pixel_auroc": float(pixel_metric[0]),
         "aupro": float(pixel_metric[3]),
