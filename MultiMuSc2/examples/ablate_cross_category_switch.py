@@ -113,6 +113,18 @@ VARIANTS = {
         "reset": True,
         "candidate_mode": "legacy",
     },
+    "dynamic_dino_channel_gate_conditional_fallback": {
+        "dynamic": True,
+        "mode": "dino_only",
+        "reset": False,
+        "candidate_mode": "dual_path",
+        "novel_admission_mode": "channel_gate",
+        "transition_fallback_window": 8,
+        "transition_fallback_require_pre_pool_expert": True,
+        # "transition_fallback_evidence_window":4,
+        # "transition_fallback_min_hits":2,
+        "transition_fallback_confirm_steps": 2,
+    },
 }
 
 MS_SHORT_WINDOWS = (8, 16, 32)
@@ -467,6 +479,12 @@ def run_variant(base_config, args, sequence, seed, variant_name):
     cfg["models"]["dynamic_fusion"]["transition_fallback_window"] = int(
         variant.get("transition_fallback_window", 8)
     )
+    cfg["models"]["dynamic_fusion"]["transition_fallback_require_pre_pool_expert"] = bool(
+        variant.get("transition_fallback_require_pre_pool_expert", False)
+    )
+    cfg["models"]["dynamic_fusion"]["transition_fallback_confirm_steps"] = int(
+        variant.get("transition_fallback_confirm_steps", 0)
+    )
 
     model = MuSc(cfg, seed=seed)
     if torch.cuda.is_available():
@@ -545,6 +563,8 @@ def run_variant(base_config, args, sequence, seed, variant_name):
         ),
         "runtime_seconds": runtime_seconds,
         "peak_memory_mb": peak_memory_mb,
+        "transition_fallback_require_pre_pool_expert": cfg["models"]["dynamic_fusion"]["transition_fallback_require_pre_pool_expert"],
+        "transition_fallback_confirm_steps": cfg["models"]["dynamic_fusion"]["transition_fallback_confirm_steps"],
     }
     row.update(audit_metrics(audit_path, boundary))
     del model

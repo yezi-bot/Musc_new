@@ -169,6 +169,7 @@ class DynamicExpertManager:
       self.novel_quarantine = None
       self.last_novel_quarantine_event = None
       self.confirmed_provisional = None
+      self.novel_evidence_streak=0
 
     def provisional_expert_before_step(self):
         if (
@@ -222,6 +223,7 @@ class DynamicExpertManager:
             return None
         return {
             "image_id": int(representative["image_id"]),
+            "novel_evidence_streak": int(self.novel_evidence_streak),
             "image_ids": [
                 int(member["image_id"])
                 for member in (
@@ -686,7 +688,12 @@ class DynamicExpertManager:
         }:
             return None, None
         if ms_short_score is None or ms_short_ratio is None:
+            self.novel_evidence_streak = 0
             return None, None
+        if novel_trigger:
+            self.novel_evidence_streak += 1
+        else:
+            self.novel_evidence_streak = 0        
         member = self._quarantine_member(
             step,
             image_id,
@@ -756,6 +763,7 @@ class DynamicExpertManager:
 
         pool = self.novel_quarantine
         self.novel_quarantine = None
+        self.novel_evidence_streak=0
         median_ratio = float(
             np.median([item["ms_short_ratio"] for item in pool])
         )

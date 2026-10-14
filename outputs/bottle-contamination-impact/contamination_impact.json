@@ -1,0 +1,393 @@
+{
+  "analysis_scope": "offline_gt_oracle_remove_abnormal_active_experts",
+  "gt_usage": "GT is used only after the original online run to label and remove contaminated expert references. It is not an online method.",
+  "source_summary": "D:\\multimusc2\\reentry-ablation-full\\reentry_ablation_summary.json",
+  "source_experiment_root": "D:\\multimusc2\\reentry-ablation-full\\latest_only",
+  "data_root": "D:\\multimusc2\\MultiMuSc2\\data",
+  "dinov2_repo": "C:\\Users\\PC\\.cache\\torch\\hub\\facebookresearch_dinov2_main",
+  "checkpoint": "C:\\Users\\PC\\.cache\\torch\\hub\\checkpoints\\dinov2_vitl14_pretrain.pth",
+  "device": "cuda:0",
+  "config": {
+    "feature_layers": [
+      5,
+      11,
+      17,
+      23
+    ],
+    "r_list": [
+      1,
+      3,
+      5
+    ],
+    "scoring": {
+      "topmin_min": 0.02,
+      "topmin_max": 0.3,
+      "reference_chunk_size": 8
+    },
+    "image_size": 518
+  },
+  "aggregate": {
+    "seed_count": 3,
+    "total_expert_scored_steps": 197,
+    "total_contaminated_exposure_steps": 99,
+    "pooled_contaminated_exposure_fraction": 0.5025380710659898,
+    "total_expert_reference_slots": 444,
+    "total_contaminated_reference_slots": 117,
+    "pooled_contaminated_reference_slot_fraction": 0.2635135135135135,
+    "original_metric_means": {
+      "image_auroc": 0.9962365591397848,
+      "image_f1": 0.9893756613756612,
+      "image_ap": 0.9987731824117064,
+      "pixel_auroc": 0.9930797855131042,
+      "pixel_f1": 0.8376781701447756,
+      "pixel_ap": 0.8985275932868352,
+      "aupro": 0.974722015579934
+    },
+    "oracle_metric_means": {
+      "image_auroc": 0.996774193548387,
+      "image_f1": 0.9919132791327913,
+      "image_ap": 0.998955911854428,
+      "pixel_auroc": 0.993027236257853,
+      "pixel_f1": 0.8355920378454375,
+      "pixel_ap": 0.8997400270942079,
+      "aupro": 0.9759404376360687
+    },
+    "oracle_minus_original_means": {
+      "image_auroc": 0.0005376344086021426,
+      "image_f1": 0.0025376177571299805,
+      "image_ap": 0.0001827294427216112,
+      "pixel_auroc": -5.2549255250962844e-05,
+      "pixel_f1": -0.0020861322993381837,
+      "pixel_ap": 0.0012124338073728664,
+      "aupro": 0.0012184220561349453
+    }
+  },
+  "seeds": [
+    {
+      "seed": 0,
+      "available_steps": 82,
+      "expert_scored_steps": 64,
+      "contaminated_exposure_steps": 50,
+      "contaminated_exposure_fraction_of_expert_steps": 0.78125,
+      "expert_reference_slots": 164,
+      "contaminated_reference_slots": 68,
+      "contaminated_reference_slot_fraction": 0.4146341463414634,
+      "first_contaminated_exposure_step": 31,
+      "last_contaminated_exposure_step": 80,
+      "contaminated_experts": [
+        {
+          "expert_id": 1,
+          "expert_image_id": 30,
+          "anomaly_type": "broken_large",
+          "admission_step": 30,
+          "reference_step_count": 26,
+          "first_reference_step": 31,
+          "last_reference_step": 56
+        },
+        {
+          "expert_id": 2,
+          "expert_image_id": 38,
+          "anomaly_type": "broken_small",
+          "admission_step": 38,
+          "reference_step_count": 42,
+          "first_reference_step": 39,
+          "last_reference_step": 80
+        }
+      ],
+      "max_replay_image_score_error": 0.0,
+      "stored_metric_errors": {
+        "image_auroc": 0.0,
+        "image_f1": 0.0,
+        "image_ap": 0.0,
+        "pixel_auroc": 0.0,
+        "pixel_f1": 0.0,
+        "pixel_ap": 0.0,
+        "aupro": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.9975806451612903,
+        "image_f1": 0.9919999999999999,
+        "image_ap": 0.9992194275684834,
+        "pixel_auroc": 0.9926666337263498,
+        "pixel_f1": 0.8368617768571569,
+        "pixel_ap": 0.8935064251721457,
+        "aupro": 0.9728732252860314
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.9983870967741936,
+        "image_f1": 0.991869918699187,
+        "image_ap": 0.9994959677419355,
+        "pixel_auroc": 0.9929006414107472,
+        "pixel_f1": 0.8350645874670857,
+        "pixel_ap": 0.8974095535261964,
+        "aupro": 0.9765399172140328
+      },
+      "oracle_minus_original": {
+        "image_auroc": 0.0008064516129032695,
+        "image_f1": -0.00013008130081293423,
+        "image_ap": 0.00027654017345213333,
+        "pixel_auroc": 0.00023400768439740816,
+        "pixel_f1": -0.00179718939007123,
+        "pixel_ap": 0.003903128354050711,
+        "aupro": 0.0036666919280013976
+      },
+      "score_phases": {
+        "before_contamination": {
+          "step_count": 30,
+          "normal_count": 7,
+          "normal_original_score_mean": 0.4357587311949049,
+          "normal_oracle_score_mean": 0.4357587311949049,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 23,
+          "anomaly_original_score_mean": 0.7539033786110256,
+          "anomaly_oracle_score_mean": 0.7539033786110256,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "contaminated_exposure": {
+          "step_count": 50,
+          "normal_count": 12,
+          "normal_original_score_mean": 0.41426342229048413,
+          "normal_oracle_score_mean": 0.4512925272186597,
+          "normal_oracle_delta_mean": 0.037029104928175606,
+          "anomaly_count": 38,
+          "anomaly_original_score_mean": 0.7311549076908513,
+          "anomaly_oracle_score_mean": 0.7989928800808755,
+          "anomaly_oracle_delta_mean": 0.06783797239002429
+        },
+        "after_contamination": {
+          "step_count": 2,
+          "normal_count": 1,
+          "normal_original_score_mean": 0.44264087080955505,
+          "normal_oracle_score_mean": 0.44264087080955505,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 1,
+          "anomaly_original_score_mean": 0.7743622064590454,
+          "anomaly_oracle_score_mean": 0.7743622064590454,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "clean_or_fallback": {
+          "step_count": 0,
+          "normal_count": 0,
+          "normal_original_score_mean": null,
+          "normal_oracle_score_mean": null,
+          "normal_oracle_delta_mean": null,
+          "anomaly_count": 0,
+          "anomaly_original_score_mean": null,
+          "anomaly_oracle_score_mean": null,
+          "anomaly_oracle_delta_mean": null
+        }
+      }
+    },
+    {
+      "seed": 1,
+      "available_steps": 82,
+      "expert_scored_steps": 72,
+      "contaminated_exposure_steps": 0,
+      "contaminated_exposure_fraction_of_expert_steps": 0.0,
+      "expert_reference_slots": 115,
+      "contaminated_reference_slots": 0,
+      "contaminated_reference_slot_fraction": 0.0,
+      "first_contaminated_exposure_step": null,
+      "last_contaminated_exposure_step": null,
+      "contaminated_experts": [],
+      "max_replay_image_score_error": 0.0,
+      "stored_metric_errors": {
+        "image_auroc": 0.0,
+        "image_f1": 0.0,
+        "image_ap": 0.0,
+        "pixel_auroc": 0.0,
+        "pixel_f1": 0.0,
+        "pixel_ap": 0.0,
+        "aupro": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.9943548387096773,
+        "image_f1": 0.9919999999999999,
+        "image_ap": 0.9981161846947977,
+        "pixel_auroc": 0.9925542426508843,
+        "pixel_f1": 0.8318792694429359,
+        "pixel_ap": 0.897896547209816,
+        "aupro": 0.9747732501620189
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.9943548387096773,
+        "image_f1": 0.9919999999999999,
+        "image_ap": 0.9981161846947977,
+        "pixel_auroc": 0.9925542426508843,
+        "pixel_f1": 0.8318792694429359,
+        "pixel_ap": 0.897896547209816,
+        "aupro": 0.9747732501620189
+      },
+      "oracle_minus_original": {
+        "image_auroc": 0.0,
+        "image_f1": 0.0,
+        "image_ap": 0.0,
+        "pixel_auroc": 0.0,
+        "pixel_f1": 0.0,
+        "pixel_ap": 0.0,
+        "aupro": 0.0
+      },
+      "score_phases": {
+        "before_contamination": {
+          "step_count": 0,
+          "normal_count": 0,
+          "normal_original_score_mean": null,
+          "normal_oracle_score_mean": null,
+          "normal_oracle_delta_mean": null,
+          "anomaly_count": 0,
+          "anomaly_original_score_mean": null,
+          "anomaly_oracle_score_mean": null,
+          "anomaly_oracle_delta_mean": null
+        },
+        "contaminated_exposure": {
+          "step_count": 0,
+          "normal_count": 0,
+          "normal_original_score_mean": null,
+          "normal_oracle_score_mean": null,
+          "normal_oracle_delta_mean": null,
+          "anomaly_count": 0,
+          "anomaly_original_score_mean": null,
+          "anomaly_oracle_score_mean": null,
+          "anomaly_oracle_delta_mean": null
+        },
+        "after_contamination": {
+          "step_count": 0,
+          "normal_count": 0,
+          "normal_original_score_mean": null,
+          "normal_oracle_score_mean": null,
+          "normal_oracle_delta_mean": null,
+          "anomaly_count": 0,
+          "anomaly_original_score_mean": null,
+          "anomaly_oracle_score_mean": null,
+          "anomaly_oracle_delta_mean": null
+        },
+        "clean_or_fallback": {
+          "step_count": 82,
+          "normal_count": 20,
+          "normal_original_score_mean": 0.450723198056221,
+          "normal_oracle_score_mean": 0.450723198056221,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 62,
+          "anomaly_original_score_mean": 0.8080775324375399,
+          "anomaly_oracle_score_mean": 0.8080775324375399,
+          "anomaly_oracle_delta_mean": 0.0
+        }
+      }
+    },
+    {
+      "seed": 2,
+      "available_steps": 82,
+      "expert_scored_steps": 61,
+      "contaminated_exposure_steps": 49,
+      "contaminated_exposure_fraction_of_expert_steps": 0.8032786885245902,
+      "expert_reference_slots": 165,
+      "contaminated_reference_slots": 49,
+      "contaminated_reference_slot_fraction": 0.296969696969697,
+      "first_contaminated_exposure_step": 23,
+      "last_contaminated_exposure_step": 82,
+      "contaminated_experts": [
+        {
+          "expert_id": 1,
+          "expert_image_id": 22,
+          "anomaly_type": "broken_small",
+          "admission_step": 22,
+          "reference_step_count": 29,
+          "first_reference_step": 23,
+          "last_reference_step": 51
+        },
+        {
+          "expert_id": 3,
+          "expert_image_id": 62,
+          "anomaly_type": "broken_small",
+          "admission_step": 62,
+          "reference_step_count": 20,
+          "first_reference_step": 63,
+          "last_reference_step": 82
+        }
+      ],
+      "max_replay_image_score_error": 0.0,
+      "stored_metric_errors": {
+        "image_auroc": 0.0,
+        "image_f1": 0.0,
+        "image_ap": 0.0,
+        "pixel_auroc": 0.0,
+        "pixel_f1": 0.0,
+        "pixel_ap": 0.0,
+        "aupro": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.9967741935483871,
+        "image_f1": 0.9841269841269841,
+        "image_ap": 0.9989839349718381,
+        "pixel_auroc": 0.9940184801620782,
+        "pixel_f1": 0.844293464134234,
+        "pixel_ap": 0.9041798074785435,
+        "aupro": 0.9765195712917514
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.9975806451612903,
+        "image_f1": 0.991869918699187,
+        "image_ap": 0.9992555831265508,
+        "pixel_auroc": 0.9936268247119279,
+        "pixel_f1": 0.8398322566262907,
+        "pixel_ap": 0.9039139805466114,
+        "aupro": 0.9765081455321548
+      },
+      "oracle_minus_original": {
+        "image_auroc": 0.0008064516129031585,
+        "image_f1": 0.007742934572202875,
+        "image_ap": 0.0002716481547127003,
+        "pixel_auroc": -0.0003916554501502967,
+        "pixel_f1": -0.004461207507943321,
+        "pixel_ap": -0.0002658269319321116,
+        "aupro": -1.1425759596561669e-05
+      },
+      "score_phases": {
+        "before_contamination": {
+          "step_count": 22,
+          "normal_count": 5,
+          "normal_original_score_mean": 0.42301803827285767,
+          "normal_oracle_score_mean": 0.42301803827285767,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 17,
+          "anomaly_original_score_mean": 0.693125886075637,
+          "anomaly_oracle_score_mean": 0.693125886075637,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "contaminated_exposure": {
+          "step_count": 49,
+          "normal_count": 14,
+          "normal_original_score_mean": 0.4108005485364369,
+          "normal_oracle_score_mean": 0.42746822110244204,
+          "normal_oracle_delta_mean": 0.01666767256600516,
+          "anomaly_count": 35,
+          "anomaly_original_score_mean": 0.7554409461362022,
+          "anomaly_oracle_score_mean": 0.799048900604248,
+          "anomaly_oracle_delta_mean": 0.04360795446804592
+        },
+        "after_contamination": {
+          "step_count": 0,
+          "normal_count": 0,
+          "normal_original_score_mean": null,
+          "normal_oracle_score_mean": null,
+          "normal_oracle_delta_mean": null,
+          "anomaly_count": 0,
+          "anomaly_original_score_mean": null,
+          "anomaly_oracle_score_mean": null,
+          "anomaly_oracle_delta_mean": null
+        },
+        "clean_or_fallback": {
+          "step_count": 11,
+          "normal_count": 1,
+          "normal_original_score_mean": 0.37487852573394775,
+          "normal_oracle_score_mean": 0.37487852573394775,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 10,
+          "anomaly_original_score_mean": 0.801037722826004,
+          "anomaly_oracle_score_mean": 0.801037722826004,
+          "anomaly_oracle_delta_mean": 0.0
+        }
+      }
+    }
+  ]
+}

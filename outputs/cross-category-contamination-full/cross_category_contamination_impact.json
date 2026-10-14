@@ -1,0 +1,1473 @@
+{
+  "analysis_scope": "cross_category_offline_gt_oracle_remove_anomalous_expert_roles",
+  "gt_usage": "GT is used only after each original online run to label and remove anomalous formal/provisional expert references. It never changes the online timeline, admission, deletion, or channel state.",
+  "oracle_empty_committee_policy": "When GT removal leaves no clean formal expert, replay uses the original strict-history DINO fallback; contaminated images remain ordinary history but no longer act as experts.",
+  "source_summary": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\cross_category_switch_summary.json",
+  "source_experiment_root": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012",
+  "data_root": "D:\\multimusc2\\MultiMuSc2\\data",
+  "dinov2_repo": "C:\\Users\\PC\\.cache\\torch\\hub\\facebookresearch_dinov2_main",
+  "checkpoint": "C:\\Users\\PC\\.cache\\torch\\hub\\checkpoints\\dinov2_vitl14_pretrain.pth",
+  "device": "cuda:0",
+  "image_size": 518,
+  "aggregate": {
+    "overall": {
+      "run_count": 12,
+      "formal_admission_count": 24,
+      "contaminated_formal_admission_count": 0,
+      "contaminated_exposure_steps": 67,
+      "contaminated_exposure_fraction_of_all_steps": 0.06979166666666667,
+      "stale_post_switch_exposure_steps": 65,
+      "stale_post_switch_exposure_fraction": 0.13541666666666666,
+      "used_reference_slots": 781,
+      "contaminated_reference_slots": 100,
+      "contaminated_reference_slot_fraction": 0.12804097311139565,
+      "original_metric_means": {
+        "image_auroc": 0.8178181818181819,
+        "image_f1": 0.8701128137699561,
+        "image_ap": 0.9008016317540579,
+        "pixel_auroc": 0.8882705995513464,
+        "pixel_f1": 0.41068573710219175,
+        "pixel_ap": 0.35934004935313624,
+        "aupro": 0.704191508228083
+      },
+      "oracle_metric_means": {
+        "image_auroc": 0.813939393939394,
+        "image_f1": 0.8701706965526336,
+        "image_ap": 0.8946037082905907,
+        "pixel_auroc": 0.8860636813184527,
+        "pixel_f1": 0.4040797708009885,
+        "pixel_ap": 0.3473579826574657,
+        "aupro": 0.6976208810820695
+      },
+      "oracle_minus_original_means": {
+        "image_auroc": -0.0038787878787878614,
+        "image_f1": 5.788278267753374e-05,
+        "image_ap": -0.0061979234634673515,
+        "pixel_auroc": -0.0022069182328937897,
+        "pixel_f1": -0.0066059663012032295,
+        "pixel_ap": -0.01198206669567054,
+        "aupro": -0.00657062714601354
+      }
+    },
+    "by_sequence_variant": {
+      "bottle->cable|dynamic_dino_channel_gate_no_fallback": {
+        "run_count": 3,
+        "formal_admission_count": 8,
+        "contaminated_formal_admission_count": 0,
+        "contaminated_exposure_steps": 29,
+        "contaminated_exposure_fraction_of_all_steps": 0.12083333333333333,
+        "stale_post_switch_exposure_steps": 31,
+        "stale_post_switch_exposure_fraction": 0.25833333333333336,
+        "used_reference_slots": 273,
+        "contaminated_reference_slots": 41,
+        "contaminated_reference_slot_fraction": 0.15018315018315018,
+        "original_metric_means": {
+          "image_auroc": 0.8288484848484848,
+          "image_f1": 0.8694398130335029,
+          "image_ap": 0.9168493110419648,
+          "pixel_auroc": 0.8617190827996671,
+          "pixel_f1": 0.295088605146018,
+          "pixel_ap": 0.21329125480914893,
+          "aupro": 0.6544357228981394
+        },
+        "oracle_metric_means": {
+          "image_auroc": 0.8157575757575758,
+          "image_f1": 0.8687151753523435,
+          "image_ap": 0.892735062944527,
+          "pixel_auroc": 0.8579892166143309,
+          "pixel_f1": 0.2935376240267055,
+          "pixel_ap": 0.18459640157871618,
+          "aupro": 0.64215534669936
+        },
+        "oracle_minus_original_means": {
+          "image_auroc": -0.013090909090909117,
+          "image_f1": -0.0007246376811593791,
+          "image_ap": -0.024114248097437823,
+          "pixel_auroc": -0.00372986618533618,
+          "pixel_f1": -0.001550981119312474,
+          "pixel_ap": -0.028694853230432766,
+          "aupro": -0.012280376198779383
+        }
+      },
+      "bottle->cable|dynamic_dino_quarantine": {
+        "run_count": 3,
+        "formal_admission_count": 8,
+        "contaminated_formal_admission_count": 0,
+        "contaminated_exposure_steps": 0,
+        "contaminated_exposure_fraction_of_all_steps": 0.0,
+        "stale_post_switch_exposure_steps": 31,
+        "stale_post_switch_exposure_fraction": 0.25833333333333336,
+        "used_reference_slots": 217,
+        "contaminated_reference_slots": 0,
+        "contaminated_reference_slot_fraction": 0.0,
+        "original_metric_means": {
+          "image_auroc": 0.7401212121212121,
+          "image_f1": 0.8657902384557733,
+          "image_ap": 0.8195819764239403,
+          "pixel_auroc": 0.8426954276756876,
+          "pixel_f1": 0.28953057513232466,
+          "pixel_ap": 0.138319441259683,
+          "aupro": 0.5948308338899931
+        },
+        "oracle_metric_means": {
+          "image_auroc": 0.7401212121212121,
+          "image_f1": 0.8657902384557733,
+          "image_ap": 0.8195819764239403,
+          "pixel_auroc": 0.8426954276756876,
+          "pixel_f1": 0.28953057513232466,
+          "pixel_ap": 0.138319441259683,
+          "aupro": 0.5948308338899931
+        },
+        "oracle_minus_original_means": {
+          "image_auroc": 0.0,
+          "image_f1": 0.0,
+          "image_ap": 0.0,
+          "pixel_auroc": 0.0,
+          "pixel_f1": 0.0,
+          "pixel_ap": 0.0,
+          "aupro": 0.0
+        }
+      },
+      "cable->bottle|dynamic_dino_channel_gate_no_fallback": {
+        "run_count": 3,
+        "formal_admission_count": 4,
+        "contaminated_formal_admission_count": 0,
+        "contaminated_exposure_steps": 38,
+        "contaminated_exposure_fraction_of_all_steps": 0.15833333333333333,
+        "stale_post_switch_exposure_steps": 3,
+        "stale_post_switch_exposure_fraction": 0.025,
+        "used_reference_slots": 189,
+        "contaminated_reference_slots": 59,
+        "contaminated_reference_slot_fraction": 0.31216931216931215,
+        "original_metric_means": {
+          "image_auroc": 0.8540606060606061,
+          "image_f1": 0.8724881256850566,
+          "image_ap": 0.9344408958034535,
+          "pixel_auroc": 0.9281132778682127,
+          "pixel_f1": 0.5435064786784615,
+          "pixel_ap": 0.553343091169152,
+          "aupro": 0.7982255373881829
+        },
+        "oracle_metric_means": {
+          "image_auroc": 0.8516363636363637,
+          "image_f1": 0.8734442944969261,
+          "image_ap": 0.9337634500470218,
+          "pixel_auroc": 0.9230154711219738,
+          "pixel_f1": 0.518633594592961,
+          "pixel_ap": 0.5341096776169026,
+          "aupro": 0.7842234050029083
+        },
+        "oracle_minus_original_means": {
+          "image_auroc": -0.002424242424242329,
+          "image_f1": 0.0009561688118695141,
+          "image_ap": -0.0006774457564315828,
+          "pixel_auroc": -0.005097806746238979,
+          "pixel_f1": -0.02487288408550044,
+          "pixel_ap": -0.01923341355224939,
+          "aupro": -0.014002132385274776
+        }
+      },
+      "cable->bottle|dynamic_dino_quarantine": {
+        "run_count": 3,
+        "formal_admission_count": 4,
+        "contaminated_formal_admission_count": 0,
+        "contaminated_exposure_steps": 0,
+        "contaminated_exposure_fraction_of_all_steps": 0.0,
+        "stale_post_switch_exposure_steps": 0,
+        "stale_post_switch_exposure_fraction": 0.0,
+        "used_reference_slots": 102,
+        "contaminated_reference_slots": 0,
+        "contaminated_reference_slot_fraction": 0.0,
+        "original_metric_means": {
+          "image_auroc": 0.8482424242424242,
+          "image_f1": 0.8727330779054917,
+          "image_ap": 0.9323343437468731,
+          "pixel_auroc": 0.9205546098618179,
+          "pixel_f1": 0.5146172894519628,
+          "pixel_ap": 0.5324064101745609,
+          "aupro": 0.7692739387360166
+        },
+        "oracle_metric_means": {
+          "image_auroc": 0.8482424242424242,
+          "image_f1": 0.8727330779054917,
+          "image_ap": 0.9323343437468731,
+          "pixel_auroc": 0.9205546098618179,
+          "pixel_f1": 0.5146172894519628,
+          "pixel_ap": 0.5324064101745609,
+          "aupro": 0.7692739387360166
+        },
+        "oracle_minus_original_means": {
+          "image_auroc": 0.0,
+          "image_f1": 0.0,
+          "image_ap": 0.0,
+          "pixel_auroc": 0.0,
+          "pixel_f1": 0.0,
+          "pixel_ap": 0.0,
+          "aupro": 0.0
+        }
+      }
+    }
+  },
+  "runs": [
+    {
+      "sequence": "bottle->cable",
+      "seed": 0,
+      "variant": "dynamic_dino_quarantine",
+      "boundary": 40,
+      "step_count": 80,
+      "formal_admission_count": 3,
+      "contaminated_formal_admission_count": 0,
+      "formal_admissions": [
+        {
+          "expert_id": 0,
+          "image_id": 6,
+          "admission_step": 7,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        },
+        {
+          "expert_id": 1,
+          "image_id": 29,
+          "admission_step": 29,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        },
+        {
+          "expert_id": 2,
+          "image_id": 48,
+          "admission_step": 48,
+          "category": "cable",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        }
+      ],
+      "used_reference_steps": 46,
+      "contaminated_exposure_steps": 0,
+      "contaminated_exposure_fraction_of_all_steps": 0.0,
+      "stale_post_switch_exposure_steps": 9,
+      "stale_post_switch_exposure_fraction": 0.225,
+      "used_reference_slots": 65,
+      "contaminated_reference_slots": 0,
+      "contaminated_reference_slot_fraction": 0.0,
+      "stale_post_switch_reference_slots": 18,
+      "replay_metric_errors": {
+        "image_auroc": 0.0,
+        "pixel_auroc": 2.1885138146160443e-10,
+        "aupro": 1.958667398271885e-07,
+        "raw_image_auroc": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.7687272727272727,
+        "image_f1": 0.8596491228070176,
+        "image_ap": 0.836778826825927,
+        "pixel_auroc": 0.8464720388163244,
+        "pixel_f1": 0.29878484888781864,
+        "pixel_ap": 0.14593535407003994,
+        "aupro": 0.6016487130502232
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.7687272727272727,
+        "image_f1": 0.8596491228070176,
+        "image_ap": 0.836778826825927,
+        "pixel_auroc": 0.8464720388163244,
+        "pixel_f1": 0.29878484888781864,
+        "pixel_ap": 0.14593535407003994,
+        "aupro": 0.6016487130502232
+      },
+      "oracle_minus_original": {
+        "image_auroc": 0.0,
+        "image_f1": 0.0,
+        "image_ap": 0.0,
+        "pixel_auroc": 0.0,
+        "pixel_f1": 0.0,
+        "pixel_ap": 0.0,
+        "aupro": 0.0
+      },
+      "score_phases": {
+        "pre_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 10,
+          "normal_original_score_mean": 0.8668267965316773,
+          "normal_oracle_score_mean": 0.8668267965316773,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 30,
+          "anomaly_original_score_mean": 1.0686036785443624,
+          "anomaly_oracle_score_mean": 1.0686036785443624,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "contaminated_exposure": {
+          "step_count": 0,
+          "normal_count": 0,
+          "normal_original_score_mean": null,
+          "normal_oracle_score_mean": null,
+          "normal_oracle_delta_mean": null,
+          "anomaly_count": 0,
+          "anomaly_original_score_mean": null,
+          "anomaly_oracle_score_mean": null,
+          "anomaly_oracle_delta_mean": null
+        },
+        "post_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 15,
+          "normal_original_score_mean": 1.004382602373759,
+          "normal_oracle_score_mean": 1.004382602373759,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 25,
+          "anomaly_original_score_mean": 1.0456765031814574,
+          "anomaly_oracle_score_mean": 1.0456765031814574,
+          "anomaly_oracle_delta_mean": 0.0
+        }
+      },
+      "source_audit": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\bottle_to_cable\\seed_0\\dynamic_dino_quarantine\\mvtec_ad\\dinov2_vitl14\\imagesize518\\bottle_to_cable_dynamic_audit_seed0_part0.json"
+    },
+    {
+      "sequence": "bottle->cable",
+      "seed": 0,
+      "variant": "dynamic_dino_channel_gate_no_fallback",
+      "boundary": 40,
+      "step_count": 80,
+      "formal_admission_count": 3,
+      "contaminated_formal_admission_count": 0,
+      "formal_admissions": [
+        {
+          "expert_id": 0,
+          "image_id": 6,
+          "admission_step": 7,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        },
+        {
+          "expert_id": 1,
+          "image_id": 29,
+          "admission_step": 29,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        },
+        {
+          "expert_id": 2,
+          "image_id": 48,
+          "admission_step": 48,
+          "category": "cable",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        }
+      ],
+      "used_reference_steps": 46,
+      "contaminated_exposure_steps": 6,
+      "contaminated_exposure_fraction_of_all_steps": 0.075,
+      "stale_post_switch_exposure_steps": 9,
+      "stale_post_switch_exposure_fraction": 0.225,
+      "used_reference_slots": 82,
+      "contaminated_reference_slots": 9,
+      "contaminated_reference_slot_fraction": 0.10975609756097561,
+      "stale_post_switch_reference_slots": 18,
+      "replay_metric_errors": {
+        "image_auroc": 0.0,
+        "pixel_auroc": 1.3590462089041466e-10,
+        "aupro": 2.956687128463642e-07,
+        "raw_image_auroc": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.818909090909091,
+        "image_f1": 0.8672566371681416,
+        "image_ap": 0.9091903230383668,
+        "pixel_auroc": 0.866746745158024,
+        "pixel_f1": 0.3072823728924487,
+        "pixel_ap": 0.24822413403892526,
+        "aupro": 0.6672681338057762
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.8094545454545455,
+        "image_f1": 0.8672566371681416,
+        "image_ap": 0.8888753856661151,
+        "pixel_auroc": 0.8623665735584034,
+        "pixel_f1": 0.304409700336193,
+        "pixel_ap": 0.20940932880232152,
+        "aupro": 0.6517707607506291
+      },
+      "oracle_minus_original": {
+        "image_auroc": -0.009454545454545493,
+        "image_f1": 0.0,
+        "image_ap": -0.02031493737225165,
+        "pixel_auroc": -0.004380171599620564,
+        "pixel_f1": -0.002872672556255673,
+        "pixel_ap": -0.038814805236603744,
+        "aupro": -0.01549737305514709
+      },
+      "score_phases": {
+        "pre_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 10,
+          "normal_original_score_mean": 0.8668267965316773,
+          "normal_oracle_score_mean": 0.8668267965316773,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 30,
+          "anomaly_original_score_mean": 1.0686036785443624,
+          "anomaly_oracle_score_mean": 1.0686036785443624,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "contaminated_exposure": {
+          "step_count": 6,
+          "normal_count": 3,
+          "normal_original_score_mean": 1.1148951053619385,
+          "normal_oracle_score_mean": 1.1721591552098591,
+          "normal_oracle_delta_mean": 0.05726404984792074,
+          "anomaly_count": 3,
+          "anomaly_original_score_mean": 1.1427908341089885,
+          "anomaly_oracle_score_mean": 1.149278163909912,
+          "anomaly_oracle_delta_mean": 0.006487329800923665
+        },
+        "post_switch_clean_or_fallback": {
+          "step_count": 34,
+          "normal_count": 12,
+          "normal_original_score_mean": 0.9310218691825867,
+          "normal_oracle_score_mean": 0.9310218691825867,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 22,
+          "anomaly_original_score_mean": 1.0101729414679788,
+          "anomaly_oracle_score_mean": 1.0101729414679788,
+          "anomaly_oracle_delta_mean": 0.0
+        }
+      },
+      "source_audit": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\bottle_to_cable\\seed_0\\dynamic_dino_channel_gate_no_fallback\\mvtec_ad\\dinov2_vitl14\\imagesize518\\bottle_to_cable_dynamic_audit_seed0_part0.json"
+    },
+    {
+      "sequence": "cable->bottle",
+      "seed": 0,
+      "variant": "dynamic_dino_quarantine",
+      "boundary": 40,
+      "step_count": 80,
+      "formal_admission_count": 2,
+      "contaminated_formal_admission_count": 0,
+      "formal_admissions": [
+        {
+          "expert_id": 0,
+          "image_id": 46,
+          "admission_step": 48,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        },
+        {
+          "expert_id": 1,
+          "image_id": 69,
+          "admission_step": 69,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        }
+      ],
+      "used_reference_steps": 31,
+      "contaminated_exposure_steps": 0,
+      "contaminated_exposure_fraction_of_all_steps": 0.0,
+      "stale_post_switch_exposure_steps": 0,
+      "stale_post_switch_exposure_fraction": 0.0,
+      "used_reference_slots": 41,
+      "contaminated_reference_slots": 0,
+      "contaminated_reference_slot_fraction": 0.0,
+      "stale_post_switch_reference_slots": 0,
+      "replay_metric_errors": {
+        "image_auroc": 0.0,
+        "pixel_auroc": 1.2460711351636178e-09,
+        "aupro": 3.1765785779569455e-07,
+        "raw_image_auroc": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.9054545454545455,
+        "image_f1": 0.888888888888889,
+        "image_ap": 0.9636192954399656,
+        "pixel_auroc": 0.9278286395286645,
+        "pixel_f1": 0.5153474102547466,
+        "pixel_ap": 0.535050150407697,
+        "aupro": 0.7819189389782978
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.9054545454545455,
+        "image_f1": 0.888888888888889,
+        "image_ap": 0.9636192954399656,
+        "pixel_auroc": 0.9278286395286645,
+        "pixel_f1": 0.5153474102547466,
+        "pixel_ap": 0.535050150407697,
+        "aupro": 0.7819189389782978
+      },
+      "oracle_minus_original": {
+        "image_auroc": 0.0,
+        "image_f1": 0.0,
+        "image_ap": 0.0,
+        "pixel_auroc": 0.0,
+        "pixel_f1": 0.0,
+        "pixel_ap": 0.0,
+        "aupro": 0.0
+      },
+      "score_phases": {
+        "pre_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 15,
+          "normal_original_score_mean": 0.8664146780967712,
+          "normal_oracle_score_mean": 0.8664146780967712,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 25,
+          "anomaly_original_score_mean": 0.9261257719993591,
+          "anomaly_oracle_score_mean": 0.9261257719993591,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "contaminated_exposure": {
+          "step_count": 0,
+          "normal_count": 0,
+          "normal_original_score_mean": null,
+          "normal_oracle_score_mean": null,
+          "normal_oracle_delta_mean": null,
+          "anomaly_count": 0,
+          "anomaly_original_score_mean": null,
+          "anomaly_oracle_score_mean": null,
+          "anomaly_oracle_delta_mean": null
+        },
+        "post_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 10,
+          "normal_original_score_mean": 0.879588508605957,
+          "normal_oracle_score_mean": 0.879588508605957,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 30,
+          "anomaly_original_score_mean": 1.1204914271831512,
+          "anomaly_oracle_score_mean": 1.1204914271831512,
+          "anomaly_oracle_delta_mean": 0.0
+        }
+      },
+      "source_audit": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\cable_to_bottle\\seed_0\\dynamic_dino_quarantine\\mvtec_ad\\dinov2_vitl14\\imagesize518\\cable_to_bottle_dynamic_audit_seed0_part0.json"
+    },
+    {
+      "sequence": "cable->bottle",
+      "seed": 0,
+      "variant": "dynamic_dino_channel_gate_no_fallback",
+      "boundary": 40,
+      "step_count": 80,
+      "formal_admission_count": 2,
+      "contaminated_formal_admission_count": 0,
+      "formal_admissions": [
+        {
+          "expert_id": 0,
+          "image_id": 46,
+          "admission_step": 48,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        },
+        {
+          "expert_id": 1,
+          "image_id": 69,
+          "admission_step": 69,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        }
+      ],
+      "used_reference_steps": 38,
+      "contaminated_exposure_steps": 7,
+      "contaminated_exposure_fraction_of_all_steps": 0.0875,
+      "stale_post_switch_exposure_steps": 0,
+      "stale_post_switch_exposure_fraction": 0.0,
+      "used_reference_slots": 57,
+      "contaminated_reference_slots": 14,
+      "contaminated_reference_slot_fraction": 0.24561403508771928,
+      "stale_post_switch_reference_slots": 0,
+      "replay_metric_errors": {
+        "image_auroc": 0.0,
+        "pixel_auroc": 1.2515665170909074e-09,
+        "aupro": 3.159162306198837e-07,
+        "raw_image_auroc": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.9083636363636364,
+        "image_f1": 0.8907563025210083,
+        "image_ap": 0.964603149197288,
+        "pixel_auroc": 0.9348627938543653,
+        "pixel_f1": 0.5418177801405744,
+        "pixel_ap": 0.5652299227330112,
+        "aupro": 0.8102962349975779
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.9054545454545455,
+        "image_f1": 0.888888888888889,
+        "image_ap": 0.9636192954399656,
+        "pixel_auroc": 0.9286957028456593,
+        "pixel_f1": 0.514058393767928,
+        "pixel_ap": 0.5363634555987995,
+        "aupro": 0.7902383169140779
+      },
+      "oracle_minus_original": {
+        "image_auroc": -0.002909090909090861,
+        "image_f1": -0.0018674136321193968,
+        "image_ap": -0.0009838537573223505,
+        "pixel_auroc": -0.006167091008706049,
+        "pixel_f1": -0.02775938637264641,
+        "pixel_ap": -0.028866467134211704,
+        "aupro": -0.020057918083499993
+      },
+      "score_phases": {
+        "pre_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 15,
+          "normal_original_score_mean": 0.8664146780967712,
+          "normal_oracle_score_mean": 0.8664146780967712,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 25,
+          "anomaly_original_score_mean": 0.9261257719993591,
+          "anomaly_oracle_score_mean": 0.9261257719993591,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "contaminated_exposure": {
+          "step_count": 7,
+          "normal_count": 1,
+          "normal_original_score_mean": 0.9021555781364441,
+          "normal_oracle_score_mean": 0.9520726203918457,
+          "normal_oracle_delta_mean": 0.04991704225540161,
+          "anomaly_count": 6,
+          "anomaly_original_score_mean": 1.0359778602917988,
+          "anomaly_oracle_score_mean": 1.0575110415617626,
+          "anomaly_oracle_delta_mean": 0.02153318126996358
+        },
+        "post_switch_clean_or_fallback": {
+          "step_count": 33,
+          "normal_count": 9,
+          "normal_original_score_mean": 0.8715347184075249,
+          "normal_oracle_score_mean": 0.8715347184075249,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 24,
+          "anomaly_original_score_mean": 1.137163574496905,
+          "anomaly_oracle_score_mean": 1.137163574496905,
+          "anomaly_oracle_delta_mean": 0.0
+        }
+      },
+      "source_audit": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\cable_to_bottle\\seed_0\\dynamic_dino_channel_gate_no_fallback\\mvtec_ad\\dinov2_vitl14\\imagesize518\\cable_to_bottle_dynamic_audit_seed0_part0.json"
+    },
+    {
+      "sequence": "bottle->cable",
+      "seed": 1,
+      "variant": "dynamic_dino_quarantine",
+      "boundary": 40,
+      "step_count": 80,
+      "formal_admission_count": 3,
+      "contaminated_formal_admission_count": 0,
+      "formal_admissions": [
+        {
+          "expert_id": 0,
+          "image_id": 9,
+          "admission_step": 9,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        },
+        {
+          "expert_id": 1,
+          "image_id": 11,
+          "admission_step": 11,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        },
+        {
+          "expert_id": 2,
+          "image_id": 47,
+          "admission_step": 49,
+          "category": "cable",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        }
+      ],
+      "used_reference_steps": 45,
+      "contaminated_exposure_steps": 0,
+      "contaminated_exposure_fraction_of_all_steps": 0.0,
+      "stale_post_switch_exposure_steps": 12,
+      "stale_post_switch_exposure_fraction": 0.3,
+      "used_reference_slots": 84,
+      "contaminated_reference_slots": 0,
+      "contaminated_reference_slot_fraction": 0.0,
+      "stale_post_switch_reference_slots": 21,
+      "replay_metric_errors": {
+        "image_auroc": 0.0,
+        "pixel_auroc": 9.240036513702421e-10,
+        "aupro": 1.0491744173446449e-07,
+        "raw_image_auroc": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.7963636363636363,
+        "image_f1": 0.8828828828828829,
+        "image_ap": 0.8692649893135793,
+        "pixel_auroc": 0.8462529530589277,
+        "pixel_f1": 0.2882453091822756,
+        "pixel_ap": 0.13074023664320614,
+        "aupro": 0.5662899480935955
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.7963636363636363,
+        "image_f1": 0.8828828828828829,
+        "image_ap": 0.8692649893135793,
+        "pixel_auroc": 0.8462529530589277,
+        "pixel_f1": 0.2882453091822756,
+        "pixel_ap": 0.13074023664320614,
+        "aupro": 0.5662899480935955
+      },
+      "oracle_minus_original": {
+        "image_auroc": 0.0,
+        "image_f1": 0.0,
+        "image_ap": 0.0,
+        "pixel_auroc": 0.0,
+        "pixel_f1": 0.0,
+        "pixel_ap": 0.0,
+        "aupro": 0.0
+      },
+      "score_phases": {
+        "pre_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 10,
+          "normal_original_score_mean": 0.8775927901268006,
+          "normal_oracle_score_mean": 0.8775927901268006,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 30,
+          "anomaly_original_score_mean": 1.0412820080916088,
+          "anomaly_oracle_score_mean": 1.0412820080916088,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "contaminated_exposure": {
+          "step_count": 0,
+          "normal_count": 0,
+          "normal_original_score_mean": null,
+          "normal_oracle_score_mean": null,
+          "normal_oracle_delta_mean": null,
+          "anomaly_count": 0,
+          "anomaly_original_score_mean": null,
+          "anomaly_oracle_score_mean": null,
+          "anomaly_oracle_delta_mean": null
+        },
+        "post_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 15,
+          "normal_original_score_mean": 0.9946941018104554,
+          "normal_oracle_score_mean": 0.9946941018104554,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 25,
+          "anomaly_original_score_mean": 1.064074764251709,
+          "anomaly_oracle_score_mean": 1.064074764251709,
+          "anomaly_oracle_delta_mean": 0.0
+        }
+      },
+      "source_audit": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\bottle_to_cable\\seed_1\\dynamic_dino_quarantine\\mvtec_ad\\dinov2_vitl14\\imagesize518\\bottle_to_cable_dynamic_audit_seed1_part0.json"
+    },
+    {
+      "sequence": "bottle->cable",
+      "seed": 1,
+      "variant": "dynamic_dino_channel_gate_no_fallback",
+      "boundary": 40,
+      "step_count": 80,
+      "formal_admission_count": 3,
+      "contaminated_formal_admission_count": 0,
+      "formal_admissions": [
+        {
+          "expert_id": 0,
+          "image_id": 9,
+          "admission_step": 9,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        },
+        {
+          "expert_id": 1,
+          "image_id": 11,
+          "admission_step": 11,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        },
+        {
+          "expert_id": 2,
+          "image_id": 47,
+          "admission_step": 49,
+          "category": "cable",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        }
+      ],
+      "used_reference_steps": 46,
+      "contaminated_exposure_steps": 18,
+      "contaminated_exposure_fraction_of_all_steps": 0.225,
+      "stale_post_switch_exposure_steps": 12,
+      "stale_post_switch_exposure_fraction": 0.3,
+      "used_reference_slots": 133,
+      "contaminated_reference_slots": 27,
+      "contaminated_reference_slot_fraction": 0.20300751879699247,
+      "stale_post_switch_reference_slots": 21,
+      "replay_metric_errors": {
+        "image_auroc": 0.0,
+        "pixel_auroc": 1.0884986245685013e-09,
+        "aupro": 4.6526330965690477e-07,
+        "raw_image_auroc": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.8487272727272727,
+        "image_f1": 0.8888888888888888,
+        "image_ap": 0.9250222803604017,
+        "pixel_auroc": 0.8667457703970304,
+        "pixel_f1": 0.29175087528310406,
+        "pixel_ap": 0.18036692103069976,
+        "aupro": 0.632392218278921
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.8363636363636363,
+        "image_f1": 0.8888888888888888,
+        "image_ap": 0.908677204181035,
+        "pixel_auroc": 0.8629896740894439,
+        "pixel_f1": 0.29084490865436,
+        "pixel_ap": 0.16039469913455473,
+        "aupro": 0.6208242503200494
+      },
+      "oracle_minus_original": {
+        "image_auroc": -0.012363636363636354,
+        "image_f1": 0.0,
+        "image_ap": -0.016345076179366647,
+        "pixel_auroc": -0.003756096307586443,
+        "pixel_f1": -0.0009059666287440371,
+        "pixel_ap": -0.01997222189614503,
+        "aupro": -0.011567967958871606
+      },
+      "score_phases": {
+        "pre_switch_clean_or_fallback": {
+          "step_count": 29,
+          "normal_count": 6,
+          "normal_original_score_mean": 0.9289416869481405,
+          "normal_oracle_score_mean": 0.9289416869481405,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 23,
+          "anomaly_original_score_mean": 1.024328941884248,
+          "anomaly_oracle_score_mean": 1.024328941884248,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "contaminated_exposure": {
+          "step_count": 18,
+          "normal_count": 8,
+          "normal_original_score_mean": 0.9567180946469307,
+          "normal_oracle_score_mean": 0.9712940901517868,
+          "normal_oracle_delta_mean": 0.01457599550485611,
+          "anomaly_count": 10,
+          "anomaly_original_score_mean": 1.0851767480373382,
+          "anomaly_oracle_score_mean": 1.1240911781787872,
+          "anomaly_oracle_delta_mean": 0.03891443014144898
+        },
+        "post_switch_clean_or_fallback": {
+          "step_count": 33,
+          "normal_count": 11,
+          "normal_original_score_mean": 0.9009826996109702,
+          "normal_oracle_score_mean": 0.9009826996109702,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 22,
+          "anomaly_original_score_mean": 1.034655207937414,
+          "anomaly_oracle_score_mean": 1.034655207937414,
+          "anomaly_oracle_delta_mean": 0.0
+        }
+      },
+      "source_audit": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\bottle_to_cable\\seed_1\\dynamic_dino_channel_gate_no_fallback\\mvtec_ad\\dinov2_vitl14\\imagesize518\\bottle_to_cable_dynamic_audit_seed1_part0.json"
+    },
+    {
+      "sequence": "cable->bottle",
+      "seed": 1,
+      "variant": "dynamic_dino_quarantine",
+      "boundary": 40,
+      "step_count": 80,
+      "formal_admission_count": 1,
+      "contaminated_formal_admission_count": 0,
+      "formal_admissions": [
+        {
+          "expert_id": 0,
+          "image_id": 47,
+          "admission_step": 48,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        }
+      ],
+      "used_reference_steps": 31,
+      "contaminated_exposure_steps": 0,
+      "contaminated_exposure_fraction_of_all_steps": 0.0,
+      "stale_post_switch_exposure_steps": 0,
+      "stale_post_switch_exposure_fraction": 0.0,
+      "used_reference_slots": 31,
+      "contaminated_reference_slots": 0,
+      "contaminated_reference_slot_fraction": 0.0,
+      "stale_post_switch_reference_slots": 0,
+      "replay_metric_errors": {
+        "image_auroc": 0.0,
+        "pixel_auroc": 3.0823439356453264e-09,
+        "aupro": 7.144961833294161e-08,
+        "raw_image_auroc": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.8181818181818181,
+        "image_f1": 0.8793103448275862,
+        "image_ap": 0.9119338362448004,
+        "pixel_auroc": 0.9228091366353866,
+        "pixel_f1": 0.5155037060210218,
+        "pixel_ap": 0.532209713638002,
+        "aupro": 0.7697645733517055
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.8181818181818181,
+        "image_f1": 0.8793103448275862,
+        "image_ap": 0.9119338362448004,
+        "pixel_auroc": 0.9228091366353866,
+        "pixel_f1": 0.5155037060210218,
+        "pixel_ap": 0.532209713638002,
+        "aupro": 0.7697645733517055
+      },
+      "oracle_minus_original": {
+        "image_auroc": 0.0,
+        "image_f1": 0.0,
+        "image_ap": 0.0,
+        "pixel_auroc": 0.0,
+        "pixel_f1": 0.0,
+        "pixel_ap": 0.0,
+        "aupro": 0.0
+      },
+      "score_phases": {
+        "pre_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 15,
+          "normal_original_score_mean": 0.8436824361483256,
+          "normal_oracle_score_mean": 0.8436824361483256,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 25,
+          "anomaly_original_score_mean": 0.9185354948043823,
+          "anomaly_oracle_score_mean": 0.9185354948043823,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "contaminated_exposure": {
+          "step_count": 0,
+          "normal_count": 0,
+          "normal_original_score_mean": null,
+          "normal_oracle_score_mean": null,
+          "normal_oracle_delta_mean": null,
+          "anomaly_count": 0,
+          "anomaly_original_score_mean": null,
+          "anomaly_oracle_score_mean": null,
+          "anomaly_oracle_delta_mean": null
+        },
+        "post_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 10,
+          "normal_original_score_mean": 0.9750855207443238,
+          "normal_oracle_score_mean": 0.9750855207443238,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 30,
+          "anomaly_original_score_mean": 1.127221550544103,
+          "anomaly_oracle_score_mean": 1.127221550544103,
+          "anomaly_oracle_delta_mean": 0.0
+        }
+      },
+      "source_audit": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\cable_to_bottle\\seed_1\\dynamic_dino_quarantine\\mvtec_ad\\dinov2_vitl14\\imagesize518\\cable_to_bottle_dynamic_audit_seed1_part0.json"
+    },
+    {
+      "sequence": "cable->bottle",
+      "seed": 1,
+      "variant": "dynamic_dino_channel_gate_no_fallback",
+      "boundary": 40,
+      "step_count": 80,
+      "formal_admission_count": 1,
+      "contaminated_formal_admission_count": 0,
+      "formal_admissions": [
+        {
+          "expert_id": 0,
+          "image_id": 47,
+          "admission_step": 48,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        }
+      ],
+      "used_reference_steps": 49,
+      "contaminated_exposure_steps": 16,
+      "contaminated_exposure_fraction_of_all_steps": 0.2,
+      "stale_post_switch_exposure_steps": 2,
+      "stale_post_switch_exposure_fraction": 0.05,
+      "used_reference_slots": 69,
+      "contaminated_reference_slots": 24,
+      "contaminated_reference_slot_fraction": 0.34782608695652173,
+      "stale_post_switch_reference_slots": 4,
+      "replay_metric_errors": {
+        "image_auroc": 0.0,
+        "pixel_auroc": 3.0837181697052074e-09,
+        "aupro": 8.99531286124855e-08,
+        "raw_image_auroc": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.8189090909090908,
+        "image_f1": 0.8695652173913043,
+        "image_ap": 0.9119664217243151,
+        "pixel_auroc": 0.9305869097944304,
+        "pixel_f1": 0.5444416037873734,
+        "pixel_ap": 0.5386355568503628,
+        "aupro": 0.7947214875719987
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.8152727272727274,
+        "image_f1": 0.8717948717948718,
+        "image_ap": 0.9107229889189272,
+        "pixel_auroc": 0.9257621024825299,
+        "pixel_f1": 0.5307168515818503,
+        "pixel_ap": 0.5323588868493996,
+        "aupro": 0.7864106377631854
+      },
+      "oracle_minus_original": {
+        "image_auroc": -0.0036363636363634377,
+        "image_f1": 0.0022296544035674826,
+        "image_ap": -0.0012434328053878563,
+        "pixel_auroc": -0.004824807311900492,
+        "pixel_f1": -0.01372475220552305,
+        "pixel_ap": -0.006276670000963214,
+        "aupro": -0.008310849808813248
+      },
+      "score_phases": {
+        "pre_switch_clean_or_fallback": {
+          "step_count": 32,
+          "normal_count": 11,
+          "normal_original_score_mean": 0.84908081184734,
+          "normal_oracle_score_mean": 0.84908081184734,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 21,
+          "anomaly_original_score_mean": 0.9102359527633304,
+          "anomaly_oracle_score_mean": 0.9102359527633304,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "contaminated_exposure": {
+          "step_count": 16,
+          "normal_count": 6,
+          "normal_original_score_mean": 0.9171243607997894,
+          "normal_oracle_score_mean": 0.9172312219937643,
+          "normal_oracle_delta_mean": 0.00010686119397481282,
+          "anomaly_count": 10,
+          "anomaly_original_score_mean": 1.026271265745163,
+          "anomaly_oracle_score_mean": 1.0398167729377747,
+          "anomaly_oracle_delta_mean": 0.013545507192611694
+        },
+        "post_switch_clean_or_fallback": {
+          "step_count": 32,
+          "normal_count": 8,
+          "normal_original_score_mean": 0.9571264311671257,
+          "normal_oracle_score_mean": 0.9571264311671257,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 24,
+          "anomaly_original_score_mean": 1.1411582653721173,
+          "anomaly_oracle_score_mean": 1.1411582653721173,
+          "anomaly_oracle_delta_mean": 0.0
+        }
+      },
+      "source_audit": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\cable_to_bottle\\seed_1\\dynamic_dino_channel_gate_no_fallback\\mvtec_ad\\dinov2_vitl14\\imagesize518\\cable_to_bottle_dynamic_audit_seed1_part0.json"
+    },
+    {
+      "sequence": "bottle->cable",
+      "seed": 2,
+      "variant": "dynamic_dino_quarantine",
+      "boundary": 40,
+      "step_count": 80,
+      "formal_admission_count": 2,
+      "contaminated_formal_admission_count": 0,
+      "formal_admissions": [
+        {
+          "expert_id": 0,
+          "image_id": 7,
+          "admission_step": 12,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        },
+        {
+          "expert_id": 1,
+          "image_id": 46,
+          "admission_step": 48,
+          "category": "cable",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        }
+      ],
+      "used_reference_steps": 67,
+      "contaminated_exposure_steps": 0,
+      "contaminated_exposure_fraction_of_all_steps": 0.0,
+      "stale_post_switch_exposure_steps": 10,
+      "stale_post_switch_exposure_fraction": 0.25,
+      "used_reference_slots": 68,
+      "contaminated_reference_slots": 0,
+      "contaminated_reference_slot_fraction": 0.0,
+      "stale_post_switch_reference_slots": 10,
+      "replay_metric_errors": {
+        "image_auroc": 0.0,
+        "pixel_auroc": 1.4076069199120411e-09,
+        "aupro": 1.5679913201172013e-07,
+        "raw_image_auroc": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.6552727272727272,
+        "image_f1": 0.8548387096774193,
+        "image_ap": 0.7527021131323145,
+        "pixel_auroc": 0.8353612911518106,
+        "pixel_f1": 0.2815615673268797,
+        "pixel_ap": 0.138282733065803,
+        "aupro": 0.6165538405261606
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.6552727272727272,
+        "image_f1": 0.8548387096774193,
+        "image_ap": 0.7527021131323145,
+        "pixel_auroc": 0.8353612911518106,
+        "pixel_f1": 0.2815615673268797,
+        "pixel_ap": 0.138282733065803,
+        "aupro": 0.6165538405261606
+      },
+      "oracle_minus_original": {
+        "image_auroc": 0.0,
+        "image_f1": 0.0,
+        "image_ap": 0.0,
+        "pixel_auroc": 0.0,
+        "pixel_f1": 0.0,
+        "pixel_ap": 0.0,
+        "aupro": 0.0
+      },
+      "score_phases": {
+        "pre_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 10,
+          "normal_original_score_mean": 0.8850183010101318,
+          "normal_oracle_score_mean": 0.8850183010101318,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 30,
+          "anomaly_original_score_mean": 1.0712064266204835,
+          "anomaly_oracle_score_mean": 1.0712064266204835,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "contaminated_exposure": {
+          "step_count": 0,
+          "normal_count": 0,
+          "normal_original_score_mean": null,
+          "normal_oracle_score_mean": null,
+          "normal_oracle_delta_mean": null,
+          "anomaly_count": 0,
+          "anomaly_original_score_mean": null,
+          "anomaly_oracle_score_mean": null,
+          "anomaly_oracle_delta_mean": null
+        },
+        "post_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 15,
+          "normal_original_score_mean": 1.101954706509908,
+          "normal_oracle_score_mean": 1.101954706509908,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 25,
+          "anomaly_original_score_mean": 1.1278408241271973,
+          "anomaly_oracle_score_mean": 1.1278408241271973,
+          "anomaly_oracle_delta_mean": 0.0
+        }
+      },
+      "source_audit": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\bottle_to_cable\\seed_2\\dynamic_dino_quarantine\\mvtec_ad\\dinov2_vitl14\\imagesize518\\bottle_to_cable_dynamic_audit_seed2_part0.json"
+    },
+    {
+      "sequence": "bottle->cable",
+      "seed": 2,
+      "variant": "dynamic_dino_channel_gate_no_fallback",
+      "boundary": 40,
+      "step_count": 80,
+      "formal_admission_count": 2,
+      "contaminated_formal_admission_count": 0,
+      "formal_admissions": [
+        {
+          "expert_id": 0,
+          "image_id": 7,
+          "admission_step": 12,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        },
+        {
+          "expert_id": 1,
+          "image_id": 44,
+          "admission_step": 48,
+          "category": "cable",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        }
+      ],
+      "used_reference_steps": 41,
+      "contaminated_exposure_steps": 5,
+      "contaminated_exposure_fraction_of_all_steps": 0.0625,
+      "stale_post_switch_exposure_steps": 10,
+      "stale_post_switch_exposure_fraction": 0.25,
+      "used_reference_slots": 58,
+      "contaminated_reference_slots": 5,
+      "contaminated_reference_slot_fraction": 0.08620689655172414,
+      "stale_post_switch_reference_slots": 10,
+      "replay_metric_errors": {
+        "image_auroc": 0.0,
+        "pixel_auroc": 1.7486213588213673e-09,
+        "aupro": 1.1909273200938486e-07,
+        "raw_image_auroc": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.8189090909090909,
+        "image_f1": 0.8521739130434782,
+        "image_ap": 0.9163353297271261,
+        "pixel_auroc": 0.8516647328439472,
+        "pixel_f1": 0.28623256726250124,
+        "pixel_ap": 0.2112827093578218,
+        "aupro": 0.6636468166097211
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.8014545454545454,
+        "image_f1": 0.8500000000000001,
+        "image_ap": 0.8806525989864309,
+        "pixel_auroc": 0.8486114021951456,
+        "pixel_f1": 0.2853582630895635,
+        "pixel_ap": 0.1839851767992723,
+        "aupro": 0.6538710290274017
+      },
+      "oracle_minus_original": {
+        "image_auroc": -0.0174545454545455,
+        "image_f1": -0.0021739130434781373,
+        "image_ap": -0.03568273074069517,
+        "pixel_auroc": -0.0030533306488015333,
+        "pixel_f1": -0.0008743041729377121,
+        "pixel_ap": -0.027297532558549525,
+        "aupro": -0.00977578758231945
+      },
+      "score_phases": {
+        "pre_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 10,
+          "normal_original_score_mean": 0.8850183010101318,
+          "normal_oracle_score_mean": 0.8850183010101318,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 30,
+          "anomaly_original_score_mean": 1.0712064266204835,
+          "anomaly_oracle_score_mean": 1.0712064266204835,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "contaminated_exposure": {
+          "step_count": 5,
+          "normal_count": 5,
+          "normal_original_score_mean": 1.1065884113311768,
+          "normal_oracle_score_mean": 1.137700653076172,
+          "normal_oracle_delta_mean": 0.031112241744995116,
+          "anomaly_count": 0,
+          "anomaly_original_score_mean": null,
+          "anomaly_oracle_score_mean": null,
+          "anomaly_oracle_delta_mean": null
+        },
+        "post_switch_clean_or_fallback": {
+          "step_count": 35,
+          "normal_count": 10,
+          "normal_original_score_mean": 0.8902818143367768,
+          "normal_oracle_score_mean": 0.8902818143367768,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 25,
+          "anomaly_original_score_mean": 1.0349896502494813,
+          "anomaly_oracle_score_mean": 1.0349896502494813,
+          "anomaly_oracle_delta_mean": 0.0
+        }
+      },
+      "source_audit": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\bottle_to_cable\\seed_2\\dynamic_dino_channel_gate_no_fallback\\mvtec_ad\\dinov2_vitl14\\imagesize518\\bottle_to_cable_dynamic_audit_seed2_part0.json"
+    },
+    {
+      "sequence": "cable->bottle",
+      "seed": 2,
+      "variant": "dynamic_dino_quarantine",
+      "boundary": 40,
+      "step_count": 80,
+      "formal_admission_count": 1,
+      "contaminated_formal_admission_count": 0,
+      "formal_admissions": [
+        {
+          "expert_id": 0,
+          "image_id": 47,
+          "admission_step": 49,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        }
+      ],
+      "used_reference_steps": 30,
+      "contaminated_exposure_steps": 0,
+      "contaminated_exposure_fraction_of_all_steps": 0.0,
+      "stale_post_switch_exposure_steps": 0,
+      "stale_post_switch_exposure_fraction": 0.0,
+      "used_reference_slots": 30,
+      "contaminated_reference_slots": 0,
+      "contaminated_reference_slot_fraction": 0.0,
+      "stale_post_switch_reference_slots": 0,
+      "replay_metric_errors": {
+        "image_auroc": 0.0,
+        "pixel_auroc": 4.4280390465445407e-10,
+        "aupro": 3.840388163034447e-08,
+        "raw_image_auroc": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.821090909090909,
+        "image_f1": 0.8500000000000001,
+        "image_ap": 0.9214498995558531,
+        "pixel_auroc": 0.9110260534214024,
+        "pixel_f1": 0.5130007520801204,
+        "pixel_ap": 0.5299593664779837,
+        "aupro": 0.7561383038780464
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.821090909090909,
+        "image_f1": 0.8500000000000001,
+        "image_ap": 0.9214498995558531,
+        "pixel_auroc": 0.9110260534214024,
+        "pixel_f1": 0.5130007520801204,
+        "pixel_ap": 0.5299593664779837,
+        "aupro": 0.7561383038780464
+      },
+      "oracle_minus_original": {
+        "image_auroc": 0.0,
+        "image_f1": 0.0,
+        "image_ap": 0.0,
+        "pixel_auroc": 0.0,
+        "pixel_f1": 0.0,
+        "pixel_ap": 0.0,
+        "aupro": 0.0
+      },
+      "score_phases": {
+        "pre_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 15,
+          "normal_original_score_mean": 0.8554425915082295,
+          "normal_oracle_score_mean": 0.8554425915082295,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 25,
+          "anomaly_original_score_mean": 0.902965202331543,
+          "anomaly_oracle_score_mean": 0.902965202331543,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "contaminated_exposure": {
+          "step_count": 0,
+          "normal_count": 0,
+          "normal_original_score_mean": null,
+          "normal_oracle_score_mean": null,
+          "normal_oracle_delta_mean": null,
+          "anomaly_count": 0,
+          "anomaly_original_score_mean": null,
+          "anomaly_oracle_score_mean": null,
+          "anomaly_oracle_delta_mean": null
+        },
+        "post_switch_clean_or_fallback": {
+          "step_count": 40,
+          "normal_count": 10,
+          "normal_original_score_mean": 0.9444123268127441,
+          "normal_oracle_score_mean": 0.9444123268127441,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 30,
+          "anomaly_original_score_mean": 1.1321278949578604,
+          "anomaly_oracle_score_mean": 1.1321278949578604,
+          "anomaly_oracle_delta_mean": 0.0
+        }
+      },
+      "source_audit": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\cable_to_bottle\\seed_2\\dynamic_dino_quarantine\\mvtec_ad\\dinov2_vitl14\\imagesize518\\cable_to_bottle_dynamic_audit_seed2_part0.json"
+    },
+    {
+      "sequence": "cable->bottle",
+      "seed": 2,
+      "variant": "dynamic_dino_channel_gate_no_fallback",
+      "boundary": 40,
+      "step_count": 80,
+      "formal_admission_count": 1,
+      "contaminated_formal_admission_count": 0,
+      "formal_admissions": [
+        {
+          "expert_id": 0,
+          "image_id": 47,
+          "admission_step": 49,
+          "category": "bottle",
+          "anomaly_type": "good",
+          "is_anomaly": false
+        }
+      ],
+      "used_reference_steps": 45,
+      "contaminated_exposure_steps": 15,
+      "contaminated_exposure_fraction_of_all_steps": 0.1875,
+      "stale_post_switch_exposure_steps": 1,
+      "stale_post_switch_exposure_fraction": 0.025,
+      "used_reference_slots": 63,
+      "contaminated_reference_slots": 21,
+      "contaminated_reference_slot_fraction": 0.3333333333333333,
+      "stale_post_switch_reference_slots": 4,
+      "replay_metric_errors": {
+        "image_auroc": 0.0,
+        "pixel_auroc": 5.242982714648292e-10,
+        "aupro": 5.2585497400947645e-08,
+        "raw_image_auroc": 0.0
+      },
+      "original_metrics": {
+        "image_auroc": 0.8349090909090908,
+        "image_f1": 0.8571428571428571,
+        "image_ap": 0.9267531164887572,
+        "pixel_auroc": 0.9188901299558427,
+        "pixel_f1": 0.5442600521074364,
+        "pixel_ap": 0.5561637939240821,
+        "aupro": 0.7896588895949725
+      },
+      "oracle_metrics": {
+        "image_auroc": 0.8341818181818181,
+        "image_f1": 0.8596491228070176,
+        "image_ap": 0.9269480657821727,
+        "pixel_auroc": 0.9145886080377323,
+        "pixel_f1": 0.5111255384291046,
+        "pixel_ap": 0.5336066904025089,
+        "aupro": 0.7760212603314615
+      },
+      "oracle_minus_original": {
+        "image_auroc": -0.0007272727272726875,
+        "image_f1": 0.0025062656641604564,
+        "image_ap": 0.0001949492934154584,
+        "pixel_auroc": -0.004301521918110396,
+        "pixel_f1": -0.03313451367833187,
+        "pixel_ap": -0.022557103521573252,
+        "aupro": -0.013637629263511086
+      },
+      "score_phases": {
+        "pre_switch_clean_or_fallback": {
+          "step_count": 34,
+          "normal_count": 14,
+          "normal_original_score_mean": 0.8577322789600917,
+          "normal_oracle_score_mean": 0.8577322789600917,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 20,
+          "anomaly_original_score_mean": 0.8977025479078293,
+          "anomaly_oracle_score_mean": 0.8977025479078293,
+          "anomaly_oracle_delta_mean": 0.0
+        },
+        "contaminated_exposure": {
+          "step_count": 15,
+          "normal_count": 3,
+          "normal_original_score_mean": 0.9023476441701254,
+          "normal_oracle_score_mean": 0.901274045308431,
+          "normal_oracle_delta_mean": -0.001073598861694336,
+          "anomaly_count": 12,
+          "anomaly_original_score_mean": 0.9974776109059652,
+          "anomaly_oracle_score_mean": 1.0045894136031468,
+          "anomaly_oracle_delta_mean": 0.007111802697181702
+        },
+        "post_switch_clean_or_fallback": {
+          "step_count": 31,
+          "normal_count": 8,
+          "normal_original_score_mean": 0.938555970788002,
+          "normal_oracle_score_mean": 0.938555970788002,
+          "normal_oracle_delta_mean": 0.0,
+          "anomaly_count": 23,
+          "anomaly_original_score_mean": 1.1599132107651753,
+          "anomaly_oracle_score_mean": 1.1599132107651753,
+          "anomaly_oracle_delta_mean": 0.0
+        }
+      },
+      "source_audit": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\cable_to_bottle\\seed_2\\dynamic_dino_channel_gate_no_fallback\\mvtec_ad\\dinov2_vitl14\\imagesize518\\cable_to_bottle_dynamic_audit_seed2_part0.json"
+    }
+  ]
+}

@@ -664,6 +664,13 @@ class MuSc():
                                     'transition_fallback_window', 8
                                 )
                             ),
+                            transition_fallback_require_pre_pool_expert=bool(
+                                self.dynamic_fusion_cfg.get(
+                                    'transition_fallback_require_pre_pool_expert', False
+                                )
+                            ),
+                            transition_fallback_confirm_steps=int(self.dynamic_fusion_cfg.get(
+                                'transition_fallback_confirm_steps', 0)),
                             committee_retrain_cooldown=int(
                                 self.dynamic_fusion_cfg.get(
                                     'committee_retrain_cooldown', 5

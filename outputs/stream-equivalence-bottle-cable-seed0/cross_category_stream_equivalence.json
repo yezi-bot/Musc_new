@@ -1,0 +1,41 @@
+{
+  "protocol": {
+    "sequence": "bottle->cable",
+    "seed": 0,
+    "segment_samples": 40,
+    "rscin_enabled": false,
+    "order": "extract_one_image -> score_with_step_start_state -> update_state",
+    "float_tolerance": 1e-06
+  },
+  "results": [
+    {
+      "variant": "dynamic_dino_quarantine",
+      "audit_path": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\bottle_to_cable\\seed_0\\dynamic_dino_quarantine\\mvtec_ad\\dinov2_vitl14\\imagesize518\\bottle_to_cable_dynamic_audit_seed0_part0.json",
+      "step_count": 80,
+      "timeline_and_reference_difference_count": 0,
+      "first_differences": [],
+      "max_score_map_abs_error": 0.0,
+      "max_raw_image_score_abs_error": 0.0,
+      "online_raw_image_auroc": 0.7752727272727272,
+      "batch_replay_raw_image_auroc": 0.7752727272727272,
+      "source_summary_raw_image_auroc": 0.7752727272727272,
+      "source_summary_raw_image_auroc_abs_error": 0.0,
+      "equivalent": true
+    },
+    {
+      "variant": "dynamic_dino_channel_gate_no_fallback",
+      "audit_path": "C:\\Users\\PC\\Documents\\ChatGPT\\动态的无监督检测\\.worktrees\\dynamic-msm2-fuser\\outputs\\gate-vs-fallback-full40-seeds012\\bottle_to_cable\\seed_0\\dynamic_dino_channel_gate_no_fallback\\mvtec_ad\\dinov2_vitl14\\imagesize518\\bottle_to_cable_dynamic_audit_seed0_part0.json",
+      "step_count": 80,
+      "timeline_and_reference_difference_count": 0,
+      "first_differences": [],
+      "max_score_map_abs_error": 0.0,
+      "max_raw_image_score_abs_error": 0.0,
+      "online_raw_image_auroc": 0.8298181818181819,
+      "batch_replay_raw_image_auroc": 0.8298181818181819,
+      "source_summary_raw_image_auroc": 0.8298181818181819,
+      "source_summary_raw_image_auroc_abs_error": 0.0,
+      "equivalent": true
+    }
+  ],
+  "all_equivalent": true
+}

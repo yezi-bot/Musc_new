@@ -270,6 +270,7 @@ def build_dynamic_committee_timeline(
                     "novel_support_threshold"
                 ],
                 "novel_ms_threshold": event["novel_ms_threshold"],
+
                 "expert_channel_supports": expert_supports,
                 "admitted_expert_id": event["admitted_expert_id"],
                 "deleted_expert_ids": event["deleted_expert_ids"],
@@ -443,7 +444,12 @@ def score_dynamic_msm2_layer(
     committee_retrain_cooldown=5,
     position_radius=1,
     transition_fallback_window=8,
+    transition_fallback_require_pre_pool_expert=False,
+    transition_fallback_confirm_steps=0,
 ):
+
+    if transition_fallback_confirm_steps < 0:
+        raise ValueError("transition_fallback_confirm_steps must be non-negative")
     if dino_features.ndim != 3:
         raise ValueError("dino_features must have shape [image, patch, feature]")
     if len(timeline) != dino_features.shape[0]:
@@ -502,6 +508,9 @@ def score_dynamic_msm2_layer(
         provisional = record.get("provisional_expert_before")
         provisional_score_audit = None
         fallback_history_image_ids = []
+        fallback_has_pre_pool_expert = False
+        transition_fallback_triggered = False
+        fallback_novel_evidence_streak = 0
 
         if fusion_mode == "strict_history_dino":
             patch_score, fallback_reason = _strict_history_dino_fallback(
@@ -705,10 +714,35 @@ def score_dynamic_msm2_layer(
                 raise ValueError(
                     "provisional expert must be strictly historical"
                 )
-            if (
-                provisional.get("state") == "collecting_channel_gate"
+            provisional_start_step=provisional.get("start_step")
+            # 旧分布专家存在  
+            fallback_has_pre_pool_expert = (provisional_start_step is not None and any(
+                int(image_id) < provisional_start_step
+                for image_id in expert_image_ids
+            ))
+            # 连续新分布证据
+            fallback_novel_evidence_streak = int(
+                provisional.get("novel_evidence_streak", 0)
+            )
+
+            has_enough_novel_evidence = (
+                transition_fallback_confirm_steps <= 0
+                or fallback_novel_evidence_streak
+                >= transition_fallback_confirm_steps
+            )
+
+            should_use_transition_fallback = (
+                provisional.get("state")
+                == "collecting_channel_gate"
                 and transition_fallback_window > 0
-            ):
+                and (
+                    not transition_fallback_require_pre_pool_expert
+                    or fallback_has_pre_pool_expert
+                )
+                and has_enough_novel_evidence
+            )
+
+            if should_use_transition_fallback:
                 fallback_start = max(
                     history_start,
                     step - transition_fallback_window,
@@ -716,14 +750,21 @@ def score_dynamic_msm2_layer(
                 fallback_history_image_ids = list(
                     range(fallback_start, step)
                 )
+
                 patch_score, fallback_reason = (
                     _strict_history_dino_fallback(
                         current_dino,
                         dino_features[fallback_start:step],
                     )
                 )
-                fallback_reason = "category_transition_recent_history"
-                effective_mode = "recent_history_dino_fallback"
+
+                fallback_reason = (
+                    "category_transition_recent_history"
+                )
+                effective_mode = (
+                    "recent_history_dino_fallback"
+                )
+                transition_fallback_triggered = True
             elif provisional.get("state") in {
                 "collecting_irbank",
                 "confirmed_irbank",
@@ -859,6 +900,10 @@ def score_dynamic_msm2_layer(
             ),
             "fallback_reason": fallback_reason,
             "fallback_history_image_ids": fallback_history_image_ids,
+            "fallback_has_pre_pool_expert": (fallback_has_pre_pool_expert),
+            "fallback_novel_evidence_streak": (fallback_novel_evidence_streak),
+            "transition_fallback_triggered": (transition_fallback_triggered),
+            "transition_fallback_confirm_steps": (transition_fallback_confirm_steps),
             "training_image_count": (
                 len(cached_training["image_ids"])
                 if cached_training is not None
