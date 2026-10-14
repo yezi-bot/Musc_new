@@ -749,6 +749,7 @@ class MuSc():
                     self.output_dir,
                     f'{category_name}_dynamic_audit_seed{self.seed}_part{divide_iter}.json',
                 )
+                os.makedirs(os.path.dirname(audit_path), exist_ok=True)
                 with open(audit_path, 'w', encoding='utf-8') as handle:
                     json.dump(
                         {

@@ -410,6 +410,7 @@ def run_variant(base_config, args, sequence, seed, variant_name):
     variant = VARIANTS[variant_name]
     sequence_name = "_to_".join(sequence)
     run_output = Path(args.output_dir) / sequence_name / f"seed_{seed}" / variant_name
+    run_output.mkdir(parents=True, exist_ok=True)
     cfg = copy.deepcopy(base_config)
     cfg["datasets"]["dataset_name"] = "mvtec_ad"
     cfg["datasets"]["data_path"] = str(Path(args.data_root).resolve())
