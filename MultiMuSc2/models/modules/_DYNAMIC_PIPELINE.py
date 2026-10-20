@@ -693,6 +693,9 @@ def build_dynamic_committee_timeline(
                 ),
                 "admitted_expert_id": event["admitted_expert_id"],
                 "deleted_expert_ids": event["deleted_expert_ids"],
+                "expert_lifecycle_events": event[
+                    "expert_lifecycle_events"
+                ],
                 "active_experts_after": manager.active_experts_before_step(),
                 "active_expert_ids_after": event["active_expert_ids_after_step"],
                 "channel_count_after": len(memory.channels),

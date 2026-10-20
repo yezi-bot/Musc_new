@@ -159,6 +159,54 @@ VARIANTS = {
         "photometric_dynamic_min_low_risk_members": 3,
         "photometric_dynamic_max_low_risk_members": 6,
     },
+    "photometric_c_episode_exit": {
+        "dynamic": True,
+        "mode": "dino_only",
+        "candidate_mode": "legacy",
+        "novel_admission_mode": "channel_gate",
+        "transition_fallback_window": 0,
+        "transition_fallback_require_pre_pool_expert": True,
+        "transition_fallback_evidence_window": 0,
+        "transition_fallback_min_hits": 0,
+        "transition_fallback_latch": True,
+        "robust_shift_audit": False,
+        "cold_start_mode": "adaptive",
+        "cold_start_lab_enabled": True,
+        "photometric_candidate_enabled": True,
+        "photometric_relevant_history_enabled": False,
+        "photometric_gate_mode": "lab_confirmed",
+        "photometric_candidate_window_mode": "dynamic_low_risk",
+        "photometric_dynamic_min_low_risk_members": 3,
+        "photometric_dynamic_max_low_risk_members": 6,
+        "photometric_episode_enabled": True,
+        "photometric_exit_confirm_steps": 2,
+        "photometric_candidate_max_age": 12,
+        "minimum_active_experts": 0,
+    },
+    "photometric_c_episode_exit_min1": {
+        "dynamic": True,
+        "mode": "dino_only",
+        "candidate_mode": "legacy",
+        "novel_admission_mode": "channel_gate",
+        "transition_fallback_window": 0,
+        "transition_fallback_require_pre_pool_expert": True,
+        "transition_fallback_evidence_window": 0,
+        "transition_fallback_min_hits": 0,
+        "transition_fallback_latch": True,
+        "robust_shift_audit": False,
+        "cold_start_mode": "adaptive",
+        "cold_start_lab_enabled": True,
+        "photometric_candidate_enabled": True,
+        "photometric_relevant_history_enabled": False,
+        "photometric_gate_mode": "lab_confirmed",
+        "photometric_candidate_window_mode": "dynamic_low_risk",
+        "photometric_dynamic_min_low_risk_members": 3,
+        "photometric_dynamic_max_low_risk_members": 6,
+        "photometric_episode_enabled": True,
+        "photometric_exit_confirm_steps": 2,
+        "photometric_candidate_max_age": 12,
+        "minimum_active_experts": 1,
+    },
     "dynamic_dino_channel_gate_rolling_fallback": {
         "dynamic": True,
         "mode": "dino_only",
@@ -415,6 +463,15 @@ def configure_variant(
     committee["photometric_dynamic_max_low_risk_members"] = int(
         variant.get("photometric_dynamic_max_low_risk_members", 6)
     )
+    committee["photometric_episode_enabled"] = bool(
+        variant.get("photometric_episode_enabled", False)
+    )
+    committee["photometric_exit_confirm_steps"] = int(
+        variant.get("photometric_exit_confirm_steps", 2)
+    )
+    committee["photometric_candidate_max_age"] = int(
+        variant.get("photometric_candidate_max_age", 12)
+    )
     committee["photometric_local_lab_distance_threshold"] = 0.04
     committee["photometric_l_ewma_floor"] = args.photometric_l_ewma_floor
     committee["photometric_ab_ewma_floor"] = args.photometric_ab_ewma_floor
@@ -430,6 +487,9 @@ def configure_variant(
     committee["photometric_history_distance_threshold"] = 3.0
     committee["photometric_dino_similarity_floor"] = 0.9
     committee["photometric_budget_replacement"] = True
+    committee["minimum_active_experts"] = int(
+        variant.get("minimum_active_experts", 0)
+    )
     committee["drift_candidate_audit_enabled"] = bool(
         variant.get("drift_candidate_audit_enabled", False)
     )
@@ -1064,6 +1124,32 @@ def photometric_route_metrics(timeline):
         for record in timeline
         if (record.get("photometric_gate") or {}).get("triggered", False)
     ]
+    episode_start_steps = [
+        int(record["step"])
+        for record in timeline
+        if (record.get("photometric_gate") or {}).get(
+            "episode_started", False
+        )
+    ]
+    episode_end_steps = [
+        int(record["step"])
+        for record in timeline
+        if (record.get("photometric_gate") or {}).get(
+            "episode_ended", False
+        )
+    ]
+    abort_decisions = [
+        str(event.get("decision", ""))
+        for event in quarantine_events
+        if str(event.get("decision", "")).startswith(
+            "aborted_photometric"
+        )
+    ]
+    coverage_floor_retained_count = sum(
+        bool(event.get("coverage_floor_retained", False))
+        for record in timeline
+        for event in record.get("expert_lifecycle_events", [])
+    )
     confirmed_patch_counts = [
         int(event["confirmed_patch_count"])
         for event in quarantine_events
@@ -1086,8 +1172,21 @@ def photometric_route_metrics(timeline):
             str(event.get("decision", "")).startswith("rejected")
             for event in quarantine_events
         ),
+        "photometric_quarantine_abort_count": len(abort_decisions),
+        "photometric_recovery_abort_count": abort_decisions.count(
+            "aborted_photometric_recovered"
+        ),
+        "photometric_reference_missing_abort_count": abort_decisions.count(
+            "aborted_photometric_reference_missing"
+        ),
+        "photometric_timeout_abort_count": abort_decisions.count(
+            "aborted_photometric_timeout"
+        ),
         "photometric_admission_count": len(admission_steps),
         "photometric_gate_trigger_count": len(gate_trigger_steps),
+        "photometric_episode_start_count": len(episode_start_steps),
+        "photometric_episode_end_count": len(episode_end_steps),
+        "coverage_floor_retained_count": coverage_floor_retained_count,
         "photometric_first_gate_trigger_step": (
             gate_trigger_steps[0] if gate_trigger_steps else None
         ),
@@ -2155,6 +2254,20 @@ def run_variant(
         "photometric_dynamic_max_low_risk_members": cfg["models"][
             "dynamic_committee"
         ].get("photometric_dynamic_max_low_risk_members"),
+        "photometric_episode_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "photometric_episode_enabled", False
+            )
+        ),
+        "photometric_exit_confirm_steps": cfg["models"][
+            "dynamic_committee"
+        ].get("photometric_exit_confirm_steps"),
+        "photometric_candidate_max_age": cfg["models"][
+            "dynamic_committee"
+        ].get("photometric_candidate_max_age"),
+        "minimum_active_experts": cfg["models"][
+            "dynamic_committee"
+        ].get("minimum_active_experts"),
         "photometric_local_lab_distance_threshold": cfg["models"][
             "dynamic_committee"
         ].get("photometric_local_lab_distance_threshold"),

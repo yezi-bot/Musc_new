@@ -1361,6 +1361,111 @@ class DynamicExpertManagerTest(unittest.TestCase):
         )
         self.assertIsNone(manager.novel_quarantine)
 
+    def test_photometric_episode_triggers_once_and_aborts_after_recovery(self):
+        manager = DynamicExpertManager(
+            photometric_candidate_enabled=True,
+            photometric_gate_mode="lab_confirmed",
+            photometric_episode_enabled=True,
+            photometric_exit_confirm_steps=2,
+        )
+        manager.active_experts = [{"expert_id": 3}]
+        shifted = {
+            "expert_id": 3,
+            "lab_center": [40.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+            "l_ewma": 0.08,
+            "ab_ewma": 0.0,
+            "l_threshold": 0.02,
+            "ab_threshold": 0.02,
+            "drift_confirmed": True,
+        }
+        stable = {
+            **shifted,
+            "l_ewma": 0.0,
+            "drift_confirmed": False,
+        }
+
+        triggered, expert_id = manager._advance_photometric_gate(
+            shifted,
+            support_threshold=0.5,
+            expert_channel_supports={3: 0.9},
+            step=10,
+        )
+        self.assertTrue(triggered)
+        self.assertEqual(expert_id, 3)
+        self.assertTrue(manager.photometric_episode_pending)
+
+        manager.photometric_episode_pending = False
+        manager.novel_quarantine = [{"step": 10, "image_id": 10}]
+        manager.novel_quarantine_route = "photometric_drift"
+        triggered, _ = manager._advance_photometric_gate(
+            shifted,
+            support_threshold=0.5,
+            expert_channel_supports={3: 0.9},
+            step=11,
+        )
+        self.assertFalse(triggered)
+
+        manager._advance_photometric_gate(
+            stable,
+            support_threshold=0.5,
+            expert_channel_supports={3: 0.9},
+            step=12,
+        )
+        self.assertIsNone(manager.photometric_pool_abort_reason)
+        manager._advance_photometric_gate(
+            stable,
+            support_threshold=0.5,
+            expert_channel_supports={3: 0.9},
+            step=13,
+        )
+        self.assertEqual(
+            manager.photometric_pool_abort_reason,
+            "aborted_photometric_recovered",
+        )
+        manager._abort_photometric_quarantine(
+            13,
+            manager.photometric_pool_abort_reason,
+        )
+        self.assertIsNone(manager.novel_quarantine)
+        self.assertFalse(manager.photometric_episode_active)
+        self.assertEqual(
+            manager.last_novel_quarantine_event["decision"],
+            "aborted_photometric_recovered",
+        )
+
+    def test_minimum_active_expert_retains_last_coverage(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="adaptive",
+            cold_start_min_samples=4,
+            cold_start_max_samples=4,
+            cold_start_required_members=3,
+            base_ttl=1,
+            max_ttl=1,
+            minimum_active_experts=1,
+        )
+        features = patch_features(1.0, 0.0)
+        for step in range(4):
+            manager.advance(
+                step=step,
+                image_id=step,
+                dino_patch_features=features,
+                ms_score=None if step == 0 else 0.1,
+                channel_support=None if step == 0 else 1.0,
+                expert_channel_supports={},
+            )
+
+        deleted, events = manager._advance_lifecycle(
+            step=4,
+            support_threshold=0.5,
+            expert_channel_supports={0: 0.0},
+        )
+
+        self.assertEqual(deleted, [])
+        self.assertEqual(len(manager.active_experts), 1)
+        self.assertEqual(manager.active_experts[0]["ttl"], 1)
+        self.assertEqual(events[0]["decision"], "coverage_floor_retained")
+        self.assertTrue(events[0]["coverage_floor_retained"])
+
 
 if __name__ == "__main__":
     unittest.main()

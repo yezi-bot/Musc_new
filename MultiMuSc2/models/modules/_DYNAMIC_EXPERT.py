@@ -54,6 +54,9 @@ class DynamicExpertManager:
     photometric_fixed_low_risk_members=4,
     photometric_dynamic_min_low_risk_members=3,
     photometric_dynamic_max_low_risk_members=6,
+    photometric_episode_enabled=False,
+    photometric_exit_confirm_steps=2,
+    photometric_candidate_max_age=12,
     photometric_local_lab_distance_threshold=0.04,
     photometric_l_ewma_floor=0.04,
     photometric_ab_ewma_floor=0.01,
@@ -65,6 +68,7 @@ class DynamicExpertManager:
     photometric_history_distance_threshold=3.0,
     photometric_dino_similarity_floor=0.9,
     photometric_budget_replacement=True,
+    minimum_active_experts=0,
     drift_candidate_audit_enabled=False,
     drift_candidate_pool_size=4,
     drift_candidate_keep=3,
@@ -224,6 +228,14 @@ class DynamicExpertManager:
                 "photometric_dynamic_max_low_risk_members must be at least "
                 "photometric_dynamic_min_low_risk_members"
             )
+      if photometric_exit_confirm_steps < 1:
+            raise ValueError(
+                "photometric_exit_confirm_steps must be positive"
+            )
+      if photometric_candidate_max_age < 1:
+            raise ValueError(
+                "photometric_candidate_max_age must be positive"
+            )
       if photometric_local_lab_distance_threshold <= 0.0:
             raise ValueError(
                 "photometric_local_lab_distance_threshold must be positive"
@@ -254,6 +266,10 @@ class DynamicExpertManager:
       if not 0.0 <= photometric_dino_similarity_floor <= 1.0:
             raise ValueError(
                 "photometric_dino_similarity_floor must be within [0, 1]"
+            )
+      if not 0 <= minimum_active_experts <= committee_cap:
+            raise ValueError(
+                "minimum_active_experts must be between 0 and committee_cap"
             )
       if drift_candidate_pool_size < 2:
             raise ValueError("drift_candidate_pool_size must be at least 2")
@@ -328,6 +344,15 @@ class DynamicExpertManager:
       self.photometric_dynamic_max_low_risk_members = int(
             photometric_dynamic_max_low_risk_members
       )
+      self.photometric_episode_enabled = bool(
+            photometric_episode_enabled
+      )
+      self.photometric_exit_confirm_steps = int(
+            photometric_exit_confirm_steps
+      )
+      self.photometric_candidate_max_age = int(
+            photometric_candidate_max_age
+      )
       self.photometric_local_lab_distance_threshold = float(
             photometric_local_lab_distance_threshold
       )
@@ -357,6 +382,7 @@ class DynamicExpertManager:
       self.photometric_budget_replacement = bool(
             photometric_budget_replacement
       )
+      self.minimum_active_experts = int(minimum_active_experts)
       self.drift_candidate_audit_enabled = bool(
             drift_candidate_audit_enabled
         )
@@ -387,6 +413,13 @@ class DynamicExpertManager:
       self.photometric_trigger_expert_id = None
       self.photometric_trigger_lab_center = None
       self.last_photometric_gate = None
+      self.photometric_episode_active = False
+      self.photometric_episode_pending = False
+      self.photometric_episode_reference_expert_id = None
+      self.photometric_episode_lab_center = None
+      self.photometric_episode_start_step = None
+      self.photometric_recovery_streak = 0
+      self.photometric_pool_abort_reason = None
       self.last_budget_replacement = None
 
     def provisional_expert_before_step(self):
@@ -1019,12 +1052,71 @@ class DynamicExpertManager:
         lab_drift_profile,
         support_threshold,
         expert_channel_supports,
+        step=None,
     ):
         self.last_photometric_gate = None
-        if not self.photometric_candidate_enabled or lab_drift_profile is None:
+        self.photometric_pool_abort_reason = None
+        if not self.photometric_candidate_enabled:
             self.photometric_armed_expert_id = None
             self.photometric_support_streak = 0
             return False, None
+
+        pool_active = bool(
+            self.novel_quarantine is not None
+            and self.novel_quarantine_route == "photometric_drift"
+        )
+        if lab_drift_profile is None:
+            episode_ended = False
+            ended_reference_expert_id = None
+            ended_start_step = None
+            reference_active = any(
+                int(expert["expert_id"])
+                == self.photometric_episode_reference_expert_id
+                for expert in self.active_experts
+            )
+            if (
+                self.photometric_episode_enabled
+                and self.photometric_episode_active
+                and not reference_active
+            ):
+                ended_reference_expert_id = (
+                    self.photometric_episode_reference_expert_id
+                )
+                ended_start_step = self.photometric_episode_start_step
+                if pool_active:
+                    self.photometric_pool_abort_reason = (
+                        "aborted_photometric_reference_missing"
+                    )
+                self._reset_photometric_episode()
+                episode_ended = True
+            elif (
+                self.photometric_episode_enabled
+                and pool_active
+                and step is not None
+                and int(step) - int(self.novel_quarantine[0]["step"])
+                >= self.photometric_candidate_max_age
+            ):
+                self.photometric_pool_abort_reason = (
+                    "aborted_photometric_timeout"
+                )
+            self.last_photometric_gate = {
+                "expert_id": None,
+                "robust_shift": False,
+                "pool_active": pool_active,
+                "triggered": False,
+                "episode_enabled": self.photometric_episode_enabled,
+                "episode_active": self.photometric_episode_active,
+                "episode_pending": self.photometric_episode_pending,
+                "episode_started": False,
+                "episode_ended": episode_ended,
+                "ended_episode_reference_expert_id": (
+                    ended_reference_expert_id
+                ),
+                "ended_episode_start_step": ended_start_step,
+                "recovery_streak": int(self.photometric_recovery_streak),
+                "pool_abort_reason": self.photometric_pool_abort_reason,
+            }
+            return False, self.photometric_episode_reference_expert_id
 
         expert_id = int(lab_drift_profile["expert_id"])
         robust_l = float(lab_drift_profile["l_ewma"]) >= max(
@@ -1081,11 +1173,7 @@ class DynamicExpertManager:
                 else 0
             )
 
-        pool_active = bool(
-            self.novel_quarantine is not None
-            and self.novel_quarantine_route == "photometric_drift"
-        )
-        triggered = bool(
+        gate_hit = bool(
             robust_shift
             and not pool_active
             and (
@@ -1094,6 +1182,83 @@ class DynamicExpertManager:
                 >= self.photometric_support_confirm_steps
             )
         )
+        episode_started = False
+        episode_ended = False
+        ended_reference_expert_id = None
+        ended_start_step = None
+        recovery_streak_at_end = None
+        if self.photometric_episode_enabled:
+            if not self.photometric_episode_active and gate_hit:
+                self.photometric_episode_active = True
+                self.photometric_episode_pending = True
+                self.photometric_episode_reference_expert_id = expert_id
+                self.photometric_episode_lab_center = np.asarray(
+                    lab_drift_profile["lab_center"],
+                    dtype=np.float64,
+                ).copy()
+                self.photometric_episode_start_step = (
+                    int(step) if step is not None else None
+                )
+                self.photometric_recovery_streak = 0
+                episode_started = True
+            elif self.photometric_episode_active:
+                self.photometric_recovery_streak = (
+                    0
+                    if robust_shift
+                    else self.photometric_recovery_streak + 1
+                )
+
+                reference_active = any(
+                    int(expert["expert_id"])
+                    == self.photometric_episode_reference_expert_id
+                    for expert in self.active_experts
+                )
+                recovered = (
+                    self.photometric_recovery_streak
+                    >= self.photometric_exit_confirm_steps
+                )
+                if not reference_active:
+                    ended_reference_expert_id = (
+                        self.photometric_episode_reference_expert_id
+                    )
+                    ended_start_step = self.photometric_episode_start_step
+                    recovery_streak_at_end = int(
+                        self.photometric_recovery_streak
+                    )
+                    if pool_active:
+                        self.photometric_pool_abort_reason = (
+                            "aborted_photometric_reference_missing"
+                        )
+                    self._reset_photometric_episode()
+                    episode_ended = True
+                elif recovered:
+                    ended_reference_expert_id = (
+                        self.photometric_episode_reference_expert_id
+                    )
+                    ended_start_step = self.photometric_episode_start_step
+                    recovery_streak_at_end = int(
+                        self.photometric_recovery_streak
+                    )
+                    if pool_active:
+                        self.photometric_pool_abort_reason = (
+                            "aborted_photometric_recovered"
+                        )
+                    self._reset_photometric_episode()
+                    episode_ended = True
+
+            if (
+                pool_active
+                and self.photometric_pool_abort_reason is None
+                and step is not None
+                and int(step) - int(self.novel_quarantine[0]["step"])
+                >= self.photometric_candidate_max_age
+            ):
+                self.photometric_pool_abort_reason = (
+                    "aborted_photometric_timeout"
+                )
+            triggered = episode_started
+        else:
+            triggered = gate_hit
         self.last_photometric_gate = {
             "expert_id": expert_id,
             "robust_l": robust_l,
@@ -1118,8 +1283,56 @@ class DynamicExpertManager:
             "gate_mode": self.photometric_gate_mode,
             "pool_active": pool_active,
             "triggered": triggered,
+            "episode_enabled": self.photometric_episode_enabled,
+            "episode_active": self.photometric_episode_active,
+            "episode_pending": self.photometric_episode_pending,
+            "episode_started": episode_started,
+            "episode_ended": episode_ended,
+            "episode_reference_expert_id": (
+                self.photometric_episode_reference_expert_id
+            ),
+            "episode_start_step": self.photometric_episode_start_step,
+            "ended_episode_reference_expert_id": (
+                ended_reference_expert_id
+            ),
+            "ended_episode_start_step": ended_start_step,
+            "recovery_streak_at_end": recovery_streak_at_end,
+            "recovery_streak": int(self.photometric_recovery_streak),
+            "required_recovery_steps": self.photometric_exit_confirm_steps,
+            "pool_abort_reason": self.photometric_pool_abort_reason,
         }
-        return triggered, expert_id
+        return (
+            triggered,
+            self.photometric_episode_reference_expert_id
+            if self.photometric_episode_enabled
+            and self.photometric_episode_active
+            else expert_id,
+        )
+
+    def _reset_photometric_episode(self):
+        self.photometric_episode_active = False
+        self.photometric_episode_pending = False
+        self.photometric_episode_reference_expert_id = None
+        self.photometric_episode_lab_center = None
+        self.photometric_episode_start_step = None
+        self.photometric_recovery_streak = 0
+
+    def _abort_photometric_quarantine(self, step, reason):
+        pool = list(self.novel_quarantine or [])
+        self.novel_quarantine = None
+        self.novel_quarantine_route = None
+        self.photometric_trigger_expert_id = None
+        self.photometric_trigger_lab_center = None
+        self.last_novel_quarantine_event = {
+            "decision": reason,
+            "start_step": (
+                int(pool[0]["step"]) if pool else None
+            ),
+            "end_step": int(step),
+            "size": len(pool),
+            "route": "photometric_drift",
+            "image_ids": [int(member["image_id"]) for member in pool],
+        }
 
     def _photometric_trigger_center(self, trigger_expert_id):
         expert = next(
@@ -1608,6 +1821,7 @@ class DynamicExpertManager:
         deleted_expert_ids = []
         survivors = []
         lifecycle_events = []
+        lifecycle_records = []
 
         for expert in self.active_experts:
             expert_id = expert["expert_id"]
@@ -1663,21 +1877,74 @@ class DynamicExpertManager:
             signal_decision = event
             expert["last_event"] = event
             expert["last_channel_support"] = support
+            lifecycle_records.append(
+                {
+                    "expert": expert,
+                    "expert_id": expert_id,
+                    "support": support,
+                    "support_gap": support_gap,
+                    "ttl_before": ttl_before,
+                    "patience_before": patience_before,
+                    "last_supported_step_before": (
+                        last_supported_step_before
+                    ),
+                    "signal_decision": signal_decision,
+                    "tentative_delete": expert["ttl"] <= 0,
+                }
+            )
 
+        tentative_deletions = [
+            record
+            for record in lifecycle_records
+            if record["tentative_delete"]
+        ]
+        natural_survivor_count = (
+            len(lifecycle_records) - len(tentative_deletions)
+        )
+        protect_count = max(
+            0,
+            self.minimum_active_experts - natural_survivor_count,
+        )
+        protected_ids = {
+            int(record["expert_id"])
+            for record in sorted(
+                tentative_deletions,
+                key=lambda record: (
+                    record["support"] is not None,
+                    (
+                        float(record["support"])
+                        if record["support"] is not None
+                        else -1.0
+                    ),
+                    int(record["expert"]["last_supported_step"]),
+                    int(record["expert"]["support_count"]),
+                    int(record["expert"]["admission_step"]),
+                ),
+                reverse=True,
+            )[:protect_count]
+        }
+
+        for record in lifecycle_records:
+            expert = record["expert"]
+            expert_id = record["expert_id"]
             deleted_this_step = False
-            if expert["ttl"] <= 0:
+            coverage_floor_retained = bool(
+                record["tentative_delete"]
+                and int(expert_id) in protected_ids
+            )
+            if coverage_floor_retained:
+                expert["ttl"] = 1
+                expert["deletion_step"] = None
+                expert["last_event"] = "coverage_floor_retained"
+                survivors.append(expert)
+            elif record["tentative_delete"]:
                 expert["ttl"] = 0
                 expert["deletion_step"] = step
                 expert["last_event"] = "deleted"
                 deleted_this_step = True
 
-                cluster = self.clusters[
-                    expert["cluster_id"]
-                ]
-                if (
-                    cluster["active_expert_id"]
-                    == expert_id
-                ):
+                cluster = self.clusters[expert["cluster_id"]]
+                if cluster["active_expert_id"] == expert_id:
                     cluster["active_expert_id"] = None
 
                 self.retired_experts.append(expert)
@@ -1693,26 +1960,30 @@ class DynamicExpertManager:
                     "cluster_id": int(expert["cluster_id"]),
                     "admission_step": int(expert["admission_step"]),
                     "age": int(step - expert["admission_step"]),
-                    "channel_support": support,
+                    "channel_support": record["support"],
                     "support_threshold": support_threshold,
-                    "support_available": support is not None,
+                    "support_available": record["support"] is not None,
                     "threshold_available": support_threshold is not None,
-                    "support_gap": support_gap,
-                    "ttl_before": ttl_before,
+                    "support_gap": record["support_gap"],
+                    "ttl_before": record["ttl_before"],
                     "ttl_after": int(expert["ttl"]),
-                    "patience_before": patience_before,
+                    "patience_before": record["patience_before"],
                     "patience_after": int(expert["patience"]),
                     "last_supported_step_before": (
-                        last_supported_step_before
+                        record["last_supported_step_before"]
                     ),
                     "last_supported_step_after": int(
                         expert["last_supported_step"]
                     ),
-                    "signal_decision": signal_decision,
+                    "signal_decision": record["signal_decision"],
                     "decision": expert["last_event"],
-                    "refreshed": signal_decision == "ttl_refreshed",
+                    "refreshed": (
+                        record["signal_decision"] == "ttl_refreshed"
+                    ),
                     "deleted_this_step": deleted_this_step,
                     "alive_after": not deleted_this_step,
+                    "coverage_floor_retained": coverage_floor_retained,
+                    "minimum_active_experts": self.minimum_active_experts,
                     "admission_candidate_image_id": None,
                     "admission_candidate_ms_score": None,
                     "admission_ms_threshold": None,
@@ -2513,9 +2784,21 @@ class DynamicExpertManager:
             lab_drift_profile,
             support_threshold,
             current_expert_supports,
+            step=step,
         )
+        photometric_episode_pending = bool(
+            self.photometric_episode_enabled
+            and self.photometric_episode_active
+            and self.photometric_episode_pending
+        )
+        if photometric_episode_pending:
+            photometric_trigger_expert_id = (
+                self.photometric_episode_reference_expert_id
+            )
         photometric_trigger_lab_center = (
-            lab_drift_profile.get("lab_center")
+            self.photometric_episode_lab_center
+            if photometric_episode_pending
+            else lab_drift_profile.get("lab_center")
             if photometric_candidate and lab_drift_profile is not None
             else None
         )
@@ -2525,7 +2808,11 @@ class DynamicExpertManager:
         )
         candidate_route = (
             "photometric_drift"
-            if photometric_pool_active or photometric_candidate
+            if (
+                photometric_pool_active
+                or photometric_candidate
+                or photometric_episode_pending
+            )
             else "new_distribution"
             if novel_candidate
             else "legacy"
@@ -2547,6 +2834,19 @@ class DynamicExpertManager:
             candidate_route=(candidate_route or "history"),
             historical_ms_threshold=ms_threshold,
         )
+        if self.photometric_pool_abort_reason is not None:
+            self._abort_photometric_quarantine(
+                step,
+                self.photometric_pool_abort_reason,
+            )
+            self.photometric_prebuffer.append(current_member)
+            prebuffer_size = (
+                self.photometric_history_max
+                if self.photometric_relevant_history_enabled
+                else self.photometric_prebuffer_size
+            )
+            del self.photometric_prebuffer[:-prebuffer_size]
+            return True, None, None, "photometric_drift"
         photometric_seed_members = []
         if (
             candidate_route == "photometric_drift"
@@ -2600,6 +2900,12 @@ class DynamicExpertManager:
                 historical_ms_threshold=ms_threshold,
             )
         )
+        if (
+            self.photometric_episode_enabled
+            and self.novel_quarantine is not None
+            and self.novel_quarantine_route == "photometric_drift"
+        ):
+            self.photometric_episode_pending = False
         self.photometric_prebuffer.append(current_member)
         prebuffer_size = (
             self.photometric_history_max

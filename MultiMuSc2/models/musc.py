@@ -651,6 +651,21 @@ class MuSc():
                                     6,
                                 )
                             ),
+                            'photometric_episode_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_episode_enabled', False
+                                )
+                            ),
+                            'photometric_exit_confirm_steps': int(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_exit_confirm_steps', 2
+                                )
+                            ),
+                            'photometric_candidate_max_age': int(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_candidate_max_age', 12
+                                )
+                            ),
                             'photometric_local_lab_distance_threshold': float(
                                 self.dynamic_committee_cfg.get(
                                     'photometric_local_lab_distance_threshold',
@@ -707,6 +722,11 @@ class MuSc():
                             'photometric_budget_replacement': bool(
                                 self.dynamic_committee_cfg.get(
                                     'photometric_budget_replacement', True
+                                )
+                            ),
+                            'minimum_active_experts': int(
+                                self.dynamic_committee_cfg.get(
+                                    'minimum_active_experts', 0
                                 )
                             ),
                             'drift_candidate_audit_enabled': bool(
