@@ -63,6 +63,244 @@ def scoring_timeline(image_count=4):
 
 
 class DynamicPipelineTest(unittest.TestCase):
+    def test_photometric_drift_rejects_high_risk_pool_without_cross_category_route(
+        self,
+    ):
+        dino = synthetic_features(10)
+        dino[4:] = -dino[4:]
+        lab = torch.tensor(
+            [
+                [40.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [40.1, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [40.2, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [40.3, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [70.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [70.1, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [70.2, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [70.3, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [70.4, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [70.5, 2.0, 1.0, 3.0, 2.0, 4.0],
+            ],
+            dtype=torch.float64,
+        )
+        timeline = build_dynamic_committee_timeline(
+            dino,
+            device="cpu",
+            lab_features=lab,
+            manager_kwargs={
+                "cold_start_mode": "adaptive",
+                "cold_start_min_samples": 4,
+                "cold_start_max_samples": 6,
+                "cold_start_required_members": 3,
+                "cold_start_lab_enabled": True,
+                "candidate_mode": "legacy",
+                "photometric_candidate_enabled": True,
+                "photometric_quarantine_steps": 4,
+                "photometric_prebuffer_size": 2,
+                "lab_ewma_confirm_steps": 2,
+                "novel_admission_mode": "channel_gate",
+                "committee_cap": 3,
+            },
+        )
+
+        self.assertFalse(timeline[4]["lab_drift_profile"]["just_confirmed"])
+        self.assertTrue(timeline[5]["lab_drift_profile"]["just_confirmed"])
+        self.assertFalse(timeline[5]["photometric_gate"]["triggered"])
+        self.assertTrue(timeline[6]["photometric_gate"]["triggered"])
+        self.assertEqual(timeline[6]["candidate_route"], "photometric_drift")
+        self.assertEqual(timeline[6]["novel_quarantine"]["decision"], "opened")
+        self.assertEqual(timeline[6]["novel_quarantine"]["image_ids"], [5, 6])
+        self.assertEqual(timeline[7]["novel_quarantine"]["decision"], "collecting")
+        self.assertEqual(
+            timeline[8]["novel_quarantine"]["decision"],
+            "rejected_photometric_insufficient_low_risk",
+        )
+        self.assertEqual(timeline[8]["novel_quarantine"]["low_risk_count"], 1)
+        self.assertIsNone(timeline[8]["admission_route"])
+        self.assertTrue(
+            all(
+                record["candidate_route"] != "new_distribution"
+                for record in timeline
+            )
+        )
+        self.assertNotIn(
+            1,
+            [
+                expert["expert_id"]
+                for expert in timeline[8]["active_experts_before"]
+            ],
+        )
+        self.assertNotIn(
+            1,
+            [
+                expert["expert_id"]
+                for expert in timeline[9]["active_experts_before"]
+            ],
+        )
+
+    def test_stable_lab_does_not_open_photometric_route(self):
+        dino = synthetic_features(8)
+        lab = torch.tensor(
+            [[40.0, 2.0, 1.0, 3.0, 2.0, 4.0]] * 8,
+            dtype=torch.float64,
+        )
+        timeline = build_dynamic_committee_timeline(
+            dino,
+            device="cpu",
+            lab_features=lab,
+            manager_kwargs={
+                "cold_start_mode": "adaptive",
+                "cold_start_min_samples": 4,
+                "cold_start_max_samples": 6,
+                "cold_start_required_members": 3,
+                "cold_start_lab_enabled": True,
+                "photometric_candidate_enabled": True,
+                "novel_admission_mode": "channel_gate",
+                "committee_cap": 3,
+            },
+        )
+
+        self.assertTrue(
+            all(
+                record["candidate_route"] != "photometric_drift"
+                for record in timeline
+            )
+        )
+        self.assertTrue(
+            all(
+                record["admission_route"]
+                != "photometric_drift_channel_gate"
+                for record in timeline
+            )
+        )
+
+    def test_small_lab_false_confirmation_stays_below_photometric_floor(self):
+        dino = synthetic_features(10)
+        lab = torch.tensor(
+            [
+                [40.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [40.1, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [40.2, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [40.3, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [43.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [42.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [43.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [42.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [43.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [42.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+            ],
+            dtype=torch.float64,
+        )
+        timeline = build_dynamic_committee_timeline(
+            dino,
+            device="cpu",
+            lab_features=lab,
+            manager_kwargs={
+                "cold_start_mode": "adaptive",
+                "cold_start_min_samples": 4,
+                "cold_start_max_samples": 6,
+                "cold_start_required_members": 3,
+                "cold_start_lab_enabled": True,
+                "photometric_candidate_enabled": True,
+                "novel_admission_mode": "channel_gate",
+                "committee_cap": 3,
+            },
+        )
+
+        self.assertTrue(
+            any(
+                (record.get("lab_drift_profile") or {}).get(
+                    "just_confirmed", False
+                )
+                for record in timeline
+            )
+        )
+        self.assertTrue(
+            all(
+                not (record.get("photometric_gate") or {}).get(
+                    "triggered", False
+                )
+                for record in timeline
+            )
+        )
+        self.assertTrue(
+            all(
+                record.get("admission_route")
+                != "photometric_drift_channel_gate"
+                for record in timeline
+            )
+        )
+    def test_bootstrap_lab_state_is_used_only_after_admission(self):
+        dino = synthetic_features(5)
+        lab = torch.tensor(
+            [
+                [40.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [40.5, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [41.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [41.5, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [50.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+            ],
+            dtype=torch.float64,
+        )
+        timeline = build_dynamic_committee_timeline(
+            dino,
+            device="cpu",
+            lab_features=lab,
+            manager_kwargs={
+                "cold_start_mode": "adaptive",
+                "cold_start_min_samples": 4,
+                "cold_start_max_samples": 6,
+                "cold_start_required_members": 3,
+                "cold_start_lab_enabled": True,
+            },
+        )
+
+        self.assertEqual(timeline[3]["admitted_expert_id"], 0)
+        self.assertIsNone(timeline[3]["lab_drift_profile"])
+        self.assertEqual(timeline[4]["lab_drift_profile"]["expert_id"], 0)
+
+    def test_drift_candidate_audit_is_causal_and_read_only(self):
+        base = synthetic_features(1)[0]
+        dino = torch.stack([base for _ in range(9)])
+        lab = torch.tensor(
+            [
+                [40.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [40.1, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [40.2, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [40.3, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [70.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [70.1, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [70.2, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [70.3, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [70.4, 2.0, 1.0, 3.0, 2.0, 4.0],
+            ],
+            dtype=torch.float64,
+        )
+        timeline = build_dynamic_committee_timeline(
+            dino,
+            device="cpu",
+            lab_features=lab,
+            manager_kwargs={
+                "cold_start_mode": "adaptive",
+                "cold_start_min_samples": 4,
+                "cold_start_max_samples": 6,
+                "cold_start_required_members": 3,
+                "cold_start_lab_enabled": True,
+                "drift_candidate_audit_enabled": True,
+                "drift_candidate_pool_size": 4,
+                "drift_candidate_keep": 3,
+                "committee_cap": 1,
+            },
+        )
+
+        event = timeline[8]["drift_candidate_audit"]
+        self.assertEqual(event["decision"], "audited")
+        self.assertTrue(
+            all(image_id <= 8 for image_id in event["selected_image_ids"])
+        )
+        self.assertEqual(len(timeline[8]["active_experts_after"]), 1)
+        self.assertIsNone(timeline[8]["admitted_expert_id"])
+
     def test_positioned_memory_scores_leave_uncovered_patches_invalid(self):
         features = synthetic_features(2)
         scores, valid = _positioned_memory_scores(
@@ -161,6 +399,78 @@ class DynamicPipelineTest(unittest.TestCase):
         )
         self.assertEqual(audits[4]["fallback_history_image_ids"], [2, 3])
         self.assertNotIn("memory_patch_count", audits[4])
+
+    def test_channel_gate_rolling_evidence_triggers_and_latches(self):
+        dino = synthetic_features(7)
+        timeline = scoring_timeline(7)
+        timeline[1]["candidate_route"] = "new_distribution"
+        timeline[3]["candidate_route"] = "new_distribution"
+        provisional = {
+            "image_id": 3,
+            "image_ids": [3],
+            "representative_step": 3,
+            "start_step": 1,
+            "pool_size": 3,
+            "weight": 0.25,
+            "state": "collecting_channel_gate",
+        }
+        for step in (4, 5, 6):
+            timeline[step]["provisional_expert_before"] = provisional
+
+        _, audits = score_dynamic_msm2_layer(
+            dino,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+            transition_fallback_window=2,
+            transition_fallback_require_pre_pool_expert=True,
+            transition_fallback_evidence_window=4,
+            transition_fallback_min_hits=2,
+            transition_fallback_latch=True,
+        )
+
+        self.assertEqual(audits[4]["fallback_recent_evidence_steps"], [1, 3])
+        self.assertEqual(audits[4]["fallback_recent_evidence_hits"], 2)
+        self.assertTrue(audits[4]["transition_fallback_triggered"])
+        self.assertTrue(audits[4]["transition_fallback_latched"])
+        self.assertEqual(audits[6]["fallback_recent_evidence_steps"], [3])
+        self.assertEqual(audits[6]["fallback_recent_evidence_hits"], 1)
+        self.assertTrue(audits[6]["transition_fallback_triggered"])
+        self.assertTrue(audits[6]["transition_fallback_latched"])
+
+    def test_channel_gate_rolling_evidence_requires_old_expert(self):
+        dino = synthetic_features(5)
+        timeline = scoring_timeline(5)
+        timeline[1]["candidate_route"] = "new_distribution"
+        timeline[3]["candidate_route"] = "new_distribution"
+        timeline[4]["active_experts_before"] = [
+            {"expert_id": 0, "image_id": 2}
+        ]
+        timeline[4]["provisional_expert_before"] = {
+            "image_id": 3,
+            "image_ids": [3],
+            "representative_step": 3,
+            "start_step": 1,
+            "pool_size": 3,
+            "weight": 0.25,
+            "state": "collecting_channel_gate",
+        }
+
+        _, audits = score_dynamic_msm2_layer(
+            dino,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+            transition_fallback_window=2,
+            transition_fallback_require_pre_pool_expert=True,
+            transition_fallback_evidence_window=4,
+            transition_fallback_min_hits=2,
+            transition_fallback_latch=True,
+        )
+
+        self.assertEqual(audits[4]["fallback_recent_evidence_hits"], 2)
+        self.assertFalse(audits[4]["fallback_has_pre_pool_expert"])
+        self.assertFalse(audits[4]["transition_fallback_triggered"])
 
     def test_channel_gate_can_disable_recent_history_fallback(self):
         features = torch.tensor(

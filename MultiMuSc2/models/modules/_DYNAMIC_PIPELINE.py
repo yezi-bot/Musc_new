@@ -13,6 +13,12 @@ from ._MSM import (
     fit_causal_detect_fuser,
     interval_average,
 )
+from ._ROBUST_SHIFT import (
+    pairwise_window_sinkhorn_profile,
+    robust_sinkhorn_profile,
+    robust_window_sinkhorn_profile,
+    uniformly_sample_patch_ids,
+)
 
 
 def _patch_to_history_image_distances(
@@ -100,9 +106,278 @@ def _channel_support(memory, features, grid_size, distance_threshold):
     return support, distances
 
 
+def _positioned_expert_support(
+    current,
+    reference,
+    grid_size,
+    distance_threshold,
+    position_radius=1,
+):
+    if distance_threshold is None:
+        return None
+    if current.shape != reference.shape:
+        raise ValueError("current and reference expert features must match")
+    if isinstance(grid_size, int):
+        rows = cols = int(grid_size)
+    else:
+        rows, cols = (int(grid_size[0]), int(grid_size[1]))
+    if rows * cols != current.shape[0]:
+        raise ValueError("grid_size does not match the patch count")
+    patch_ids = torch.arange(current.shape[0], device=current.device)
+    patch_rows = torch.div(patch_ids, cols, rounding_mode="floor")
+    patch_cols = patch_ids % cols
+    valid_positions = (
+        (patch_rows[:, None] - patch_rows[None, :]).abs() <= position_radius
+    ) & (
+        (patch_cols[:, None] - patch_cols[None, :]).abs() <= position_radius
+    )
+    distances = torch.cdist(current, reference)
+    distances = distances.masked_fill(~valid_positions, float("inf"))
+    nearest = distances.amin(dim=1)
+    return float((nearest <= distance_threshold).float().mean())
+
+
+def _robust_shift_audit_profile(
+    current,
+    current_step,
+    active_experts,
+    committee_features,
+    grid_size,
+    max_patches,
+    epsilon,
+    iterations,
+):
+    if not active_experts:
+        return {
+            "nearest_expert_id": None,
+            "nearest_discrete_cost": None,
+            "expert_profiles": {},
+        }
+
+    patch_ids = uniformly_sample_patch_ids(
+        current.shape[0],
+        max_patches,
+        current.device,
+    )
+    target = current[patch_ids]
+    profiles = {}
+    for expert in active_experts:
+        reference_image_id = int(expert["image_id"])
+        if reference_image_id >= current_step:
+            raise ValueError("robust shift audit requires historical experts")
+        reference = committee_features[reference_image_id][patch_ids]
+        profiles[str(expert["expert_id"])] = robust_sinkhorn_profile(
+            target,
+            reference,
+            target_patch_ids=patch_ids,
+            reference_patch_ids=patch_ids,
+            grid_size=grid_size,
+            position_radius=None,
+            epsilon=epsilon,
+            iterations=iterations,
+        )
+
+    nearest_expert_id, nearest = min(
+        profiles.items(),
+        key=lambda item: item[1]["discrete_cost"],
+    )
+    return {
+        "nearest_expert_id": int(nearest_expert_id),
+        "nearest_discrete_cost": nearest["discrete_cost"],
+        "expert_profiles": profiles,
+    }
+
+
+def _robust_shift_window_audit_profile(
+    current_step,
+    selected_steps,
+    window_steps,
+    active_experts,
+    committee_features,
+    grid_size,
+    max_patches,
+    position_radius,
+    epsilon,
+    iterations,
+    fixed_reference_expert=None,
+):
+    selected_steps = [int(step) for step in selected_steps]
+    window_steps = [int(step) for step in window_steps]
+    if len(selected_steps) < 2:
+        return {
+            "state": "insufficient_window",
+            "window_steps": window_steps,
+            "selected_steps": selected_steps,
+            "dropped_steps": [
+                step for step in window_steps if step not in selected_steps
+            ],
+            "nearest_expert_id": None,
+            "nearest_discrete_cost": None,
+            "fixed_reference_expert_id": (
+                int(fixed_reference_expert["expert_id"])
+                if fixed_reference_expert is not None
+                else None
+            ),
+            "fixed_reference_image_id": (
+                int(fixed_reference_expert["image_id"])
+                if fixed_reference_expert is not None
+                else None
+            ),
+            "fixed_reference_discrete_cost": None,
+            "fixed_reference_profile": None,
+            "within_window_discrete_cost": None,
+            "within_window_discrete_cost_median": None,
+            "within_window_discrete_cost_max": None,
+            "within_window_sinkhorn_cost_median": None,
+            "within_window_sinkhorn_cost_max": None,
+            "within_window_mutual_fraction": None,
+            "within_window_mutual_fraction_mean": None,
+            "within_window_mutual_fraction_min": None,
+            "within_window_pair_count": 0,
+            "within_window_pair_profiles": {},
+            "expert_profiles": {},
+        }
+    if any(step > current_step for step in selected_steps):
+        raise ValueError("robust shift window cannot contain future steps")
+
+    patch_ids = uniformly_sample_patch_ids(
+        committee_features.shape[1],
+        max_patches,
+        committee_features.device,
+    )
+    target_window = committee_features[selected_steps]
+    within_profile = pairwise_window_sinkhorn_profile(
+        target_window,
+        patch_ids=patch_ids,
+        grid_size=grid_size,
+        position_radius=position_radius,
+        epsilon=epsilon,
+        iterations=iterations,
+    )
+    within_pair_profiles = {}
+    for pair_profile in within_profile["pair_profiles"]:
+        left_step = selected_steps[pair_profile["left_image_index"]]
+        right_step = selected_steps[pair_profile["right_image_index"]]
+        pair_key = f"{min(left_step, right_step)}:{max(left_step, right_step)}"
+        pair_values = {
+            key: value
+            for key, value in pair_profile.items()
+            if key not in {"left_image_index", "right_image_index"}
+        }
+        within_pair_profiles[pair_key] = {
+            "target_step": left_step,
+            "reference_step": right_step,
+            **pair_values,
+        }
+
+    profiles = {}
+    for expert in active_experts:
+        reference_image_id = int(expert["image_id"])
+        if reference_image_id >= current_step:
+            raise ValueError("robust shift audit requires historical experts")
+        profiles[str(expert["expert_id"])] = (
+            robust_window_sinkhorn_profile(
+                target_window,
+                committee_features[reference_image_id].unsqueeze(0),
+                patch_ids=patch_ids,
+                grid_size=grid_size,
+                position_radius=position_radius,
+                epsilon=epsilon,
+                iterations=iterations,
+            )
+        )
+
+    nearest_expert_id = None
+    nearest_discrete_cost = None
+    if profiles:
+        nearest_expert_id, nearest = min(
+            profiles.items(),
+            key=lambda item: item[1]["discrete_cost"],
+        )
+        nearest_expert_id = int(nearest_expert_id)
+        nearest_discrete_cost = nearest["discrete_cost"]
+
+    fixed_reference_expert_id = None
+    fixed_reference_image_id = None
+    fixed_reference_profile = None
+    if fixed_reference_expert is not None:
+        fixed_reference_expert_id = int(
+            fixed_reference_expert["expert_id"]
+        )
+        fixed_reference_image_id = int(
+            fixed_reference_expert["image_id"]
+        )
+        if fixed_reference_image_id >= current_step:
+            raise ValueError(
+                "fixed robust shift reference must be historical"
+            )
+        fixed_reference_profile = robust_window_sinkhorn_profile(
+            target_window,
+            committee_features[
+                fixed_reference_image_id
+            ].unsqueeze(0),
+            patch_ids=patch_ids,
+            grid_size=grid_size,
+            position_radius=position_radius,
+            epsilon=epsilon,
+            iterations=iterations,
+        )
+
+    return {
+        "state": (
+            "observed"
+            if profiles or fixed_reference_profile is not None
+            else "no_active_expert"
+        ),
+        "window_steps": window_steps,
+        "selected_steps": selected_steps,
+        "dropped_steps": [
+            step for step in window_steps if step not in selected_steps
+        ],
+        "nearest_expert_id": nearest_expert_id,
+        "nearest_discrete_cost": nearest_discrete_cost,
+        "fixed_reference_expert_id": fixed_reference_expert_id,
+        "fixed_reference_image_id": fixed_reference_image_id,
+        "fixed_reference_discrete_cost": (
+            fixed_reference_profile["discrete_cost"]
+            if fixed_reference_profile is not None
+            else None
+        ),
+        "fixed_reference_profile": fixed_reference_profile,
+        "within_window_discrete_cost": (
+            within_profile["discrete_cost_median"]
+        ),
+        "within_window_discrete_cost_median": (
+            within_profile["discrete_cost_median"]
+        ),
+        "within_window_discrete_cost_max": (
+            within_profile["discrete_cost_max"]
+        ),
+        "within_window_sinkhorn_cost_median": (
+            within_profile["sinkhorn_cost_median"]
+        ),
+        "within_window_sinkhorn_cost_max": (
+            within_profile["sinkhorn_cost_max"]
+        ),
+        "within_window_mutual_fraction": (
+            within_profile["mutual_fraction_mean"]
+        ),
+        "within_window_mutual_fraction_mean": (
+            within_profile["mutual_fraction_mean"]
+        ),
+        "within_window_mutual_fraction_min": (
+            within_profile["mutual_fraction_min"]
+        ),
+        "within_window_pair_count": within_profile["pair_count"],
+        "within_window_pair_profiles": within_pair_profiles,
+        "expert_profiles": profiles,
+    }
+
+
 def build_dynamic_committee_timeline(
     committee_features,
     device,
+    lab_features=None,
     position_radius=1,
     channel_distance_quantile=0.7,
     reliability_alpha=0.5,
@@ -111,15 +386,45 @@ def build_dynamic_committee_timeline(
     density_k=5,
     memory_reliability_threshold=0.5,
     ms_short_windows=(8, 16, 32),
+    robust_shift_audit=False,
+    robust_shift_max_patches=128,
+    robust_shift_epsilon=0.05,
+    robust_shift_iterations=20,
+    robust_shift_window_size=4,
+    robust_shift_window_keep=3,
+    robust_shift_position_radius=1,
     manager_kwargs=None,
     reset_steps=None,
 ):
     if committee_features.ndim != 3:
         raise ValueError("committee_features must have shape [image, patch, feature]")
+    if lab_features is not None:
+        if not isinstance(lab_features, torch.Tensor):
+            lab_features = torch.as_tensor(lab_features)
+        if lab_features.shape != (committee_features.shape[0], 6):
+            raise ValueError("lab_features must have shape [image, 6]")
+        if not torch.isfinite(lab_features).all():
+            raise ValueError("lab_features must be finite")
     if not 0.0 <= memory_reliability_threshold <= 1.0:
         raise ValueError(
             "memory_reliability_threshold must be within [0, 1]"
         )
+    if robust_shift_max_patches < 1:
+        raise ValueError("robust_shift_max_patches must be positive")
+    if robust_shift_epsilon <= 0.0:
+        raise ValueError("robust_shift_epsilon must be positive")
+    if robust_shift_iterations < 1:
+        raise ValueError("robust_shift_iterations must be positive")
+    if robust_shift_window_size < 1:
+        raise ValueError("robust_shift_window_size must be positive")
+    if not 2 <= robust_shift_window_keep <= robust_shift_window_size:
+        raise ValueError(
+            "robust_shift_window_keep must be between 2 and the window size"
+        )
+    if robust_shift_position_radius is not None and (
+        robust_shift_position_radius < 0
+    ):
+        raise ValueError("robust_shift_position_radius must be non-negative")
     ms_short_windows = tuple(int(window) for window in ms_short_windows)
     grid_size = math.isqrt(committee_features.shape[1])
     if grid_size * grid_size != committee_features.shape[1]:
@@ -149,6 +454,8 @@ def build_dynamic_committee_timeline(
     distance_history = []
     timeline = []
     segment_start = 0
+    robust_window_members = []
+    fixed_reference_expert = None
 
     for step in range(committee_features.shape[0]):
         state_reset_before = step in reset_steps
@@ -160,9 +467,17 @@ def build_dynamic_committee_timeline(
             manager.last_step = step - 1
             historical_features = []
             distance_history = []
+            robust_window_members = []
+            fixed_reference_expert = None
             segment_start = step
         current = committee_features[step]
+        current_lab = (
+            lab_features[step]
+            if lab_features is not None
+            else None
+        )
         active_before = manager.active_experts_before_step()
+        # 读取当前候选池状态
         provisional_before = manager.provisional_expert_before_step()
         training_members = manager.fuser_training_members(step)
         ms_score, ms_short_scores = _image_msm_profile(
@@ -202,6 +517,7 @@ def build_dynamic_committee_timeline(
         ).flatten().tolist()
 
         expert_supports = {}
+        current_expert_supports = {}
         for expert in active_before:
             expert_features = committee_features[expert["image_id"]]
             support, _ = _channel_support(
@@ -211,6 +527,79 @@ def build_dynamic_committee_timeline(
                 distance_threshold,
             )
             expert_supports[expert["expert_id"]] = support
+            current_expert_supports[expert["expert_id"]] = (
+                _positioned_expert_support(
+                    current,
+                    expert_features,
+                    grid_size,
+                    distance_threshold,
+                )
+            )
+
+        robust_shift_profile = None
+        if robust_shift_audit:
+            selection_score = (
+                ms_short if ms_short is not None else ms_score
+            )
+            robust_window_members.append(
+                {
+                    "step": int(step),
+                    "selection_score": selection_score,
+                }
+            )
+            del robust_window_members[:-robust_shift_window_size]
+            window_steps = [
+                member["step"] for member in robust_window_members
+            ]
+            ranked_members = sorted(
+                robust_window_members,
+                key=lambda member: (
+                    member["selection_score"] is None,
+                    member["selection_score"]
+                    if member["selection_score"] is not None
+                    else float("inf"),
+                ),
+            )
+            selected_steps = [
+                member["step"]
+                for member in ranked_members[:robust_shift_window_keep]
+            ]
+            if len(robust_window_members) < robust_shift_window_keep:
+                selected_steps = []
+            robust_shift_profile = _robust_shift_window_audit_profile(
+                step,
+                selected_steps,
+                window_steps,
+                active_before,
+                committee_features,
+                grid_size,
+                robust_shift_max_patches,
+                robust_shift_position_radius,
+                robust_shift_epsilon,
+                robust_shift_iterations,
+                fixed_reference_expert=fixed_reference_expert,
+            )
+
+        lab_drift_profile = manager.advance_lab_state(
+            current_lab,
+            step=step,
+            image_id=step,
+        )
+        drift_candidate_audit = manager.advance_drift_candidate_audit(
+            step=step,
+            image_id=step,
+            dino_patch_features=current,
+            lab_feature=current_lab,
+            ms_short_score=ms_short,
+            lab_drift_profile=lab_drift_profile,
+            channel_support=channel_support,
+            mature_match_fraction=association_profile[
+                "mature_match_fraction"
+            ],
+            recent_provisional_match_fraction=association_profile[
+                "recent_provisional_match_fraction"
+            ],
+        )
 
         event = manager.advance(
             step=step,
@@ -219,13 +608,32 @@ def build_dynamic_committee_timeline(
             ms_score=ms_score,
             channel_support=channel_support,
             expert_channel_supports=expert_supports,
+            current_expert_supports=current_expert_supports,
             provisional_channel_support=association_profile[
                 "recent_provisional_match_fraction"
             ],
             ms_short_score=ms_short,
             ms_short_ratio=ms_short_ratio,
             memory_patch_ids=memory_patch_ids,
+            lab_feature=current_lab,
+            lab_drift_profile=lab_drift_profile,
         )
+
+        if (
+            robust_shift_audit
+            and fixed_reference_expert is None
+            and event["admitted_expert_id"] is not None
+        ):
+            admitted_expert_id = int(event["admitted_expert_id"])
+            fixed_reference_expert = next(
+                {
+                    "expert_id": int(expert["expert_id"]),
+                    "image_id": int(expert["image_id"]),
+                    "admission_step": int(step),
+                }
+                for expert in manager.active_experts
+                if int(expert["expert_id"]) == admitted_expert_id
+            )
 
         if current_distances is not None:
             finite = current_distances[torch.isfinite(current_distances)]
@@ -266,12 +674,23 @@ def build_dynamic_committee_timeline(
                 "candidate_route": event["candidate_route"],
                 "admission_route": event["admission_route"],
                 "novel_quarantine": event["novel_quarantine"],
+                "photometric_gate": event["photometric_gate"],
+                "bootstrap": event["bootstrap"],
+                "lab_drift_profile": lab_drift_profile,
+                "drift_candidate_audit": drift_candidate_audit,
                 "novel_support_threshold": event[
                     "novel_support_threshold"
                 ],
                 "novel_ms_threshold": event["novel_ms_threshold"],
 
                 "expert_channel_supports": expert_supports,
+                "current_expert_supports": current_expert_supports,
+                "robust_shift_profile": robust_shift_profile,
+                "fixed_reference_expert_after": (
+                    dict(fixed_reference_expert)
+                    if fixed_reference_expert is not None
+                    else None
+                ),
                 "admitted_expert_id": event["admitted_expert_id"],
                 "deleted_expert_ids": event["deleted_expert_ids"],
                 "active_experts_after": manager.active_experts_before_step(),
@@ -445,11 +864,37 @@ def score_dynamic_msm2_layer(
     position_radius=1,
     transition_fallback_window=8,
     transition_fallback_require_pre_pool_expert=False,
-    transition_fallback_confirm_steps=0,
+    transition_fallback_evidence_window=0,
+    transition_fallback_min_hits=0,
+    transition_fallback_latch=False,
 ):
 
-    if transition_fallback_confirm_steps < 0:
-        raise ValueError("transition_fallback_confirm_steps must be non-negative")
+    if transition_fallback_evidence_window < 0:
+        raise ValueError(
+            "transition_fallback_evidence_window must be non-negative"
+        )
+    if transition_fallback_min_hits < 0:
+        raise ValueError(
+            "transition_fallback_min_hits must be non-negative"
+        )
+    if (
+        transition_fallback_evidence_window == 0
+        and transition_fallback_min_hits != 0
+    ):
+        raise ValueError(
+            "transition_fallback_min_hits must be 0 when "
+            "transition_fallback_evidence_window is 0"
+        )
+    if (
+        transition_fallback_evidence_window > 0
+        and not 1
+        <= transition_fallback_min_hits
+        <= transition_fallback_evidence_window
+    ):
+        raise ValueError(
+            "transition_fallback_min_hits must be within "
+            "the evidence window"
+        )
     if dino_features.ndim != 3:
         raise ValueError("dino_features must have shape [image, patch, feature]")
     if len(timeline) != dino_features.shape[0]:
@@ -474,10 +919,14 @@ def score_dynamic_msm2_layer(
     previous_active_signature = None
     active_stable_count = 0
     history_start = 0
+    transition_fallback_pool_start = None
+    transition_fallback_latched = False
 
     for step, record in enumerate(timeline):
         if record.get("state_reset_before", False):
             history_start = step
+            transition_fallback_pool_start = None
+            transition_fallback_latched = False
             cached_signature = None
             cached_training = None
             detect_fuser = None
@@ -509,8 +958,9 @@ def score_dynamic_msm2_layer(
         provisional_score_audit = None
         fallback_history_image_ids = []
         fallback_has_pre_pool_expert = False
+        fallback_recent_evidence_hits = 0
+        fallback_recent_evidence_steps = []
         transition_fallback_triggered = False
-        fallback_novel_evidence_streak = 0
 
         if fusion_mode == "strict_history_dino":
             patch_score, fallback_reason = _strict_history_dino_fallback(
@@ -703,6 +1153,13 @@ def score_dynamic_msm2_layer(
                     )
                     effective_mode = "dino_fallback"
 
+        if (
+            provisional is None
+            or provisional.get("state") != "collecting_channel_gate"
+        ):
+            transition_fallback_pool_start = None
+            transition_fallback_latched = False
+
         if fusion_mode == "dino_only" and provisional is not None:
             provisional_image_ids = [
                 int(image_id)
@@ -714,26 +1171,67 @@ def score_dynamic_msm2_layer(
                 raise ValueError(
                     "provisional expert must be strictly historical"
                 )
-            provisional_start_step=provisional.get("start_step")
-            # 旧分布专家存在  
-            fallback_has_pre_pool_expert = (provisional_start_step is not None and any(
-                int(image_id) < provisional_start_step
-                for image_id in expert_image_ids
-            ))
-            # 连续新分布证据
-            fallback_novel_evidence_streak = int(
-                provisional.get("novel_evidence_streak", 0)
-            )
 
-            has_enough_novel_evidence = (
-                transition_fallback_confirm_steps <= 0
-                or fallback_novel_evidence_streak
-                >= transition_fallback_confirm_steps
-            )
+            provisional_state = provisional.get("state")
+            provisional_start_step = provisional.get("start_step")
+            has_enough_novel_evidence = False
+
+            if (
+                provisional_state == "collecting_channel_gate"
+                and provisional_start_step is not None
+            ):
+                provisional_start_step = int(provisional_start_step)
+                if (
+                    transition_fallback_pool_start
+                    != provisional_start_step
+                ):
+                    transition_fallback_pool_start = (
+                        provisional_start_step
+                    )
+                    transition_fallback_latched = False
+
+                fallback_has_pre_pool_expert = any(
+                    int(image_id) < provisional_start_step
+                    for image_id in expert_image_ids
+                )
+                rolling_gate_enabled = (
+                    transition_fallback_evidence_window > 0
+                    and transition_fallback_min_hits > 0
+                )
+
+                if rolling_gate_enabled:
+                    evidence_start = max(
+                        history_start,
+                        provisional_start_step,
+                        step - transition_fallback_evidence_window,
+                    )
+                    fallback_recent_evidence_steps = [
+                        history_step
+                        for history_step in range(evidence_start, step)
+                        if timeline[history_step].get("candidate_route")
+                        == "new_distribution"
+                    ]
+                    fallback_recent_evidence_hits = len(
+                        fallback_recent_evidence_steps
+                    )
+                    evidence_confirmed = (
+                        fallback_recent_evidence_hits
+                        >= transition_fallback_min_hits
+                    )
+
+                    if transition_fallback_latch and evidence_confirmed:
+                        transition_fallback_latched = True
+
+                    has_enough_novel_evidence = (
+                        transition_fallback_latched
+                        if transition_fallback_latch
+                        else evidence_confirmed
+                    )
+                else:
+                    has_enough_novel_evidence = True
 
             should_use_transition_fallback = (
-                provisional.get("state")
-                == "collecting_channel_gate"
+                provisional_state == "collecting_channel_gate"
                 and transition_fallback_window > 0
                 and (
                     not transition_fallback_require_pre_pool_expert
@@ -750,22 +1248,16 @@ def score_dynamic_msm2_layer(
                 fallback_history_image_ids = list(
                     range(fallback_start, step)
                 )
-
                 patch_score, fallback_reason = (
                     _strict_history_dino_fallback(
                         current_dino,
                         dino_features[fallback_start:step],
                     )
                 )
-
-                fallback_reason = (
-                    "category_transition_recent_history"
-                )
-                effective_mode = (
-                    "recent_history_dino_fallback"
-                )
+                fallback_reason = "category_transition_recent_history"
+                effective_mode = "recent_history_dino_fallback"
                 transition_fallback_triggered = True
-            elif provisional.get("state") in {
+            elif provisional_state in {
                 "collecting_irbank",
                 "confirmed_irbank",
             }:
@@ -900,10 +1392,15 @@ def score_dynamic_msm2_layer(
             ),
             "fallback_reason": fallback_reason,
             "fallback_history_image_ids": fallback_history_image_ids,
-            "fallback_has_pre_pool_expert": (fallback_has_pre_pool_expert),
-            "fallback_novel_evidence_streak": (fallback_novel_evidence_streak),
-            "transition_fallback_triggered": (transition_fallback_triggered),
-            "transition_fallback_confirm_steps": (transition_fallback_confirm_steps),
+            "fallback_has_pre_pool_expert": fallback_has_pre_pool_expert,
+            "fallback_recent_evidence_hits": fallback_recent_evidence_hits,
+            "fallback_recent_evidence_steps": fallback_recent_evidence_steps,
+            "transition_fallback_evidence_window": (
+                transition_fallback_evidence_window
+            ),
+            "transition_fallback_min_hits": transition_fallback_min_hits,
+            "transition_fallback_latched": transition_fallback_latched,
+            "transition_fallback_triggered": transition_fallback_triggered,
             "training_image_count": (
                 len(cached_training["image_ids"])
                 if cached_training is not None

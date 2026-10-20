@@ -1,0 +1,193 @@
+{
+  "runs": [
+    {
+      "category": "bottle",
+      "drift_type": "brightness",
+      "drift_level": "strong",
+      "drift_scale": 3.0,
+      "seed": 0,
+      "variant": "dynamic_dino_channel_gate_robust_shift_audit",
+      "stream_samples": 10,
+      "anomaly_ratio": 0.3333333333333333,
+      "brightness_delta": 0.44999999999999996,
+      "contrast_delta": 0.15000000000000002,
+      "saturation_delta": 0.44999999999999996,
+      "hue_delta": 0.06,
+      "use_rscin": false,
+      "image_auroc": 1.0,
+      "pixel_auroc": 0.9813526347387858,
+      "aupro": 0.9604742183629186,
+      "raw_image_auroc": 1.0,
+      "runtime_seconds": 19.745206499999767,
+      "peak_memory_mb": 4166.54541015625,
+      "robust_shift_audit": true,
+      "cold_start_raw_auroc": 1.0,
+      "cold_start_normal_score_mean": 0.0,
+      "ramp_up_raw_auroc": 1.0,
+      "ramp_up_normal_score_mean": 0.8864723142223216,
+      "plateau_raw_auroc": 1.0,
+      "plateau_normal_score_mean": 0.9358587175733345,
+      "ramp_down_raw_auroc": 1.0,
+      "ramp_down_normal_score_mean": 0.8027976076023475,
+      "recovery_raw_auroc": 1.0,
+      "recovery_normal_score_mean": 0.7866454053876589,
+      "max_active_experts": 0,
+      "final_active_experts": 0,
+      "expert_admissions": 0,
+      "expert_deletions": 0,
+      "known_admission_sources": 0,
+      "polluted_expert_admissions": 0,
+      "polluted_admission_fraction": null,
+      "cold_start_robust_observations": 0,
+      "cold_start_robust_cost_median": null,
+      "cold_start_fixed_reference_observations": 0,
+      "cold_start_fixed_reference_cost_median": null,
+      "cold_start_within_window_observations": 0,
+      "cold_start_within_window_cost_median": null,
+      "cold_start_within_window_cost_max_median": null,
+      "ramp_up_robust_observations": 0,
+      "ramp_up_robust_cost_median": null,
+      "ramp_up_fixed_reference_observations": 0,
+      "ramp_up_fixed_reference_cost_median": null,
+      "ramp_up_within_window_observations": 2,
+      "ramp_up_within_window_cost_median": 0.6126809418201447,
+      "ramp_up_within_window_cost_max_median": 0.7028211355209351,
+      "plateau_robust_observations": 0,
+      "plateau_robust_cost_median": null,
+      "plateau_fixed_reference_observations": 0,
+      "plateau_fixed_reference_cost_median": null,
+      "plateau_within_window_observations": 2,
+      "plateau_within_window_cost_median": 0.640794575214386,
+      "plateau_within_window_cost_max_median": 0.6528673768043518,
+      "ramp_down_robust_observations": 0,
+      "ramp_down_robust_cost_median": null,
+      "ramp_down_fixed_reference_observations": 0,
+      "ramp_down_fixed_reference_cost_median": null,
+      "ramp_down_within_window_observations": 2,
+      "ramp_down_within_window_cost_median": 0.6140958070755005,
+      "ramp_down_within_window_cost_max_median": 0.6591866612434387,
+      "recovery_robust_observations": 0,
+      "recovery_robust_cost_median": null,
+      "recovery_fixed_reference_observations": 0,
+      "recovery_fixed_reference_cost_median": null,
+      "recovery_within_window_observations": 2,
+      "recovery_within_window_cost_median": 0.5842500329017639,
+      "recovery_within_window_cost_max_median": 0.6280196905136108,
+      "robust_shift_observed_steps": 0,
+      "robust_shift_cost_median": null,
+      "fixed_reference_observed_steps": 0,
+      "fixed_reference_cost_median": null,
+      "within_window_observed_steps": 8,
+      "within_window_cost_median": 0.6140958070755005,
+      "within_window_cost_max_median": 0.6528673768043518
+    }
+  ],
+  "nearest_expert_distance_monotonicity": [
+    {
+      "category": "bottle",
+      "drift_type": "brightness",
+      "variant": "dynamic_dino_channel_gate_robust_shift_audit",
+      "metric": "plateau_robust_cost_median",
+      "levels": [
+        {
+          "drift_level": "no_drift",
+          "drift_scale": 0.0,
+          "run_count": 0,
+          "median_over_seeds": null,
+          "mean_over_seeds": null,
+          "std_over_seeds": null
+        },
+        {
+          "drift_level": "light",
+          "drift_scale": 1.0,
+          "run_count": 0,
+          "median_over_seeds": null,
+          "mean_over_seeds": null,
+          "std_over_seeds": null
+        },
+        {
+          "drift_level": "medium",
+          "drift_scale": 2.0,
+          "run_count": 0,
+          "median_over_seeds": null,
+          "mean_over_seeds": null,
+          "std_over_seeds": null
+        },
+        {
+          "drift_level": "strong",
+          "drift_scale": 3.0,
+          "run_count": 0,
+          "median_over_seeds": null,
+          "mean_over_seeds": null,
+          "std_over_seeds": null
+        }
+      ],
+      "aggregate_non_decreasing": null,
+      "aggregate_strictly_increasing": null,
+      "all_complete_seeds_non_decreasing": null,
+      "complete_seed_count": 0,
+      "per_seed": [
+        {
+          "seed": 0,
+          "values": null,
+          "non_decreasing": null,
+          "strictly_increasing": null
+        }
+      ]
+    }
+  ],
+  "fixed_initial_expert_distance_monotonicity": [
+    {
+      "category": "bottle",
+      "drift_type": "brightness",
+      "variant": "dynamic_dino_channel_gate_robust_shift_audit",
+      "metric": "plateau_fixed_reference_cost_median",
+      "levels": [
+        {
+          "drift_level": "no_drift",
+          "drift_scale": 0.0,
+          "run_count": 0,
+          "median_over_seeds": null,
+          "mean_over_seeds": null,
+          "std_over_seeds": null
+        },
+        {
+          "drift_level": "light",
+          "drift_scale": 1.0,
+          "run_count": 0,
+          "median_over_seeds": null,
+          "mean_over_seeds": null,
+          "std_over_seeds": null
+        },
+        {
+          "drift_level": "medium",
+          "drift_scale": 2.0,
+          "run_count": 0,
+          "median_over_seeds": null,
+          "mean_over_seeds": null,
+          "std_over_seeds": null
+        },
+        {
+          "drift_level": "strong",
+          "drift_scale": 3.0,
+          "run_count": 0,
+          "median_over_seeds": null,
+          "mean_over_seeds": null,
+          "std_over_seeds": null
+        }
+      ],
+      "aggregate_non_decreasing": null,
+      "aggregate_strictly_increasing": null,
+      "all_complete_seeds_non_decreasing": null,
+      "complete_seed_count": 0,
+      "per_seed": [
+        {
+          "seed": 0,
+          "values": null,
+          "non_decreasing": null,
+          "strictly_increasing": null
+        }
+      ]
+    }
+  ]
+}

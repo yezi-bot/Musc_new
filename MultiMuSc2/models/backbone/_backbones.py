@@ -1,3 +1,5 @@
+import os
+
 import timm  # noqa
 import torchvision.models as models  # noqa
 import models.backbone.vision_transformer as vits
@@ -78,7 +80,18 @@ def load(name):
         patch_size = 14
         
     if 'dinov2' in url:
-        model = torch.hub.load('facebookresearch/dinov2', name)
+        dinov2_cache = os.path.join(
+            torch.hub.get_dir(),
+            "facebookresearch_dinov2_main",
+        )
+        if os.path.isdir(dinov2_cache):
+            model = torch.hub.load(
+                dinov2_cache,
+                name,
+                source="local",
+            )
+        else:
+            model = torch.hub.load('facebookresearch/dinov2', name)
         return model
 
     elif len(url)>0:

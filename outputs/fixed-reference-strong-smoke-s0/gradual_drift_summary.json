@@ -1,0 +1,193 @@
+{
+  "runs": [
+    {
+      "category": "bottle",
+      "drift_type": "brightness",
+      "drift_level": "strong",
+      "drift_scale": 3.0,
+      "seed": 0,
+      "variant": "dynamic_dino_channel_gate_robust_shift_audit",
+      "stream_samples": 30,
+      "anomaly_ratio": 0.3333333333333333,
+      "brightness_delta": 0.44999999999999996,
+      "contrast_delta": 0.15000000000000002,
+      "saturation_delta": 0.44999999999999996,
+      "hue_delta": 0.06,
+      "use_rscin": false,
+      "image_auroc": 0.97,
+      "pixel_auroc": 0.985616301468862,
+      "aupro": 0.9736479316837819,
+      "raw_image_auroc": 0.97,
+      "runtime_seconds": 57.64726719999817,
+      "peak_memory_mb": 4166.54541015625,
+      "robust_shift_audit": true,
+      "cold_start_raw_auroc": 1.0,
+      "cold_start_normal_score_mean": 0.6772320613581859,
+      "ramp_up_raw_auroc": 0.875,
+      "ramp_up_normal_score_mean": 0.8386599079271845,
+      "plateau_raw_auroc": 1.0,
+      "plateau_normal_score_mean": 0.9193580930354651,
+      "ramp_down_raw_auroc": 1.0,
+      "ramp_down_normal_score_mean": 0.922413492682626,
+      "recovery_raw_auroc": 0.875,
+      "recovery_normal_score_mean": 0.9136825911564554,
+      "max_active_experts": 1,
+      "final_active_experts": 0,
+      "expert_admissions": 1,
+      "expert_deletions": 1,
+      "known_admission_sources": 1,
+      "polluted_expert_admissions": 0,
+      "polluted_admission_fraction": 0.0,
+      "cold_start_robust_observations": 0,
+      "cold_start_robust_cost_median": null,
+      "cold_start_fixed_reference_observations": 0,
+      "cold_start_fixed_reference_cost_median": null,
+      "cold_start_within_window_observations": 4,
+      "cold_start_within_window_cost_median": 0.6013419032096863,
+      "cold_start_within_window_cost_max_median": 0.6226987838745117,
+      "ramp_up_robust_observations": 3,
+      "ramp_up_robust_cost_median": 0.4745883345603943,
+      "ramp_up_fixed_reference_observations": 3,
+      "ramp_up_fixed_reference_cost_median": 0.4745883345603943,
+      "ramp_up_within_window_observations": 6,
+      "ramp_up_within_window_cost_median": 0.5492866039276123,
+      "ramp_up_within_window_cost_max_median": 0.5747911930084229,
+      "plateau_robust_observations": 6,
+      "plateau_robust_cost_median": 0.48451417684555054,
+      "plateau_fixed_reference_observations": 6,
+      "plateau_fixed_reference_cost_median": 0.48451417684555054,
+      "plateau_within_window_observations": 6,
+      "plateau_within_window_cost_median": 0.5013470351696014,
+      "plateau_within_window_cost_max_median": 0.5343392193317413,
+      "ramp_down_robust_observations": 6,
+      "ramp_down_robust_cost_median": 0.49674713611602783,
+      "ramp_down_fixed_reference_observations": 6,
+      "ramp_down_fixed_reference_cost_median": 0.49674713611602783,
+      "ramp_down_within_window_observations": 6,
+      "ramp_down_within_window_cost_median": 0.5444116592407227,
+      "ramp_down_within_window_cost_max_median": 0.5526131391525269,
+      "recovery_robust_observations": 3,
+      "recovery_robust_cost_median": 0.531562089920044,
+      "recovery_fixed_reference_observations": 6,
+      "recovery_fixed_reference_cost_median": 0.5199537873268127,
+      "recovery_within_window_observations": 6,
+      "recovery_within_window_cost_median": 0.5190297067165375,
+      "recovery_within_window_cost_max_median": 0.5566824078559875,
+      "robust_shift_observed_steps": 18,
+      "robust_shift_cost_median": 0.4922502934932709,
+      "fixed_reference_observed_steps": 21,
+      "fixed_reference_cost_median": 0.49384933710098267,
+      "within_window_observed_steps": 28,
+      "within_window_cost_median": 0.5409102737903595,
+      "within_window_cost_max_median": 0.5542310476303101
+    }
+  ],
+  "nearest_expert_distance_monotonicity": [
+    {
+      "category": "bottle",
+      "drift_type": "brightness",
+      "variant": "dynamic_dino_channel_gate_robust_shift_audit",
+      "metric": "plateau_robust_cost_median",
+      "levels": [
+        {
+          "drift_level": "no_drift",
+          "drift_scale": 0.0,
+          "run_count": 0,
+          "median_over_seeds": null,
+          "mean_over_seeds": null,
+          "std_over_seeds": null
+        },
+        {
+          "drift_level": "light",
+          "drift_scale": 1.0,
+          "run_count": 0,
+          "median_over_seeds": null,
+          "mean_over_seeds": null,
+          "std_over_seeds": null
+        },
+        {
+          "drift_level": "medium",
+          "drift_scale": 2.0,
+          "run_count": 0,
+          "median_over_seeds": null,
+          "mean_over_seeds": null,
+          "std_over_seeds": null
+        },
+        {
+          "drift_level": "strong",
+          "drift_scale": 3.0,
+          "run_count": 1,
+          "median_over_seeds": 0.48451417684555054,
+          "mean_over_seeds": 0.48451417684555054,
+          "std_over_seeds": 0.0
+        }
+      ],
+      "aggregate_non_decreasing": null,
+      "aggregate_strictly_increasing": null,
+      "all_complete_seeds_non_decreasing": null,
+      "complete_seed_count": 0,
+      "per_seed": [
+        {
+          "seed": 0,
+          "values": null,
+          "non_decreasing": null,
+          "strictly_increasing": null
+        }
+      ]
+    }
+  ],
+  "fixed_initial_expert_distance_monotonicity": [
+    {
+      "category": "bottle",
+      "drift_type": "brightness",
+      "variant": "dynamic_dino_channel_gate_robust_shift_audit",
+      "metric": "plateau_fixed_reference_cost_median",
+      "levels": [
+        {
+          "drift_level": "no_drift",
+          "drift_scale": 0.0,
+          "run_count": 0,
+          "median_over_seeds": null,
+          "mean_over_seeds": null,
+          "std_over_seeds": null
+        },
+        {
+          "drift_level": "light",
+          "drift_scale": 1.0,
+          "run_count": 0,
+          "median_over_seeds": null,
+          "mean_over_seeds": null,
+          "std_over_seeds": null
+        },
+        {
+          "drift_level": "medium",
+          "drift_scale": 2.0,
+          "run_count": 0,
+          "median_over_seeds": null,
+          "mean_over_seeds": null,
+          "std_over_seeds": null
+        },
+        {
+          "drift_level": "strong",
+          "drift_scale": 3.0,
+          "run_count": 1,
+          "median_over_seeds": 0.48451417684555054,
+          "mean_over_seeds": 0.48451417684555054,
+          "std_over_seeds": 0.0
+        }
+      ],
+      "aggregate_non_decreasing": null,
+      "aggregate_strictly_increasing": null,
+      "all_complete_seeds_non_decreasing": null,
+      "complete_seed_count": 0,
+      "per_seed": [
+        {
+          "seed": 0,
+          "values": null,
+          "non_decreasing": null,
+          "strictly_increasing": null
+        }
+      ]
+    }
+  ]
+}

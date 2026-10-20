@@ -113,7 +113,7 @@ VARIANTS = {
         "reset": True,
         "candidate_mode": "legacy",
     },
-    "dynamic_dino_channel_gate_conditional_fallback": {
+    "dynamic_dino_channel_gate_rolling_fallback": {
         "dynamic": True,
         "mode": "dino_only",
         "reset": False,
@@ -121,9 +121,25 @@ VARIANTS = {
         "novel_admission_mode": "channel_gate",
         "transition_fallback_window": 8,
         "transition_fallback_require_pre_pool_expert": True,
-        # "transition_fallback_evidence_window":4,
-        # "transition_fallback_min_hits":2,
-        "transition_fallback_confirm_steps": 2,
+        "transition_fallback_evidence_window": 4,
+        "transition_fallback_min_hits": 2,
+        "transition_fallback_latch": True,
+    },
+    "dynamic_dino_channel_gate_robust_shift_audit": {
+        "dynamic": True,
+        "mode": "dino_only",
+        "reset": False,
+        "candidate_mode": "dual_path",
+        "novel_admission_mode": "channel_gate",
+        "transition_fallback_window": 8,
+        "transition_fallback_require_pre_pool_expert": True,
+        "transition_fallback_evidence_window": 4,
+        "transition_fallback_min_hits": 2,
+        "transition_fallback_latch": True,
+        "robust_shift_audit": True,
+        "robust_shift_max_patches": 128,
+        "robust_shift_epsilon": 0.05,
+        "robust_shift_iterations": 20,
     },
 }
 
@@ -187,6 +203,10 @@ def audit_metrics(audit_path, boundary):
             "channel_gate_confirmation_latency": None,
             "transition_fallback_steps": None,
             "post_transition_fallback_steps": None,
+            "robust_shift_observed_steps": None,
+            "pre_median_robust_shift_cost": None,
+            "post_median_robust_shift_cost": None,
+            "post_median_robust_mutual_fraction": None,
         }
     audit = json.loads(Path(audit_path).read_text(encoding="utf-8"))
     timeline = audit["timeline"]
@@ -308,6 +328,36 @@ def audit_metrics(audit_path, boundary):
     post_recent_provisional_support = [
         value for value in post_recent_provisional_support if value is not None
     ]
+    robust_records = [
+        record
+        for record in timeline
+        if (record.get("robust_shift_profile") or {}).get(
+            "nearest_discrete_cost"
+        )
+        is not None
+    ]
+    pre_robust_costs = [
+        record["robust_shift_profile"]["nearest_discrete_cost"]
+        for record in robust_records
+        if record["step"] < boundary
+    ]
+    post_robust_costs = [
+        record["robust_shift_profile"]["nearest_discrete_cost"]
+        for record in robust_records
+        if record["step"] >= boundary
+    ]
+    post_mutual_fractions = []
+    for record in robust_records:
+        if record["step"] < boundary:
+            continue
+        profile = record["robust_shift_profile"]
+        expert_profile = profile["expert_profiles"].get(
+            str(profile["nearest_expert_id"])
+        )
+        if expert_profile is not None:
+            post_mutual_fractions.append(
+                expert_profile["mutual_fraction"]
+            )
     return {
         "post_old_expert_reference_fraction": (
             len(old_reference_records) / len(post) if post else None
@@ -370,6 +420,22 @@ def audit_metrics(audit_path, boundary):
         "post_transition_fallback_steps": sum(
             record["step"] >= boundary
             for record in transition_fallback_records
+        ),
+        "robust_shift_observed_steps": len(robust_records),
+        "pre_median_robust_shift_cost": (
+            float(np.median(pre_robust_costs))
+            if pre_robust_costs
+            else None
+        ),
+        "post_median_robust_shift_cost": (
+            float(np.median(post_robust_costs))
+            if post_robust_costs
+            else None
+        ),
+        "post_median_robust_mutual_fraction": (
+            float(np.median(post_mutual_fractions))
+            if post_mutual_fractions
+            else None
         ),
     }
 
@@ -475,6 +541,18 @@ def run_variant(base_config, args, sequence, seed, variant_name):
     cfg["models"]["dynamic_committee"]["ms_short_windows"] = list(
         MS_SHORT_WINDOWS
     )
+    cfg["models"]["dynamic_committee"]["robust_shift_audit"] = bool(
+        variant.get("robust_shift_audit", False)
+    )
+    cfg["models"]["dynamic_committee"]["robust_shift_max_patches"] = int(
+        variant.get("robust_shift_max_patches", 128)
+    )
+    cfg["models"]["dynamic_committee"]["robust_shift_epsilon"] = float(
+        variant.get("robust_shift_epsilon", 0.05)
+    )
+    cfg["models"]["dynamic_committee"]["robust_shift_iterations"] = int(
+        variant.get("robust_shift_iterations", 20)
+    )
     cfg["models"].setdefault("dynamic_fusion", {})["mode"] = variant["mode"]
     cfg["models"]["dynamic_fusion"]["transition_fallback_window"] = int(
         variant.get("transition_fallback_window", 8)
@@ -482,9 +560,15 @@ def run_variant(base_config, args, sequence, seed, variant_name):
     cfg["models"]["dynamic_fusion"]["transition_fallback_require_pre_pool_expert"] = bool(
         variant.get("transition_fallback_require_pre_pool_expert", False)
     )
-    cfg["models"]["dynamic_fusion"]["transition_fallback_confirm_steps"] = int(
-        variant.get("transition_fallback_confirm_steps", 0)
-    )
+    cfg["models"]["dynamic_fusion"][
+        "transition_fallback_evidence_window"
+    ] = int(variant.get("transition_fallback_evidence_window", 0))
+    cfg["models"]["dynamic_fusion"][
+        "transition_fallback_min_hits"
+    ] = int(variant.get("transition_fallback_min_hits", 0))
+    cfg["models"]["dynamic_fusion"][
+        "transition_fallback_latch"
+    ] = bool(variant.get("transition_fallback_latch", False))
 
     model = MuSc(cfg, seed=seed)
     if torch.cuda.is_available():
@@ -563,8 +647,19 @@ def run_variant(base_config, args, sequence, seed, variant_name):
         ),
         "runtime_seconds": runtime_seconds,
         "peak_memory_mb": peak_memory_mb,
+        "robust_shift_audit": cfg["models"]["dynamic_committee"][
+            "robust_shift_audit"
+        ],
         "transition_fallback_require_pre_pool_expert": cfg["models"]["dynamic_fusion"]["transition_fallback_require_pre_pool_expert"],
-        "transition_fallback_confirm_steps": cfg["models"]["dynamic_fusion"]["transition_fallback_confirm_steps"],
+        "transition_fallback_evidence_window": cfg["models"][
+            "dynamic_fusion"
+        ]["transition_fallback_evidence_window"],
+        "transition_fallback_min_hits": cfg["models"]["dynamic_fusion"][
+            "transition_fallback_min_hits"
+        ],
+        "transition_fallback_latch": cfg["models"]["dynamic_fusion"][
+            "transition_fallback_latch"
+        ],
     }
     row.update(audit_metrics(audit_path, boundary))
     del model

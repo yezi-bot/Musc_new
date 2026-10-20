@@ -292,6 +292,7 @@ class MuSc():
             # extract features
             patch_tokens_list1 = []
             patch_tokens_list2 = []
+            lab_feature_batches = []
             subset_num = len(test_dataset)
             dataset_num += subset_num
             start_time = time.time()
@@ -303,6 +304,10 @@ class MuSc():
                     image_path_list.extend(image_info["image_path"])
                     img_masks.append(image_info["mask"])
                     gt_list.extend(list(image_info["is_anomaly"].numpy()))
+                    if "lab_feature" in image_info:
+                        lab_feature_batches.append(
+                            image_info["lab_feature"].to(torch.float64)
+                        )
                 with torch.no_grad(), torch.cuda.amp.autocast():
                     input_image = image.to(torch.float).to(self.device) # 转成float传到gpu
                     #'dinov2'
@@ -369,6 +374,11 @@ class MuSc():
                     Z_layers0[str(self.committee_layer_index)],
                     dim=0,
                 ).to(self.device)
+                committee_lab_features = (
+                    torch.cat(lab_feature_batches, dim=0)
+                    if lab_feature_batches
+                    else None
+                )
                 timeline_path = self.dynamic_committee_cfg.get('timeline_path')
                 if timeline_path:
                     with open(timeline_path, 'r', encoding='utf-8') as handle:
@@ -381,6 +391,7 @@ class MuSc():
                     dynamic_timeline = build_dynamic_committee_timeline(
                         committee_features,
                         device=self.device,
+                        lab_features=committee_lab_features,
                         position_radius=int(
                             self.dynamic_committee_cfg.get('position_radius', 1)
                         ),
@@ -401,6 +412,47 @@ class MuSc():
                             int(window)
                             for window in self.dynamic_committee_cfg.get(
                                 'ms_short_windows', [8, 16, 32]
+                            )
+                        ),
+                        robust_shift_audit=bool(
+                            self.dynamic_committee_cfg.get(
+                                'robust_shift_audit', False
+                            )
+                        ),
+                        robust_shift_max_patches=int(
+                            self.dynamic_committee_cfg.get(
+                                'robust_shift_max_patches', 128
+                            )
+                        ),
+                        robust_shift_epsilon=float(
+                            self.dynamic_committee_cfg.get(
+                                'robust_shift_epsilon', 0.05
+                            )
+                        ),
+                        robust_shift_iterations=int(
+                            self.dynamic_committee_cfg.get(
+                                'robust_shift_iterations', 20
+                            )
+                        ),
+                        robust_shift_window_size=int(
+                            self.dynamic_committee_cfg.get(
+                                'robust_shift_window_size', 4
+                            )
+                        ),
+                        robust_shift_window_keep=int(
+                            self.dynamic_committee_cfg.get(
+                                'robust_shift_window_keep', 3
+                            )
+                        ),
+                        robust_shift_position_radius=(
+                            None
+                            if self.dynamic_committee_cfg.get(
+                                'robust_shift_position_radius', 1
+                            ) is None
+                            else int(
+                                self.dynamic_committee_cfg.get(
+                                    'robust_shift_position_radius', 1
+                                )
                             )
                         ),
                         manager_kwargs={
@@ -510,6 +562,171 @@ class MuSc():
                             'novel_memory_keep_fraction': float(
                                 self.dynamic_committee_cfg.get(
                                     'novel_memory_keep_fraction', 0.5
+                                )
+                            ),
+                            'cold_start_mode': self.dynamic_committee_cfg.get(
+                                'cold_start_mode', 'legacy'
+                            ),
+                            'cold_start_min_samples': int(
+                                self.dynamic_committee_cfg.get(
+                                    'cold_start_min_samples', 4
+                                )
+                            ),
+                            'cold_start_max_samples': int(
+                                self.dynamic_committee_cfg.get(
+                                    'cold_start_max_samples', 6
+                                )
+                            ),
+                            'cold_start_required_members': int(
+                                self.dynamic_committee_cfg.get(
+                                    'cold_start_required_members', 3
+                                )
+                            ),
+                            'cold_start_lab_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'cold_start_lab_enabled', False
+                                )
+                            ),
+                            'lab_ewma_alpha': float(
+                                self.dynamic_committee_cfg.get(
+                                    'lab_ewma_alpha', 0.3
+                                )
+                            ),
+                            'lab_ewma_threshold_k': float(
+                                self.dynamic_committee_cfg.get(
+                                    'lab_ewma_threshold_k', 3.0
+                                )
+                            ),
+                            'lab_ewma_confirm_steps': int(
+                                self.dynamic_committee_cfg.get(
+                                    'lab_ewma_confirm_steps', 2
+                                )
+                            ),
+                            'photometric_candidate_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_candidate_enabled', False
+                                )
+                            ),
+                            'photometric_quarantine_steps': int(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_quarantine_steps', 4
+                                )
+                            ),
+                            'photometric_prebuffer_size': int(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_prebuffer_size', 2
+                                )
+                            ),
+                            'photometric_support_confirm_steps': int(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_support_confirm_steps', 2
+                                )
+                            ),
+                            'photometric_gate_mode': (
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_gate_mode',
+                                    'coverage_loss',
+                                )
+                            ),
+                            'photometric_candidate_window_mode': (
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_candidate_window_mode',
+                                    'history',
+                                )
+                            ),
+                            'photometric_fixed_low_risk_members': int(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_fixed_low_risk_members', 4
+                                )
+                            ),
+                            'photometric_dynamic_min_low_risk_members': int(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_dynamic_min_low_risk_members',
+                                    3,
+                                )
+                            ),
+                            'photometric_dynamic_max_low_risk_members': int(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_dynamic_max_low_risk_members',
+                                    6,
+                                )
+                            ),
+                            'photometric_local_lab_distance_threshold': float(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_local_lab_distance_threshold',
+                                    0.04,
+                                )
+                            ),
+                            'photometric_l_ewma_floor': float(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_l_ewma_floor', 0.04
+                                )
+                            ),
+                            'photometric_ab_ewma_floor': float(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_ab_ewma_floor', 0.01
+                                )
+                            ),
+                            'photometric_consistency_fraction': float(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_consistency_fraction', 0.75
+                                )
+                            ),
+                            'photometric_min_low_risk_members': int(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_min_low_risk_members', 2
+                                )
+                            ),
+                            'photometric_relevant_history_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_relevant_history_enabled',
+                                    False,
+                                )
+                            ),
+                            'photometric_history_min': int(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_history_min', 3
+                                )
+                            ),
+                            'photometric_history_max': int(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_history_max', 16
+                                )
+                            ),
+                            'photometric_history_distance_threshold': float(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_history_distance_threshold',
+                                    3.0,
+                                )
+                            ),
+                            'photometric_dino_similarity_floor': float(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_dino_similarity_floor', 0.9
+                                )
+                            ),
+                            'photometric_budget_replacement': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_budget_replacement', True
+                                )
+                            ),
+                            'drift_candidate_audit_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'drift_candidate_audit_enabled', False
+                                )
+                            ),
+                            'drift_candidate_pool_size': int(
+                                self.dynamic_committee_cfg.get(
+                                    'drift_candidate_pool_size', 4
+                                )
+                            ),
+                            'drift_candidate_keep': int(
+                                self.dynamic_committee_cfg.get(
+                                    'drift_candidate_keep', 3
+                                )
+                            ),
+                            'drift_lab_noise_floor': float(
+                                self.dynamic_committee_cfg.get(
+                                    'drift_lab_noise_floor', 0.01
                                 )
                             ),
                         },
@@ -669,8 +886,21 @@ class MuSc():
                                     'transition_fallback_require_pre_pool_expert', False
                                 )
                             ),
-                            transition_fallback_confirm_steps=int(self.dynamic_fusion_cfg.get(
-                                'transition_fallback_confirm_steps', 0)),
+                            transition_fallback_evidence_window=int(
+                                self.dynamic_fusion_cfg.get(
+                                    'transition_fallback_evidence_window', 0
+                                )
+                            ),
+                            transition_fallback_min_hits=int(
+                                self.dynamic_fusion_cfg.get(
+                                    'transition_fallback_min_hits', 0
+                                )
+                            ),
+                            transition_fallback_latch=bool(
+                                self.dynamic_fusion_cfg.get(
+                                    'transition_fallback_latch', False
+                                )
+                            ),
                             committee_retrain_cooldown=int(
                                 self.dynamic_fusion_cfg.get(
                                     'committee_retrain_cooldown', 5
