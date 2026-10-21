@@ -724,9 +724,34 @@ class MuSc():
                                     'photometric_budget_replacement', True
                                 )
                             ),
+                            'legacy_budget_replacement': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'legacy_budget_replacement', True
+                                )
+                            ),
+                            'budget_coverage_window': int(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_coverage_window', 32
+                                )
+                            ),
+                            'budget_min_new_coverage_fraction': float(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_min_new_coverage_fraction', 0.5
+                                )
+                            ),
+                            'budget_replacement_margin': float(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_replacement_margin', 0.0
+                                )
+                            ),
                             'minimum_active_experts': int(
                                 self.dynamic_committee_cfg.get(
                                     'minimum_active_experts', 0
+                                )
+                            ),
+                            'lifecycle_mode': str(
+                                self.dynamic_committee_cfg.get(
+                                    'lifecycle_mode', 'ttl_delete'
                                 )
                             ),
                             'drift_candidate_audit_enabled': bool(

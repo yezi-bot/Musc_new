@@ -5,17 +5,108 @@ from PIL import Image
 
 from MultiMuSc2.datasets.gradual_drift import (
     apply_photometric_drift,
+    build_multistage_drift_schedule,
+    build_segment_balanced_stream_records,
     lab_robust_feature,
 )
 from MultiMuSc2.examples.ablate_gradual_drift import (
     build_lab_audit_profiles,
     build_lab_ewma_profiles,
     drift_candidate_audit_metrics,
+    expert_metrics,
     lab_metrics,
 )
 
 
 class GradualDriftLabAuditTest(unittest.TestCase):
+    def test_expert_metrics_counts_budget_replacement_rejection_reason(self):
+        timeline = [
+            {
+                "active_experts_after": [],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": None,
+                "budget_replacement": None,
+                "budget_replacement_evaluation": {
+                    "outcome": "insufficient_new_coverage",
+                    "new_coverage_fraction": 0.0,
+                },
+            }
+        ]
+
+        metrics = expert_metrics(timeline, labels=np.asarray([0]))
+
+        self.assertEqual(metrics["budget_replacement_attempt_count"], 1)
+        self.assertEqual(
+            metrics["budget_replacement_insufficient_coverage_count"],
+            1,
+        )
+        self.assertEqual(
+            metrics[
+                "budget_replacement_evaluated_new_coverage_fraction_median"
+            ],
+            0.0,
+        )
+
+    def test_multistage_schedule_has_distinct_absolute_states(self):
+        schedule = build_multistage_drift_schedule()
+
+        self.assertEqual(len(schedule), 28)
+        self.assertEqual(schedule[0]["segment_id"], "state_a_initial")
+        self.assertEqual(schedule[-1]["segment_id"], "state_a_recovery")
+        self.assertEqual(schedule[-1]["brightness"], 1.0)
+        self.assertEqual(schedule[-1]["hue"], 0.0)
+        plateau_ids = {
+            item["segment_id"]
+            for item in schedule
+            if item["segment_kind"] == "plateau"
+        }
+        self.assertEqual(
+            plateau_ids,
+            {
+                "state_a_initial",
+                "state_b",
+                "state_c",
+                "state_d",
+                "state_a_recovery",
+            },
+        )
+        transition = [
+            item
+            for item in schedule
+            if item["segment_id"] == "transition_a_to_b"
+        ]
+        self.assertEqual(len(transition), 2)
+        self.assertLess(
+            transition[0]["brightness"],
+            transition[1]["brightness"],
+        )
+
+    def test_segment_balanced_records_preserve_each_segment_mix(self):
+        records = [
+            ("bottle", "good", f"good_{index}.png", None)
+            for index in range(12)
+        ]
+        records += [
+            ("bottle", "broken", f"bad_{index}.png", None)
+            for index in range(6)
+        ]
+
+        stream = build_segment_balanced_stream_records(
+            records=records,
+            segment_sizes=[4, 2, 4],
+            anomaly_ratio=(1.0 / 3.0),
+            seed=0,
+        )
+
+        self.assertEqual(len(stream), 10)
+        offset = 0
+        for size in (4, 2, 4):
+            segment = stream[offset:offset + size]
+            labels = [record[1] != "good" for record in segment]
+            self.assertGreater(sum(labels), 0)
+            self.assertLess(sum(labels), size)
+            offset += size
+
     def test_no_drift_level_stays_zero_drift_during_nonzero_schedule(self):
         timeline = [
             {

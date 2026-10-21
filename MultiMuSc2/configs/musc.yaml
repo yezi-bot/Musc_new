@@ -26,6 +26,11 @@ models:
     duplicate_similarity: 0.98
     min_cluster_support: 2
     committee_cap: 5
+    photometric_budget_replacement: true
+    legacy_budget_replacement: true
+    budget_coverage_window: 32
+    budget_min_new_coverage_fraction: 0.5
+    budget_replacement_margin: 0.0
     base_ttl: 5
     max_ttl: 20
     ttl_gap_multiplier: 2.0

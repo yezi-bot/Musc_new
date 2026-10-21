@@ -477,6 +477,7 @@ def build_dynamic_committee_timeline(
             else None
         )
         active_before = manager.active_experts_before_step()
+        expert_slots_before = manager.expert_slots_before_step()
         # 读取当前候选池状态
         provisional_before = manager.provisional_expert_before_step()
         training_members = manager.fuser_training_members(step)
@@ -518,7 +519,7 @@ def build_dynamic_committee_timeline(
 
         expert_supports = {}
         current_expert_supports = {}
-        for expert in active_before:
+        for expert in expert_slots_before:
             expert_features = committee_features[expert["image_id"]]
             support, _ = _channel_support(
                 memory,
@@ -654,6 +655,7 @@ def build_dynamic_committee_timeline(
                 "segment_start": segment_start,
                 "state_reset_before": state_reset_before,
                 "active_experts_before": active_before,
+                "expert_slots_before": expert_slots_before,
                 "provisional_expert_before": provisional_before,
                 "fuser_training_members_before": training_members,
                 "ms_score": ms_score,
@@ -675,6 +677,10 @@ def build_dynamic_committee_timeline(
                 "admission_route": event["admission_route"],
                 "novel_quarantine": event["novel_quarantine"],
                 "photometric_gate": event["photometric_gate"],
+                "budget_replacement": event["budget_replacement"],
+                "budget_replacement_evaluation": event[
+                    "budget_replacement_evaluation"
+                ],
                 "bootstrap": event["bootstrap"],
                 "lab_drift_profile": lab_drift_profile,
                 "drift_candidate_audit": drift_candidate_audit,
@@ -697,7 +703,9 @@ def build_dynamic_committee_timeline(
                     "expert_lifecycle_events"
                 ],
                 "active_experts_after": manager.active_experts_before_step(),
+                "expert_slots_after": manager.expert_slots_before_step(),
                 "active_expert_ids_after": event["active_expert_ids_after_step"],
+                "expert_slot_ids_after": event["expert_slot_ids_after_step"],
                 "channel_count_after": len(memory.channels),
                 "mature_channel_count_after": len(memory.mature_channels()),
             }

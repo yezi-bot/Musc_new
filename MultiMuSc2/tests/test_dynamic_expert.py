@@ -1179,60 +1179,257 @@ class DynamicExpertManagerTest(unittest.TestCase):
         self.assertEqual(profile["lab_inlier_count"], 3)
         self.assertEqual(profile["dino_inlier_count"], 3)
 
-    def test_photometric_admission_replaces_trigger_when_budget_is_full(self):
+    def test_photometric_admission_replaces_most_redundant_expert(self):
         manager = DynamicExpertManager(
-            committee_cap=1,
-            cold_start_mode="adaptive",
-            cold_start_min_samples=4,
-            cold_start_max_samples=4,
-            cold_start_required_members=3,
-            cold_start_lab_enabled=True,
+            committee_cap=2,
             photometric_relevant_history_enabled=True,
         )
-        features = patch_features(1.0, 0.0)
-        for step in range(4):
-            manager.advance(
-                step=step,
-                image_id=step,
-                dino_patch_features=features,
-                ms_score=None if step == 0 else 0.1,
-                channel_support=None if step == 0 else 1.0,
-                expert_channel_supports={},
-                lab_feature=torch.tensor(
-                    [40.0 + step, 2.0, 1.0, 3.0, 2.0, 4.0]
-                ),
-            )
-        member = manager._quarantine_member(
-            step=4,
-            image_id=4,
-            dino_patch_features=features,
+        first = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
             ms_score=0.1,
             ms_short_score=0.1,
             ms_short_ratio=0.8,
-            channel_support=0.2,
+            channel_support=0.8,
             provisional_channel_support=0.5,
             memory_patch_ids=[0],
-            lab_feature=torch.tensor(
-                [60.0, 2.0, 1.0, 3.0, 2.0, 4.0]
-            ),
             historical_ms_threshold=0.5,
         )
+        second = {
+            **first,
+            "step": 1,
+            "image_id": 1,
+            "embedding": manager._image_embedding(
+                patch_features(0.0, 1.0)
+            ),
+        }
+        manager._admit_quarantined_member(first, 0, admission_route="legacy")
+        manager._admit_quarantined_member(second, 1, admission_route="legacy")
+        manager.coverage_history = [
+            {
+                "step": 2,
+                "support_threshold": 0.5,
+                "supports": {0: 0.9, 1: 0.9},
+            },
+            {
+                "step": 3,
+                "support_threshold": 0.5,
+                "supports": {0: 0.9, 1: 0.1},
+            },
+        ]
+        candidate_a = {
+            **first,
+            "step": 4,
+            "image_id": 4,
+            "current_expert_supports": {0: 0.9, 1: 0.1},
+        }
+        candidate_b = {
+            **candidate_a,
+            "step": 5,
+            "image_id": 5,
+            "current_expert_supports": {0: 0.1, 1: 0.1},
+        }
 
         _, expert_id = manager._admit_quarantined_member(
-            member,
-            step=4,
-            cluster_members=[member],
+            candidate_a,
+            step=5,
+            cluster_members=[candidate_a, candidate_b],
             admission_route="photometric_drift_channel_gate",
-            replacement_expert_id=0,
+            support_threshold=0.5,
         )
 
-        self.assertEqual(expert_id, 1)
-        self.assertEqual(len(manager.active_experts), 1)
-        self.assertEqual(manager.active_experts[0]["expert_id"], 1)
-        self.assertEqual(manager.retired_experts[-1]["expert_id"], 0)
+        self.assertEqual(expert_id, 2)
+        self.assertEqual(len(manager.active_experts), 2)
+        self.assertEqual(
+            [expert["expert_id"] for expert in manager.active_experts],
+            [0, 2],
+        )
+        self.assertEqual(manager.retired_experts[-1]["expert_id"], 1)
         self.assertEqual(
             manager.retired_experts[-1]["last_event"],
-            "replaced_photometric_budget",
+            "replaced_coverage_budget",
+        )
+        self.assertEqual(
+            manager.last_budget_replacement["reason"],
+            "coverage_budget_replacement",
+        )
+        self.assertAlmostEqual(
+            manager.last_budget_replacement["new_coverage_fraction"],
+            0.5,
+        )
+        self.assertEqual(
+            manager.last_budget_replacement_evaluation["outcome"],
+            "accepted",
+        )
+
+    def test_legacy_admission_replaces_redundant_expert_at_cap(self):
+        manager = DynamicExpertManager(committee_cap=2)
+        first = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        second = {
+            **first,
+            "step": 1,
+            "image_id": 1,
+            "embedding": manager._image_embedding(
+                patch_features(0.0, 1.0)
+            ),
+        }
+        manager._admit_quarantined_member(first, 0, admission_route="legacy")
+        manager._admit_quarantined_member(second, 1, admission_route="legacy")
+        manager.coverage_history = [
+            {
+                "step": 2,
+                "support_threshold": 0.5,
+                "supports": {0: 0.9, 1: 0.9},
+            }
+        ]
+        candidate_members = [
+            {
+                **first,
+                "step": step,
+                "image_id": step,
+                "embedding": manager._image_embedding(
+                    patch_features(-1.0, 0.0)
+                ),
+                "current_expert_supports": {0: 0.1, 1: 0.1},
+            }
+            for step in (3, 4)
+        ]
+
+        _, expert_id = manager._admit_quarantined_member(
+            candidate_members[0],
+            step=4,
+            cluster_members=candidate_members,
+            admission_route="legacy",
+            support_threshold=0.5,
+        )
+
+        self.assertEqual(expert_id, 2)
+        self.assertEqual(len(manager.active_experts), 2)
+        self.assertEqual(manager.retired_experts[-1]["expert_id"], 0)
+        self.assertEqual(
+            manager.last_budget_replacement["admission_route"],
+            "legacy",
+        )
+
+    def test_legacy_route_reaches_budget_replacement_via_advance(self):
+        manager = DynamicExpertManager(
+            min_cluster_support=2,
+            committee_cap=2,
+            base_ttl=10,
+            max_ttl=10,
+        )
+        manager.ms_history.append(1.0)
+        manager.support_history.append(0.5)
+        first = patch_features(1.0, 0.0)
+        second = patch_features(0.0, 1.0)
+        third = patch_features(-1.0, 0.0)
+
+        manager.advance(0, 0, first, 0.1, 1.0, {})
+        manager.advance(1, 1, first, 0.1, 1.0, {})
+        manager.advance(
+            2,
+            2,
+            second,
+            0.1,
+            1.0,
+            {0: 1.0},
+            current_expert_supports={0: 0.1},
+        )
+        manager.advance(
+            3,
+            3,
+            second,
+            0.1,
+            1.0,
+            {0: 1.0},
+            current_expert_supports={0: 0.1},
+        )
+        manager.advance(
+            4,
+            4,
+            third,
+            0.1,
+            1.0,
+            {0: 1.0, 1: 1.0},
+            current_expert_supports={0: 0.1, 1: 0.1},
+        )
+        event = manager.advance(
+            5,
+            5,
+            third,
+            0.1,
+            1.0,
+            {0: 1.0, 1: 1.0},
+            current_expert_supports={0: 0.1, 1: 0.1},
+        )
+
+        self.assertEqual(event["admitted_expert_id"], 2)
+        self.assertEqual(event["budget_replacement"]["admission_route"], "legacy")
+        self.assertEqual(len(manager.active_experts), 2)
+        self.assertIn(
+            event["budget_replacement"]["expert_id"],
+            event["deleted_expert_ids"],
+        )
+
+    def test_budget_replacement_rejects_candidate_without_new_coverage(self):
+        manager = DynamicExpertManager(committee_cap=1)
+        member = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        manager._admit_quarantined_member(member, 0, admission_route="legacy")
+        manager.coverage_history = [
+            {
+                "step": 1,
+                "support_threshold": 0.5,
+                "supports": {0: 0.9},
+            }
+        ]
+        covered_candidate = {
+            **member,
+            "step": 2,
+            "image_id": 2,
+            "current_expert_supports": {0: 0.9},
+        }
+
+        _, expert_id = manager._admit_quarantined_member(
+            covered_candidate,
+            step=2,
+            cluster_members=[covered_candidate],
+            admission_route="legacy",
+            support_threshold=0.5,
+        )
+
+        self.assertIsNone(expert_id)
+        self.assertEqual(len(manager.active_experts), 1)
+        self.assertEqual(manager.retired_experts, [])
+        self.assertEqual(
+            manager.last_budget_replacement_evaluation["outcome"],
+            "insufficient_new_coverage",
+        )
+        self.assertEqual(
+            manager.last_budget_replacement_evaluation[
+                "new_coverage_fraction"
+            ],
+            0.0,
         )
 
     def test_lab_confirmed_gate_does_not_wait_for_coverage_loss(self):
@@ -1465,6 +1662,119 @@ class DynamicExpertManagerTest(unittest.TestCase):
         self.assertEqual(manager.active_experts[0]["ttl"], 1)
         self.assertEqual(events[0]["decision"], "coverage_floor_retained")
         self.assertTrue(events[0]["coverage_floor_retained"])
+
+    def test_dormant_lifecycle_keeps_slot_and_reactivates(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="adaptive",
+            cold_start_min_samples=4,
+            cold_start_max_samples=4,
+            cold_start_required_members=3,
+            base_ttl=1,
+            max_ttl=1,
+            lifecycle_mode="dormant_replace",
+        )
+        features = patch_features(1.0, 0.0)
+        for step in range(4):
+            manager.advance(
+                step=step,
+                image_id=step,
+                dino_patch_features=features,
+                ms_score=None if step == 0 else 0.1,
+                channel_support=None if step == 0 else 1.0,
+                expert_channel_supports={},
+            )
+
+        deleted, events = manager._advance_lifecycle(
+            step=4,
+            support_threshold=0.5,
+            expert_channel_supports={0: 0.0},
+            current_expert_supports={0: 0.0},
+        )
+
+        self.assertEqual(deleted, [])
+        self.assertEqual(manager.active_experts[0]["lifecycle_state"], "dormant")
+        self.assertEqual(manager.active_experts_before_step(), [])
+        self.assertEqual(len(manager.expert_slots_before_step()), 1)
+        self.assertTrue(events[0]["became_dormant_this_step"])
+
+        deleted, events = manager._advance_lifecycle(
+            step=5,
+            support_threshold=0.5,
+            expert_channel_supports={0: 0.0},
+            current_expert_supports={0: 0.9},
+        )
+
+        self.assertEqual(deleted, [])
+        self.assertEqual(manager.active_experts[0]["lifecycle_state"], "active")
+        self.assertEqual(len(manager.active_experts_before_step()), 1)
+        self.assertTrue(events[0]["reactivated_this_step"])
+
+    def test_budget_replacement_prefers_dormant_slot(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            lifecycle_mode="dormant_replace",
+            budget_min_new_coverage_fraction=0.5,
+        )
+        first = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        second = {
+            **first,
+            "step": 1,
+            "image_id": 1,
+            "embedding": manager._image_embedding(
+                patch_features(0.0, 1.0)
+            ),
+        }
+        manager._admit_quarantined_member(first, 0, admission_route="legacy")
+        manager._admit_quarantined_member(second, 1, admission_route="legacy")
+        manager.active_experts[1]["lifecycle_state"] = "dormant"
+        manager.coverage_history = [
+            {
+                "step": 5,
+                "support_threshold": 0.5,
+                "supports": {0: 0.9, 1: 0.0},
+            }
+        ]
+        candidate_members = [
+            {
+                **first,
+                "step": step,
+                "image_id": step,
+                "embedding": manager._image_embedding(
+                    patch_features(-1.0, 0.0)
+                ),
+                "current_expert_supports": {0: 0.0, 1: 0.0},
+            }
+            for step in (2, 3)
+        ]
+
+        _, admitted_id = manager._admit_quarantined_member(
+            candidate_members[0],
+            step=3,
+            cluster_members=candidate_members,
+            admission_route="photometric_drift_channel_gate",
+            support_threshold=0.5,
+        )
+
+        self.assertEqual(admitted_id, 2)
+        self.assertEqual(
+            [expert["expert_id"] for expert in manager.active_experts],
+            [0, 2],
+        )
+        self.assertEqual(manager.retired_experts[-1]["expert_id"], 1)
+        self.assertEqual(
+            manager.last_budget_replacement["victim_lifecycle_state"],
+            "dormant",
+        )
 
 
 if __name__ == "__main__":

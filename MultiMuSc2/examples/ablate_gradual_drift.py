@@ -24,6 +24,7 @@ from datasets.gradual_drift import (
     build_balanced_stream_records,
     build_drift_schedule,
     build_lab_feature_stream,
+    build_segment_balanced_stream_records,
 )
 from models.musc import MuSc
 
@@ -239,6 +240,29 @@ VARIANTS = {
     },
 }
 
+VARIANTS["photometric_c_episode_exit_cap2_reject"] = {
+    **VARIANTS["photometric_c_episode_exit"],
+    "committee_cap": 2,
+    "photometric_budget_replacement": False,
+    "legacy_budget_replacement": False,
+}
+VARIANTS["photometric_c_episode_exit_cap2_replace"] = {
+    **VARIANTS["photometric_c_episode_exit"],
+    "committee_cap": 2,
+    "photometric_budget_replacement": True,
+    "legacy_budget_replacement": False,
+}
+VARIANTS["photometric_multistage_cap2_reject"] = {
+    **VARIANTS["photometric_c_episode_exit_cap2_reject"],
+    "minimum_active_experts": 0,
+    "lifecycle_mode": "dormant_replace",
+}
+VARIANTS["photometric_multistage_cap2_replace"] = {
+    **VARIANTS["photometric_c_episode_exit_cap2_replace"],
+    "minimum_active_experts": 0,
+    "lifecycle_mode": "dormant_replace",
+}
+
 PRIMARY_VARIANTS = [
     "cold_start_bootstrap",
     "cold_start_bootstrap_lab",
@@ -364,6 +388,13 @@ def configure_variant(
         {},
     )
 
+    committee["committee_cap"] = int(
+        variant.get(
+            "committee_cap",
+            committee.get("committee_cap", 5),
+        )
+    )
+
     committee["enabled"] = variant[
         "dynamic"
     ]
@@ -486,9 +517,20 @@ def configure_variant(
     committee["photometric_history_max"] = 16
     committee["photometric_history_distance_threshold"] = 3.0
     committee["photometric_dino_similarity_floor"] = 0.9
-    committee["photometric_budget_replacement"] = True
+    committee["photometric_budget_replacement"] = bool(
+        variant.get("photometric_budget_replacement", True)
+    )
+    committee["legacy_budget_replacement"] = bool(
+        variant.get(
+            "legacy_budget_replacement",
+            committee.get("legacy_budget_replacement", True),
+        )
+    )
     committee["minimum_active_experts"] = int(
         variant.get("minimum_active_experts", 0)
+    )
+    committee["lifecycle_mode"] = str(
+        variant.get("lifecycle_mode", "ttl_delete")
     )
     committee["drift_candidate_audit_enabled"] = bool(
         variant.get("drift_candidate_audit_enabled", False)
@@ -1359,6 +1401,18 @@ def expert_metrics(timeline, labels):
     first_expert_is_anomaly = None
     bootstrap_selected_image_ids = []
     bootstrap_selected_anomaly_count = None
+    budget_replacement_count = 0
+    legacy_budget_replacement_count = 0
+    photometric_budget_replacement_count = 0
+    replacement_new_coverage_fractions = []
+    replacement_victim_unique_fractions = []
+    budget_replacement_attempt_count = 0
+    budget_replacement_evaluation_outcomes = {}
+    evaluated_new_coverage_fractions = []
+    max_expert_slots = 0
+    final_expert_slots = 0
+    dormant_transition_count = 0
+    expert_reactivation_count = 0
 
     for record in timeline:
         active_after = record.get(
@@ -1373,6 +1427,18 @@ def expert_metrics(timeline, labels):
             max_active_experts,
             final_active_experts,
         )
+        expert_slots_after = record.get(
+            "expert_slots_after", active_after
+        )
+        final_expert_slots = len(expert_slots_after)
+        max_expert_slots = max(max_expert_slots, final_expert_slots)
+        for event in record.get("expert_lifecycle_events", []):
+            dormant_transition_count += int(
+                bool(event.get("became_dormant_this_step", False))
+            )
+            expert_reactivation_count += int(
+                bool(event.get("reactivated_this_step", False))
+            )
 
         deleted_ids = record.get(
             "deleted_expert_ids",
@@ -1381,6 +1447,41 @@ def expert_metrics(timeline, labels):
         expert_deletions += len(
             deleted_ids
         )
+        replacement = record.get("budget_replacement") or {}
+        if replacement:
+            budget_replacement_count += 1
+            route = str(replacement.get("admission_route", ""))
+            if route == "legacy":
+                legacy_budget_replacement_count += 1
+            elif route.startswith("photometric_drift"):
+                photometric_budget_replacement_count += 1
+            if replacement.get("new_coverage_fraction") is not None:
+                replacement_new_coverage_fractions.append(
+                    float(replacement["new_coverage_fraction"])
+                )
+            victim_coverage = replacement.get("victim_coverage") or {}
+            if victim_coverage.get("unique_fraction") is not None:
+                replacement_victim_unique_fractions.append(
+                    float(victim_coverage["unique_fraction"])
+                )
+        replacement_evaluation = (
+            record.get("budget_replacement_evaluation") or {}
+        )
+        if replacement_evaluation:
+            budget_replacement_attempt_count += 1
+            outcome = str(
+                replacement_evaluation.get("outcome", "unknown")
+            )
+            budget_replacement_evaluation_outcomes[outcome] = (
+                budget_replacement_evaluation_outcomes.get(outcome, 0) + 1
+            )
+            evaluated_fraction = replacement_evaluation.get(
+                "new_coverage_fraction"
+            )
+            if evaluated_fraction is not None:
+                evaluated_new_coverage_fractions.append(
+                    float(evaluated_fraction)
+                )
 
         admitted_expert_id = record.get(
             "admitted_expert_id"
@@ -1454,11 +1555,63 @@ def expert_metrics(timeline, labels):
         "final_active_experts": (
             final_active_experts
         ),
+        "max_expert_slots": max_expert_slots,
+        "final_expert_slots": final_expert_slots,
+        "dormant_transition_count": dormant_transition_count,
+        "expert_reactivation_count": expert_reactivation_count,
         "expert_admissions": (
             expert_admissions
         ),
         "expert_deletions": (
             expert_deletions
+        ),
+        "budget_replacement_count": budget_replacement_count,
+        "legacy_budget_replacement_count": (
+            legacy_budget_replacement_count
+        ),
+        "photometric_budget_replacement_count": (
+            photometric_budget_replacement_count
+        ),
+        "budget_replacement_new_coverage_fraction_median": (
+            float(np.median(replacement_new_coverage_fractions))
+            if replacement_new_coverage_fractions
+            else None
+        ),
+        "budget_replacement_victim_unique_fraction_median": (
+            float(np.median(replacement_victim_unique_fractions))
+            if replacement_victim_unique_fractions
+            else None
+        ),
+        "budget_replacement_attempt_count": (
+            budget_replacement_attempt_count
+        ),
+        "budget_replacement_accepted_count": (
+            budget_replacement_evaluation_outcomes.get("accepted", 0)
+        ),
+        "budget_replacement_disabled_count": (
+            budget_replacement_evaluation_outcomes.get(
+                "replacement_disabled", 0
+            )
+        ),
+        "budget_replacement_insufficient_coverage_count": (
+            budget_replacement_evaluation_outcomes.get(
+                "insufficient_new_coverage", 0
+            )
+        ),
+        "budget_replacement_missing_support_count": (
+            budget_replacement_evaluation_outcomes.get(
+                "missing_candidate_support", 0
+            )
+        ),
+        "budget_replacement_no_redundant_victim_count": (
+            budget_replacement_evaluation_outcomes.get(
+                "no_redundant_victim", 0
+            )
+        ),
+        "budget_replacement_evaluated_new_coverage_fraction_median": (
+            float(np.median(evaluated_new_coverage_fractions))
+            if evaluated_new_coverage_fractions
+            else None
         ),
         "known_admission_sources": (
             known_admission_sources
@@ -1698,6 +1851,9 @@ def write_step_diagnostics(
             "active_experts_after",
             [],
         )
+        expert_slots_after = audit_record.get(
+            "expert_slots_after", active_after
+        )
         deleted_ids = audit_record.get(
             "deleted_expert_ids",
             [],
@@ -1719,6 +1875,16 @@ def write_step_diagnostics(
                 "drift_phase": drift[
                     "phase"
                 ],
+                "drift_segment_id": drift.get(
+                    "segment_id",
+                    drift["phase"],
+                ),
+                "drift_segment_kind": drift.get(
+                    "segment_kind"
+                ),
+                "drift_state_id": drift.get(
+                    "state_id"
+                ),
                 "drift_severity": drift[
                     "severity"
                 ],
@@ -1823,6 +1989,14 @@ def write_step_diagnostics(
                     audit_record.get("photometric_gate"),
                     ensure_ascii=False,
                 ),
+                "budget_replacement_event": json.dumps(
+                    audit_record.get("budget_replacement"),
+                    ensure_ascii=False,
+                ),
+                "budget_replacement_evaluation": json.dumps(
+                    audit_record.get("budget_replacement_evaluation"),
+                    ensure_ascii=False,
+                ),
                 "expert_lab_expert_id": expert_lab_profile.get("expert_id"),
                 "expert_lab_l_distance": expert_lab_profile.get(
                     "l_distance"
@@ -1892,6 +2066,19 @@ def write_step_diagnostics(
                         ensure_ascii=False,
                     )
                 ),
+                "expert_slot_count_after": len(expert_slots_after),
+                "dormant_expert_count_after": sum(
+                    expert.get("lifecycle_state") == "dormant"
+                    for expert in expert_slots_after
+                ),
+                "dormant_expert_ids_after": json.dumps(
+                    [
+                        expert["expert_id"]
+                        for expert in expert_slots_after
+                        if expert.get("lifecycle_state") == "dormant"
+                    ],
+                    ensure_ascii=False,
+                ),
                 "nearest_expert_id": (
                     robust["nearest_expert_id"]
                 ),
@@ -1954,8 +2141,13 @@ def run_variant(
     drift_level,
     seed,
     variant_name,
+    schedule_override=None,
 ):
-    drift_scale = DRIFT_LEVEL_SCALES[drift_level]
+    drift_scale = (
+        DRIFT_LEVEL_SCALES[drift_level]
+        if schedule_override is None
+        else 1.0
+    )
     run_output = (
         Path(args.output_dir)
         / args.category
@@ -1996,41 +2188,42 @@ def run_variant(
             "data_to_iterate"
         )
 
-    stream_records = (
-        build_balanced_stream_records(
-            records=(
-                base_dataset.data_to_iterate
-            ),
-            total_steps=(
-                args.stream_samples
-            ),
-            anomaly_ratio=(
-                args.anomaly_ratio
-            ),
+    if schedule_override is None:
+        stream_records = build_balanced_stream_records(
+            records=base_dataset.data_to_iterate,
+            total_steps=args.stream_samples,
+            anomaly_ratio=args.anomaly_ratio,
             seed=seed,
         )
-    )
-
-    schedule = build_drift_schedule(
-        drift_type=drift_type,
-        total_steps=args.stream_samples,
-        brightness_delta=(
-            args.brightness_delta
-            * drift_scale
-        ),
-        contrast_delta=(
-            args.contrast_delta
-            * drift_scale
-        ),
-        saturation_delta=(
-            args.saturation_delta
-            * drift_scale
-        ),
-        hue_delta=(
-            args.hue_delta
-            * drift_scale
-        ),
-    )
+        schedule = build_drift_schedule(
+            drift_type=drift_type,
+            total_steps=args.stream_samples,
+            brightness_delta=args.brightness_delta * drift_scale,
+            contrast_delta=args.contrast_delta * drift_scale,
+            saturation_delta=args.saturation_delta * drift_scale,
+            hue_delta=args.hue_delta * drift_scale,
+        )
+    else:
+        schedule = [dict(item) for item in schedule_override]
+        if len(schedule) != args.stream_samples:
+            raise ValueError(
+                "schedule_override length must match stream_samples"
+            )
+        segment_sizes = []
+        previous_segment = None
+        for item in schedule:
+            segment_id = item.get("segment_id", item["phase"])
+            if segment_id != previous_segment:
+                segment_sizes.append(1)
+                previous_segment = segment_id
+            else:
+                segment_sizes[-1] += 1
+        stream_records = build_segment_balanced_stream_records(
+            records=base_dataset.data_to_iterate,
+            segment_sizes=segment_sizes,
+            anomaly_ratio=args.anomaly_ratio,
+            seed=seed,
+        )
 
     drift_dataset = GradualDriftDataset(
         records=stream_records,
@@ -2268,6 +2461,24 @@ def run_variant(
         "minimum_active_experts": cfg["models"][
             "dynamic_committee"
         ].get("minimum_active_experts"),
+        "lifecycle_mode": cfg["models"][
+            "dynamic_committee"
+        ].get("lifecycle_mode", "ttl_delete"),
+        "committee_cap": cfg["models"][
+            "dynamic_committee"
+        ].get("committee_cap", 5),
+        "legacy_budget_replacement": cfg["models"][
+            "dynamic_committee"
+        ].get("legacy_budget_replacement", True),
+        "budget_coverage_window": cfg["models"][
+            "dynamic_committee"
+        ].get("budget_coverage_window", 32),
+        "budget_min_new_coverage_fraction": cfg["models"][
+            "dynamic_committee"
+        ].get("budget_min_new_coverage_fraction", 0.5),
+        "budget_replacement_margin": cfg["models"][
+            "dynamic_committee"
+        ].get("budget_replacement_margin", 0.0),
         "photometric_local_lab_distance_threshold": cfg["models"][
             "dynamic_committee"
         ].get("photometric_local_lab_distance_threshold"),

@@ -16,6 +16,45 @@ PHASES = (
 )
 
 
+MULTISTAGE_PHOTOMETRIC_STATES = (
+    {
+        "state_id": "a",
+        "brightness": 1.0,
+        "contrast": 1.0,
+        "saturation": 1.0,
+        "hue": 0.0,
+    },
+    {
+        "state_id": "b",
+        "brightness": 1.25,
+        "contrast": 1.08,
+        "saturation": 1.0,
+        "hue": 0.0,
+    },
+    {
+        "state_id": "c",
+        "brightness": 1.15,
+        "contrast": 1.05,
+        "saturation": 1.30,
+        "hue": 0.04,
+    },
+    {
+        "state_id": "d",
+        "brightness": 0.80,
+        "contrast": 0.95,
+        "saturation": 0.85,
+        "hue": -0.04,
+    },
+    {
+        "state_id": "a_recovery",
+        "brightness": 1.0,
+        "contrast": 1.0,
+        "saturation": 1.0,
+        "hue": 0.0,
+    },
+)
+
+
 def apply_photometric_drift(image, drift):
     image = TF.adjust_brightness(
         image,
@@ -128,6 +167,7 @@ class GradualDriftDataset(torch.utils.data.Dataset):
             "image_path": str(image_path),
             "stream_step": int(index),
             "drift_phase": drift["phase"],
+            "drift_state_id": drift.get("state_id"),
             "drift_severity": float(drift["severity"]),
             "lab_feature": lab_feature,
         }
@@ -253,6 +293,151 @@ def build_drift_schedule(
         )
 
     return schedule
+
+
+def _photometric_severity(state):
+    return float(
+        min(
+            1.0,
+            max(
+                abs(float(state["brightness"]) - 1.0) / 0.25,
+                abs(float(state["contrast"]) - 1.0) / 0.08,
+                abs(float(state["saturation"]) - 1.0) / 0.30,
+                abs(float(state["hue"])) / 0.04,
+            ),
+        )
+    )
+
+
+def build_multistage_drift_schedule(
+    initial_plateau_steps=4,
+    transition_steps=2,
+    plateau_steps=4,
+):
+    if initial_plateau_steps < 4:
+        raise ValueError("initial_plateau_steps must be at least 4")
+    if transition_steps < 1:
+        raise ValueError("transition_steps must be positive")
+    if plateau_steps < 3:
+        raise ValueError("plateau_steps must be at least 3")
+
+    schedule = []
+
+    def append_state(state, phase, segment_kind):
+        schedule.append(
+            {
+                "step": len(schedule),
+                "phase": phase,
+                "segment_id": phase,
+                "segment_kind": segment_kind,
+                "state_id": state["state_id"],
+                "severity": _photometric_severity(state),
+                "brightness": float(state["brightness"]),
+                "contrast": float(state["contrast"]),
+                "saturation": float(state["saturation"]),
+                "hue": float(state["hue"]),
+            }
+        )
+
+    initial = MULTISTAGE_PHOTOMETRIC_STATES[0]
+    for _ in range(initial_plateau_steps):
+        append_state(initial, "state_a_initial", "plateau")
+
+    previous = initial
+    for target in MULTISTAGE_PHOTOMETRIC_STATES[1:]:
+        transition_id = (
+            f"transition_{previous['state_id']}_to_{target['state_id']}"
+        )
+        for offset in range(1, transition_steps + 1):
+            fraction = offset / float(transition_steps + 1)
+            interpolated = {
+                "state_id": transition_id,
+                **{
+                    key: (
+                        float(previous[key])
+                        + fraction
+                        * (float(target[key]) - float(previous[key]))
+                    )
+                    for key in (
+                        "brightness",
+                        "contrast",
+                        "saturation",
+                        "hue",
+                    )
+                },
+            }
+            append_state(interpolated, transition_id, "transition")
+
+        plateau_id = f"state_{target['state_id']}"
+        for _ in range(plateau_steps):
+            append_state(target, plateau_id, "plateau")
+        previous = target
+
+    return schedule
+
+
+def build_segment_balanced_stream_records(
+    records,
+    segment_sizes,
+    anomaly_ratio,
+    seed,
+):
+    if not 0.0 < anomaly_ratio < 1.0:
+        raise ValueError("anomaly_ratio must be within (0, 1)")
+    if not segment_sizes or any(int(size) < 2 for size in segment_sizes):
+        raise ValueError("each segment must contain at least 2 samples")
+
+    normal_records = [
+        tuple(record)
+        for record in records
+        if record[1] == "good"
+    ]
+    anomaly_records = [
+        tuple(record)
+        for record in records
+        if record[1] != "good"
+    ]
+    generator = random.Random(seed)
+    generator.shuffle(normal_records)
+    generator.shuffle(anomaly_records)
+
+    segment_counts = []
+    for raw_size in segment_sizes:
+        size = int(raw_size)
+        anomaly_count = max(
+            1,
+            min(size - 1, round(size * anomaly_ratio)),
+        )
+        segment_counts.append((size - anomaly_count, anomaly_count))
+
+    required_normal = sum(item[0] for item in segment_counts)
+    required_anomaly = sum(item[1] for item in segment_counts)
+    if len(normal_records) < required_normal:
+        raise ValueError(
+            f"not enough normal images: need {required_normal}, "
+            f"found {len(normal_records)}"
+        )
+    if len(anomaly_records) < required_anomaly:
+        raise ValueError(
+            f"not enough anomaly images: need {required_anomaly}, "
+            f"found {len(anomaly_records)}"
+        )
+
+    stream_records = []
+    normal_offset = 0
+    anomaly_offset = 0
+    for normal_count, anomaly_count in segment_counts:
+        segment = normal_records[
+            normal_offset:normal_offset + normal_count
+        ]
+        segment += anomaly_records[
+            anomaly_offset:anomaly_offset + anomaly_count
+        ]
+        normal_offset += normal_count
+        anomaly_offset += anomaly_count
+        generator.shuffle(segment)
+        stream_records.extend(segment)
+    return stream_records
 
 
 def build_balanced_stream_records(

@@ -68,7 +68,12 @@ class DynamicExpertManager:
     photometric_history_distance_threshold=3.0,
     photometric_dino_similarity_floor=0.9,
     photometric_budget_replacement=True,
+    legacy_budget_replacement=True,
+    budget_coverage_window=32,
+    budget_min_new_coverage_fraction=0.5,
+    budget_replacement_margin=0.0,
     minimum_active_experts=0,
+    lifecycle_mode="ttl_delete",
     drift_candidate_audit_enabled=False,
     drift_candidate_pool_size=4,
     drift_candidate_keep=3,
@@ -267,9 +272,23 @@ class DynamicExpertManager:
             raise ValueError(
                 "photometric_dino_similarity_floor must be within [0, 1]"
             )
+      if budget_coverage_window < 1:
+            raise ValueError("budget_coverage_window must be at least 1")
+      if not 0.0 <= budget_min_new_coverage_fraction <= 1.0:
+            raise ValueError(
+                "budget_min_new_coverage_fraction must be within [0, 1]"
+            )
+      if not 0.0 <= budget_replacement_margin <= 1.0:
+            raise ValueError(
+                "budget_replacement_margin must be within [0, 1]"
+            )
       if not 0 <= minimum_active_experts <= committee_cap:
             raise ValueError(
                 "minimum_active_experts must be between 0 and committee_cap"
+            )
+      if lifecycle_mode not in {"ttl_delete", "dormant_replace"}:
+            raise ValueError(
+                "lifecycle_mode must be ttl_delete or dormant_replace"
             )
       if drift_candidate_pool_size < 2:
             raise ValueError("drift_candidate_pool_size must be at least 2")
@@ -382,7 +401,14 @@ class DynamicExpertManager:
       self.photometric_budget_replacement = bool(
             photometric_budget_replacement
       )
+      self.legacy_budget_replacement = bool(legacy_budget_replacement)
+      self.budget_coverage_window = int(budget_coverage_window)
+      self.budget_min_new_coverage_fraction = float(
+            budget_min_new_coverage_fraction
+      )
+      self.budget_replacement_margin = float(budget_replacement_margin)
       self.minimum_active_experts = int(minimum_active_experts)
+      self.lifecycle_mode = lifecycle_mode
       self.drift_candidate_audit_enabled = bool(
             drift_candidate_audit_enabled
         )
@@ -421,6 +447,8 @@ class DynamicExpertManager:
       self.photometric_recovery_streak = 0
       self.photometric_pool_abort_reason = None
       self.last_budget_replacement = None
+      self.last_budget_replacement_evaluation = None
+      self.coverage_history = []
 
     def provisional_expert_before_step(self):
         if (
@@ -503,6 +531,8 @@ class DynamicExpertManager:
     def active_experts_before_step(self):
         snapshots = []
         for expert in self.active_experts:
+            if expert.get("lifecycle_state", "active") != "active":
+                continue
             snapshot = {
                 "expert_id":expert["expert_id"],
                 "image_id":expert["image_id"],
@@ -513,6 +543,23 @@ class DynamicExpertManager:
                 snapshot["admission_route"] = expert["admission_route"]
             if expert.get("lab_state") is not None:
                 snapshot["lab_state"] = dict(expert["lab_state"])
+            snapshots.append(snapshot)
+        return snapshots
+
+    def expert_slots_before_step(self):
+        snapshots = []
+        for expert in self.active_experts:
+            snapshot = {
+                "expert_id": expert["expert_id"],
+                "image_id": expert["image_id"],
+                "cluster_id": expert["cluster_id"],
+                "admission_step": expert["admission_step"],
+                "lifecycle_state": expert.get(
+                    "lifecycle_state", "active"
+                ),
+            }
+            if expert.get("admission_route", "legacy") != "legacy":
+                snapshot["admission_route"] = expert["admission_route"]
             snapshots.append(snapshot)
         return snapshots
 
@@ -548,6 +595,9 @@ class DynamicExpertManager:
                     "admission_ttl_mode"
                 ],
                 "admission_route": expert.get("admission_route", "legacy"),
+                "lifecycle_state": expert.get(
+                    "lifecycle_state", "active"
+                ),
             }
             for expert in self.active_experts
         ]
@@ -557,6 +607,7 @@ class DynamicExpertManager:
         active_cluster_ids = {
             expert["cluster_id"]
             for expert in self.active_experts
+            if expert.get("lifecycle_state", "active") == "active"
         }
 
         for cluster_id in active_cluster_ids:
@@ -953,6 +1004,7 @@ class DynamicExpertManager:
             "ttl": self.base_ttl,
             "deletion_step": None,
             "last_event": "admitted",
+            "lifecycle_state": "active",
             "last_channel_support": None,
             "representative_mode": "bootstrap_medoid",
             "admission_ttl_mode": "base",
@@ -1811,13 +1863,144 @@ class DynamicExpertManager:
         self.last_drift_candidate_audit_event = base_event
         return base_event
 
+    def _advance_dormant_lifecycle(
+        self,
+        step,
+        support_threshold,
+        expert_channel_supports,
+        current_expert_supports,
+    ):
+        lifecycle_events = []
+        for expert in self.active_experts:
+            expert_id = int(expert["expert_id"])
+            state_before = expert.get("lifecycle_state", "active")
+            ttl_before = int(expert["ttl"])
+            patience_before = int(expert["patience"])
+            last_supported_step_before = int(
+                expert["last_supported_step"]
+            )
+            memory_support = self._optional_score(
+                f"expert_channel_supports[{expert_id}]",
+                expert_channel_supports.get(expert_id),
+                unit_interval=True,
+            )
+            current_support = self._optional_score(
+                f"current_expert_supports[{expert_id}]",
+                current_expert_supports.get(expert_id),
+                unit_interval=True,
+            )
+            support_gap = None
+            became_dormant = False
+            reactivated = False
+
+            if state_before == "dormant":
+                if (
+                    current_support is not None
+                    and support_threshold is not None
+                    and current_support >= support_threshold
+                ):
+                    expert["lifecycle_state"] = "active"
+                    expert["ttl"] = expert["patience"]
+                    expert["last_supported_step"] = int(step)
+                    expert["support_count"] += 1
+                    expert["last_event"] = "reactivated"
+                    reactivated = True
+                else:
+                    expert["lifecycle_state"] = "dormant"
+                    expert["ttl"] = 0
+                    expert["last_event"] = "dormant"
+            elif memory_support is None or support_threshold is None:
+                expert["lifecycle_state"] = "active"
+                expert["last_event"] = "signal_unavailable"
+            elif memory_support >= support_threshold:
+                support_gap = step - expert["last_supported_step"]
+                expert["max_support_gap"] = max(
+                    expert["max_support_gap"], support_gap
+                )
+                expert["patience"] = self._patience_from_gap(
+                    expert["max_support_gap"]
+                )
+                expert["ttl"] = expert["patience"]
+                expert["last_supported_step"] = int(step)
+                expert["support_count"] += 1
+                expert["lifecycle_state"] = "active"
+                expert["last_event"] = "ttl_refreshed"
+            else:
+                expert["ttl"] -= 1
+                if expert["ttl"] <= 0:
+                    expert["ttl"] = 0
+                    expert["lifecycle_state"] = "dormant"
+                    expert["last_event"] = "became_dormant"
+                    became_dormant = True
+                else:
+                    expert["lifecycle_state"] = "active"
+                    expert["last_event"] = "ttl_decrement"
+
+            expert["last_channel_support"] = memory_support
+            state_after = expert.get("lifecycle_state", "active")
+            lifecycle_events.append(
+                {
+                    "step": int(step),
+                    "expert_id": expert_id,
+                    "expert_image_id": int(expert["image_id"]),
+                    "cluster_id": int(expert["cluster_id"]),
+                    "admission_step": int(expert["admission_step"]),
+                    "age": int(step - expert["admission_step"]),
+                    "channel_support": memory_support,
+                    "current_expert_support": current_support,
+                    "support_threshold": support_threshold,
+                    "support_available": memory_support is not None,
+                    "threshold_available": support_threshold is not None,
+                    "support_gap": support_gap,
+                    "ttl_before": ttl_before,
+                    "ttl_after": int(expert["ttl"]),
+                    "patience_before": patience_before,
+                    "patience_after": int(expert["patience"]),
+                    "last_supported_step_before": last_supported_step_before,
+                    "last_supported_step_after": int(
+                        expert["last_supported_step"]
+                    ),
+                    "signal_decision": expert["last_event"],
+                    "decision": expert["last_event"],
+                    "refreshed": expert["last_event"] == "ttl_refreshed",
+                    "deleted_this_step": False,
+                    "alive_after": True,
+                    "active_after": state_after == "active",
+                    "lifecycle_state_before": state_before,
+                    "lifecycle_state_after": state_after,
+                    "became_dormant_this_step": became_dormant,
+                    "reactivated_this_step": reactivated,
+                    "coverage_floor_retained": False,
+                    "minimum_active_experts": self.minimum_active_experts,
+                    "admission_candidate_image_id": None,
+                    "admission_candidate_ms_score": None,
+                    "admission_ms_threshold": None,
+                    "admission_candidate_channel_support": None,
+                    "admission_support_threshold": None,
+                    "representative_mode": expert["representative_mode"],
+                    "admission_ttl_mode": expert["admission_ttl_mode"],
+                    "admission_route": expert.get(
+                        "admission_route", "legacy"
+                    ),
+                }
+            )
+        return [], lifecycle_events
+
     #管理存活专家
     def _advance_lifecycle(
         self,
         step,
         support_threshold,
         expert_channel_supports,
+        current_expert_supports=None,
     ):
+        if self.lifecycle_mode == "dormant_replace":
+            return self._advance_dormant_lifecycle(
+                step,
+                support_threshold,
+                expert_channel_supports,
+                current_expert_supports or {},
+            )
         deleted_expert_ids = []
         survivors = []
         lifecycle_events = []
@@ -2018,6 +2201,7 @@ class DynamicExpertManager:
         lab_feature=None,
         candidate_route="new_distribution",
         historical_ms_threshold=None,
+        current_expert_supports=None,
     ):
         return {
             "step": int(step),
@@ -2038,6 +2222,9 @@ class DynamicExpertManager:
             ),
             "memory_patch_ids": list(memory_patch_ids or []),
             "lab_feature": self._lab_feature(lab_feature),
+            "current_expert_supports": self._normalized_expert_supports(
+                current_expert_supports
+            ),
         }
 
     def _select_irbank_members(self, pool):
@@ -2055,7 +2242,239 @@ class DynamicExpertManager:
             key=lambda item: item["ms_short_score"],
         )[:keep]
 
-    def _replace_budgeted_expert(self, expert_id, step):
+    def _normalized_expert_supports(self, supports):
+        normalized = {}
+        for expert_id, support in (supports or {}).items():
+            parsed = self._optional_score(
+                f"current_expert_supports[{expert_id}]",
+                support,
+                unit_interval=True,
+            )
+            if parsed is not None:
+                normalized[int(expert_id)] = float(parsed)
+        return normalized
+
+    def _record_coverage_observation(
+        self,
+        step,
+        ms_score,
+        ms_threshold,
+        support_threshold,
+        current_expert_supports,
+    ):
+        if (
+            ms_score is None
+            or ms_threshold is None
+            or ms_score > ms_threshold
+            or support_threshold is None
+        ):
+            return
+        supports = self._normalized_expert_supports(
+            current_expert_supports
+        )
+        if not supports:
+            return
+        self.coverage_history.append(
+            {
+                "step": int(step),
+                "support_threshold": float(support_threshold),
+                "supports": supports,
+            }
+        )
+        del self.coverage_history[:-self.budget_coverage_window]
+
+    def _candidate_new_coverage_fraction(
+        self,
+        candidate_members,
+        support_threshold,
+    ):
+        if support_threshold is None:
+            return None, 0, 0
+        active_ids = {
+            int(expert["expert_id"])
+            for expert in self.active_experts
+        }
+        evaluated = 0
+        uncovered = 0
+        for member in candidate_members:
+            supports = {
+                int(expert_id): float(support)
+                for expert_id, support in member.get(
+                    "current_expert_supports", {}
+                ).items()
+                if int(expert_id) in active_ids
+            }
+            if not supports:
+                continue
+            evaluated += 1
+            if not any(
+                support >= support_threshold
+                for support in supports.values()
+            ):
+                uncovered += 1
+        if evaluated == 0:
+            return None, 0, 0
+        return float(uncovered / evaluated), uncovered, evaluated
+
+    def _expert_coverage_profiles(self):
+        active_ids = {
+            int(expert["expert_id"])
+            for expert in self.active_experts
+        }
+        profiles = {}
+        for expert in self.active_experts:
+            expert_id = int(expert["expert_id"])
+            observed = 0
+            covered = 0
+            unique = 0
+            redundant = 0
+            for record in self.coverage_history:
+                supports = record["supports"]
+                if expert_id not in supports:
+                    continue
+                observed += 1
+                threshold = float(record["support_threshold"])
+                if supports[expert_id] < threshold:
+                    continue
+                covered += 1
+                other_supported = any(
+                    int(other_id) in active_ids
+                    and int(other_id) != expert_id
+                    and float(other_support) >= threshold
+                    for other_id, other_support in supports.items()
+                )
+                if other_supported:
+                    redundant += 1
+                else:
+                    unique += 1
+            profiles[expert_id] = {
+                "observed_count": int(observed),
+                "covered_count": int(covered),
+                "unique_count": int(unique),
+                "redundant_count": int(redundant),
+                "coverage_fraction": (
+                    float(covered / observed) if observed else 0.0
+                ),
+                "unique_fraction": (
+                    float(unique / observed) if observed else 1.0
+                ),
+                "redundant_fraction": (
+                    float(redundant / observed) if observed else 0.0
+                ),
+            }
+        return profiles
+
+    def _select_budget_replacement(
+        self,
+        candidate_members,
+        support_threshold,
+        admission_route,
+    ):
+        if admission_route == "legacy":
+            replacement_enabled = self.legacy_budget_replacement
+        elif admission_route.startswith("photometric_drift"):
+            replacement_enabled = self.photometric_budget_replacement
+        else:
+            replacement_enabled = False
+        evaluation = {
+            "admission_route": admission_route,
+            "replacement_enabled": bool(replacement_enabled),
+            "minimum_new_coverage_fraction": float(
+                self.budget_min_new_coverage_fraction
+            ),
+            "replacement_margin": float(self.budget_replacement_margin),
+        }
+        if not replacement_enabled:
+            evaluation["outcome"] = "replacement_disabled"
+            self.last_budget_replacement_evaluation = evaluation
+            return None, None
+
+        (
+            new_coverage_fraction,
+            new_coverage_count,
+            candidate_observation_count,
+        ) = self._candidate_new_coverage_fraction(
+            candidate_members,
+            support_threshold,
+        )
+        evaluation.update(
+            {
+                "new_coverage_fraction": new_coverage_fraction,
+                "new_coverage_count": int(new_coverage_count),
+                "candidate_observation_count": int(
+                    candidate_observation_count
+                ),
+            }
+        )
+        if new_coverage_fraction is None:
+            evaluation["outcome"] = "missing_candidate_support"
+            self.last_budget_replacement_evaluation = evaluation
+            return None, None
+        if (
+            new_coverage_fraction < self.budget_min_new_coverage_fraction
+        ):
+            evaluation["outcome"] = "insufficient_new_coverage"
+            self.last_budget_replacement_evaluation = evaluation
+            return None, None
+
+        coverage_profiles = self._expert_coverage_profiles()
+        eligible = []
+        for expert in self.active_experts:
+            expert_id = int(expert["expert_id"])
+            profile = coverage_profiles[expert_id]
+            is_dormant = (
+                expert.get("lifecycle_state", "active") == "dormant"
+            )
+            if (
+                not is_dormant
+                and
+                new_coverage_fraction
+                <= profile["unique_fraction"]
+                + self.budget_replacement_margin
+            ):
+                continue
+            eligible.append((expert, profile))
+        if not eligible:
+            evaluation["outcome"] = "no_redundant_victim"
+            evaluation["expert_coverage_profiles"] = coverage_profiles
+            self.last_budget_replacement_evaluation = evaluation
+            return None, None
+
+        victim, victim_profile = min(
+            eligible,
+            key=lambda item: (
+                item[0].get("lifecycle_state", "active") != "dormant",
+                item[1]["unique_fraction"],
+                -item[1]["redundant_fraction"],
+                item[1]["coverage_fraction"],
+                int(item[0]["support_count"]),
+                int(item[0]["last_supported_step"]),
+                int(item[0]["admission_step"]),
+            ),
+        )
+        evaluation.update(
+            {
+                "outcome": "accepted",
+                "victim_expert_id": int(victim["expert_id"]),
+                "victim_coverage": dict(victim_profile),
+                "victim_lifecycle_state": victim.get(
+                    "lifecycle_state", "active"
+                ),
+            }
+        )
+        self.last_budget_replacement_evaluation = evaluation
+        return int(victim["expert_id"]), {
+            "admission_route": admission_route,
+            "new_coverage_fraction": float(new_coverage_fraction),
+            "new_coverage_count": int(new_coverage_count),
+            "candidate_observation_count": int(candidate_observation_count),
+            "victim_coverage": dict(victim_profile),
+            "victim_lifecycle_state": victim.get(
+                "lifecycle_state", "active"
+            ),
+        }
+
+    def _replace_budgeted_expert(self, expert_id, step, audit):
         expert = next(
             (
                 item
@@ -2073,7 +2492,8 @@ class DynamicExpertManager:
         ]
         expert["ttl"] = 0
         expert["deletion_step"] = int(step)
-        expert["last_event"] = "replaced_photometric_budget"
+        expert["last_event"] = "replaced_coverage_budget"
+        expert["lifecycle_state"] = "retired"
         cluster = self.clusters[expert["cluster_id"]]
         if cluster["active_expert_id"] == expert["expert_id"]:
             cluster["active_expert_id"] = None
@@ -2081,7 +2501,8 @@ class DynamicExpertManager:
         self.last_budget_replacement = {
             "expert_id": int(expert_id),
             "step": int(step),
-            "reason": "photometric_coverage_replacement",
+            "reason": "coverage_budget_replacement",
+            **dict(audit or {}),
         }
         return True
 
@@ -2091,25 +2512,27 @@ class DynamicExpertManager:
         step,
         cluster_members=None,
         admission_route="new_distribution",
-        replacement_expert_id=None,
+        support_threshold=None,
     ):
+        cluster_members = list(cluster_members or [member])
         if len(self.active_experts) >= self.committee_cap:
-            can_replace = bool(
-                (
-                    self.photometric_candidate_enabled
-                    or self.photometric_relevant_history_enabled
+            replacement_expert_id, replacement_audit = (
+                self._select_budget_replacement(
+                    cluster_members,
+                    support_threshold,
+                    admission_route,
                 )
-                and self.photometric_budget_replacement
-                and admission_route.startswith("photometric_drift")
-                and replacement_expert_id is not None
             )
-            if not can_replace or not self._replace_budgeted_expert(
-                replacement_expert_id,
-                step,
+            if (
+                replacement_expert_id is None
+                or not self._replace_budgeted_expert(
+                    replacement_expert_id,
+                    step,
+                    replacement_audit,
+                )
             ):
                 return None, None
 
-        cluster_members = list(cluster_members or [member])
         cluster_id = len(self.clusters)
         self.clusters.append(
             {
@@ -2133,6 +2556,7 @@ class DynamicExpertManager:
             "ttl": self.base_ttl,
             "deletion_step": None,
             "last_event": "admitted",
+            "lifecycle_state": "active",
             "last_channel_support": None,
             "representative_mode": self.representative_mode,
             "admission_ttl_mode": self.admission_ttl_mode,
@@ -2170,6 +2594,8 @@ class DynamicExpertManager:
         photometric_trigger_expert_id=None,
         photometric_trigger_lab_center=None,
         historical_ms_threshold=None,
+        current_expert_supports=None,
+        support_threshold=None,
     ):
         self.last_novel_quarantine_event = None
         if self.novel_admission_mode not in {
@@ -2199,6 +2625,7 @@ class DynamicExpertManager:
                 or "new_distribution"
             ),
             historical_ms_threshold=historical_ms_threshold,
+            current_expert_supports=current_expert_supports,
         )
         fixed_scale_photometric = bool(
             (
@@ -2581,11 +3008,7 @@ class DynamicExpertManager:
                         else [representative]
                     ),
                     admission_route=f"{pool_route}_channel_gate",
-                    replacement_expert_id=(
-                        pool_trigger_expert_id
-                        if pool_route == "photometric_drift"
-                        else None
-                    ),
+                    support_threshold=support_threshold,
                 )
                 self.last_novel_quarantine_event = {
                     "decision": (
@@ -2696,11 +3119,7 @@ class DynamicExpertManager:
                 if self.novel_admission_mode == "provisional"
                 else f"{pool_route}_quarantine"
             ),
-            replacement_expert_id=(
-                pool_trigger_expert_id
-                if pool_route == "photometric_drift"
-                else None
-            ),
+            support_threshold=support_threshold,
         )
         self.last_novel_quarantine_event = {
             "decision": "admitted" if expert_id is not None else "cap_rejected",
@@ -2833,6 +3252,7 @@ class DynamicExpertManager:
             lab_feature,
             candidate_route=(candidate_route or "history"),
             historical_ms_threshold=ms_threshold,
+            current_expert_supports=current_expert_supports,
         )
         if self.photometric_pool_abort_reason is not None:
             self._abort_photometric_quarantine(
@@ -2898,6 +3318,8 @@ class DynamicExpertManager:
                 photometric_trigger_expert_id,
                 photometric_trigger_lab_center,
                 historical_ms_threshold=ms_threshold,
+                current_expert_supports=current_expert_supports,
+                support_threshold=support_threshold,
             )
         )
         if (
@@ -3016,6 +3438,9 @@ class DynamicExpertManager:
                     support_threshold,
                 "candidate_route": candidate_route,
                 "provisional_channel_support": provisional_channel_support,
+                "current_expert_supports": self._normalized_expert_supports(
+                    current_expert_supports
+                ),
             }
         )
         # 更新 cluster 中心
@@ -3036,7 +3461,22 @@ class DynamicExpertManager:
             len(self.active_experts)
             >= self.committee_cap
         ):
-            return True, cluster_id, None, candidate_route
+            replacement_expert_id, replacement_audit = (
+                self._select_budget_replacement(
+                    cluster["members"],
+                    support_threshold,
+                    candidate_route,
+                )
+            )
+            if (
+                replacement_expert_id is None
+                or not self._replace_budgeted_expert(
+                    replacement_expert_id,
+                    step,
+                    replacement_audit,
+                )
+            ):
+                return True, cluster_id, None, candidate_route
 
         # 选择代表
         if self.representative_mode == "historical_quality":
@@ -3091,6 +3531,7 @@ class DynamicExpertManager:
             "ttl": patience,
             "deletion_step": None,
             "last_event": "admitted",
+            "lifecycle_state": "active",
             "last_channel_support": None,
             "representative_mode": self.representative_mode,
             "admission_ttl_mode": self.admission_ttl_mode,
@@ -3189,6 +3630,14 @@ class DynamicExpertManager:
             novel_support_threshold,
         ) = self._novel_thresholds()
         self.last_budget_replacement = None
+        self.last_budget_replacement_evaluation = None
+        self._record_coverage_observation(
+            step,
+            ms_score,
+            ms_threshold,
+            support_threshold,
+            current_expert_supports,
+        )
 
         (
             deleted_expert_ids,
@@ -3198,6 +3647,7 @@ class DynamicExpertManager:
                 step,
                 support_threshold,
                 expert_channel_supports,
+                current_expert_supports,
             )
         )
 
@@ -3256,8 +3706,8 @@ class DynamicExpertManager:
                 {
                     "step": int(step),
                     "expert_id": replaced_expert_id,
-                    "decision": "replaced_photometric_budget",
-                    "signal_decision": "replaced_photometric_budget",
+                    "decision": "replaced_coverage_budget",
+                    "signal_decision": "replaced_coverage_budget",
                     "deleted_this_step": True,
                     "alive_after": False,
                 }
@@ -3363,6 +3813,9 @@ class DynamicExpertManager:
             "novel_quarantine": self.last_novel_quarantine_event,
             "photometric_gate": self.last_photometric_gate,
             "budget_replacement": self.last_budget_replacement,
+            "budget_replacement_evaluation": (
+                self.last_budget_replacement_evaluation
+            ),
             "bootstrap": self.last_bootstrap_event,
             "cluster_id": cluster_id,
             "admitted_expert_id":
@@ -3375,6 +3828,10 @@ class DynamicExpertManager:
                 expert["expert_id"]
                 for expert
                 in self.active_experts
+                if expert.get("lifecycle_state", "active") == "active"
+            ],
+            "expert_slot_ids_after_step": [
+                expert["expert_id"] for expert in self.active_experts
             ],
         }      
 
