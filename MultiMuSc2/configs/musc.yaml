@@ -27,6 +27,10 @@ models:
     min_cluster_support: 2
     committee_cap: 5
     photometric_budget_replacement: true
+    photometric_budget_admission_mode: channel_only
+    photometric_history_reentry_enabled: false
+    photometric_history_reentry_members: 2
+    photometric_adaptive_candidate_evidence: false
     legacy_budget_replacement: true
     budget_coverage_window: 32
     budget_min_new_coverage_fraction: 0.5

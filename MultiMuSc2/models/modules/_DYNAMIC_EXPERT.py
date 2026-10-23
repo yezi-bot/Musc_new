@@ -67,7 +67,11 @@ class DynamicExpertManager:
     photometric_history_max=16,
     photometric_history_distance_threshold=3.0,
     photometric_dino_similarity_floor=0.9,
+    photometric_history_reentry_enabled=False,
+    photometric_history_reentry_members=2,
+    photometric_adaptive_candidate_evidence=False,
     photometric_budget_replacement=True,
+    photometric_budget_admission_mode="channel_only",
     legacy_budget_replacement=True,
     budget_coverage_window=32,
     budget_min_new_coverage_fraction=0.5,
@@ -272,6 +276,18 @@ class DynamicExpertManager:
             raise ValueError(
                 "photometric_dino_similarity_floor must be within [0, 1]"
             )
+      if photometric_history_reentry_members < 2:
+            raise ValueError(
+                "photometric_history_reentry_members must be at least 2"
+            )
+      if (
+            photometric_history_reentry_members
+            > photometric_dynamic_max_low_risk_members
+      ):
+            raise ValueError(
+                "photometric_history_reentry_members must not exceed "
+                "photometric_dynamic_max_low_risk_members"
+            )
       if budget_coverage_window < 1:
             raise ValueError("budget_coverage_window must be at least 1")
       if not 0.0 <= budget_min_new_coverage_fraction <= 1.0:
@@ -281,6 +297,14 @@ class DynamicExpertManager:
       if not 0.0 <= budget_replacement_margin <= 1.0:
             raise ValueError(
                 "budget_replacement_margin must be within [0, 1]"
+            )
+      if photometric_budget_admission_mode not in {
+            "channel_only",
+            "channel_or_lab",
+      }:
+            raise ValueError(
+                "photometric_budget_admission_mode must be channel_only "
+                "or channel_or_lab"
             )
       if not 0 <= minimum_active_experts <= committee_cap:
             raise ValueError(
@@ -398,8 +422,20 @@ class DynamicExpertManager:
       self.photometric_dino_similarity_floor = float(
             photometric_dino_similarity_floor
       )
+      self.photometric_history_reentry_enabled = bool(
+            photometric_history_reentry_enabled
+      )
+      self.photometric_history_reentry_members = int(
+            photometric_history_reentry_members
+      )
+      self.photometric_adaptive_candidate_evidence = bool(
+            photometric_adaptive_candidate_evidence
+        )
       self.photometric_budget_replacement = bool(
             photometric_budget_replacement
+      )
+      self.photometric_budget_admission_mode = str(
+            photometric_budget_admission_mode
       )
       self.legacy_budget_replacement = bool(legacy_budget_replacement)
       self.budget_coverage_window = int(budget_coverage_window)
@@ -445,7 +481,10 @@ class DynamicExpertManager:
       self.photometric_episode_lab_center = None
       self.photometric_episode_start_step = None
       self.photometric_recovery_streak = 0
+      self.photometric_handled_lab_center = None
+      self.photometric_rearm_streak = 0
       self.photometric_pool_abort_reason = None
+      self.photometric_observed_states = []
       self.last_budget_replacement = None
       self.last_budget_replacement_evaluation = None
       self.coverage_history = []
@@ -1083,6 +1122,7 @@ class DynamicExpertManager:
         )
         return {
             "expert_id": int(expert["expert_id"]),
+            "current_lab_feature": feature.copy().tolist(),
             "lab_center": np.asarray(
                 state["center"],
                 dtype=np.float64,
@@ -1171,6 +1211,30 @@ class DynamicExpertManager:
             return False, self.photometric_episode_reference_expert_id
 
         expert_id = int(lab_drift_profile["expert_id"])
+        handled_distance = None
+        handled_state_blocked = False
+        if self.photometric_handled_lab_center is not None:
+            current_lab_feature = lab_drift_profile.get("current_lab_feature")
+            if current_lab_feature is not None:
+                handled_distance = self._lab_distances(
+                    np.asarray(current_lab_feature, dtype=np.float64),
+                    self.photometric_handled_lab_center,
+                )["total_distance"]
+                if (
+                    handled_distance
+                    > self.photometric_local_lab_distance_threshold
+                ):
+                    self.photometric_rearm_streak += 1
+                else:
+                    self.photometric_rearm_streak = 0
+                if (
+                    self.photometric_rearm_streak
+                    >= self.photometric_exit_confirm_steps
+                ):
+                    self.photometric_handled_lab_center = None
+                    self.photometric_rearm_streak = 0
+                else:
+                    handled_state_blocked = True
         robust_l = float(lab_drift_profile["l_ewma"]) >= max(
             float(lab_drift_profile["l_threshold"]),
             self.photometric_l_ewma_floor,
@@ -1228,6 +1292,7 @@ class DynamicExpertManager:
         gate_hit = bool(
             robust_shift
             and not pool_active
+            and not handled_state_blocked
             and (
                 self.photometric_gate_mode == "lab_confirmed"
                 or self.photometric_support_streak
@@ -1352,6 +1417,9 @@ class DynamicExpertManager:
             "recovery_streak": int(self.photometric_recovery_streak),
             "required_recovery_steps": self.photometric_exit_confirm_steps,
             "pool_abort_reason": self.photometric_pool_abort_reason,
+            "handled_state_blocked": handled_state_blocked,
+            "handled_state_distance": handled_distance,
+            "rearm_streak": int(self.photometric_rearm_streak),
         }
         return (
             triggered,
@@ -1369,8 +1437,41 @@ class DynamicExpertManager:
         self.photometric_episode_start_step = None
         self.photometric_recovery_streak = 0
 
+    def _finish_photometric_episode(self, handled_lab_center=None):
+        if (
+            self.photometric_episode_enabled
+            and self.last_novel_quarantine_event is not None
+        ):
+            self.last_novel_quarantine_event["episode_finished"] = True
+        if self.photometric_episode_enabled and handled_lab_center is not None:
+            self.photometric_handled_lab_center = np.asarray(
+                handled_lab_center,
+                dtype=np.float64,
+            ).copy()
+            self.photometric_rearm_streak = 0
+        self._reset_photometric_episode()
+
+    @staticmethod
+    def _photometric_pool_lab_center(pool):
+        features = [
+            np.asarray(member["lab_feature"], dtype=np.float64)
+            for member in pool
+            if member.get("lab_feature") is not None
+        ]
+        if not features:
+            return None
+        return np.median(np.stack(features, axis=0), axis=0)
+
     def _abort_photometric_quarantine(self, step, reason):
         pool = list(self.novel_quarantine or [])
+        handled_lab_center = self._photometric_pool_lab_center(
+            [
+                member
+                for member in pool
+                if member.get("historical_low_risk", False)
+            ]
+            or pool
+        )
         self.novel_quarantine = None
         self.novel_quarantine_route = None
         self.photometric_trigger_expert_id = None
@@ -1385,6 +1486,7 @@ class DynamicExpertManager:
             "route": "photometric_drift",
             "image_ids": [int(member["image_id"]) for member in pool],
         }
+        self._finish_photometric_episode(handled_lab_center)
 
     def _photometric_trigger_center(self, trigger_expert_id):
         expert = next(
@@ -1410,7 +1512,13 @@ class DynamicExpertManager:
         pool,
         trigger_expert_id,
         trigger_lab_center,
+        required_count=None,
     ):
+        required_count = int(
+            self.photometric_min_low_risk_members
+            if required_count is None
+            else required_count
+        )
         if trigger_lab_center is None:
             return {
                 "consistent": False,
@@ -1436,33 +1544,43 @@ class DynamicExpertManager:
                 normalized[:, None, :] - normalized[None, :, :],
                 axis=2,
             )
-            medoid_index = int(pairwise_distances.mean(axis=1).argmin())
-            local_distances = pairwise_distances[medoid_index]
-            required = int(
-                math.ceil(len(pool) * self.photometric_consistency_fraction)
-            )
-            lab_inlier_count = int(
-                np.sum(
-                    local_distances
-                    <= self.photometric_local_lab_distance_threshold
-                )
-            )
-
             embeddings = torch.stack(
                 [member["embedding"] for member in pool],
                 dim=0,
             )
             similarities = embeddings @ embeddings.T
-            dino_medoid_index = int(similarities.mean(dim=1).argmax())
-            dino_medoid_similarities = similarities[dino_medoid_index]
+            joint_neighbors = (
+                pairwise_distances
+                <= self.photometric_local_lab_distance_threshold
+            ) & (
+                similarities.detach().cpu().numpy()
+                >= self.photometric_dino_similarity_floor
+            )
+            joint_neighbor_counts = joint_neighbors.sum(axis=1)
+            center_index = int(joint_neighbor_counts.argmax())
+            selected_indices = np.flatnonzero(joint_neighbors[center_index])
+            lab_inlier_count = int(
+                np.sum(
+                    pairwise_distances[center_index]
+                    <= self.photometric_local_lab_distance_threshold
+                )
+            )
             dino_inlier_count = int(
                 torch.sum(
-                    dino_medoid_similarities
+                    similarities[center_index]
                     >= self.photometric_dino_similarity_floor
                 ).item()
             )
-
-            local_center = np.median(normalized, axis=0)
+            selected_normalized = normalized[selected_indices]
+            selected_features = np.stack(
+                [
+                    np.asarray(features[index], dtype=np.float64)
+                    for index in selected_indices
+                ],
+                axis=0,
+            )
+            local_center = np.median(selected_normalized, axis=0)
+            selected_lab_center = np.median(selected_features, axis=0)
             old_center = (
                 np.asarray(trigger_lab_center, dtype=np.float64)
                 / LAB_FEATURE_SCALES
@@ -1476,9 +1594,13 @@ class DynamicExpertManager:
             )
             consistent = bool(
                 separated
-                and lab_inlier_count >= required
-                and dino_inlier_count >= required
+                and len(selected_indices)
+                >= required_count
             )
+            selected_image_ids = [
+                int(pool[index]["image_id"])
+                for index in selected_indices
+            ]
             return {
                 "consistent": consistent,
                 "reason": (
@@ -1489,23 +1611,30 @@ class DynamicExpertManager:
                 "window_mode": self.photometric_candidate_window_mode,
                 "trigger_expert_id": int(trigger_expert_id),
                 "evaluated_member_count": len(pool),
-                "required_count": required,
+                "required_count": required_count,
                 "lab_inlier_count": lab_inlier_count,
                 "dino_inlier_count": dino_inlier_count,
+                "selected_inlier_count": len(selected_indices),
+                "selected_inlier_image_ids": selected_image_ids,
+                "selected_lab_center": selected_lab_center.tolist(),
                 "local_lab_distance_threshold": (
                     self.photometric_local_lab_distance_threshold
                 ),
-                "local_distance_max": float(local_distances.max()),
+                "dino_similarity_floor": (
+                    self.photometric_dino_similarity_floor
+                ),
+                "local_distance_max": float(
+                    pairwise_distances[center_index, selected_indices].max()
+                ),
                 "local_distance_median": float(
-                    np.median(local_distances)
+                    np.median(
+                        pairwise_distances[center_index, selected_indices]
+                    )
                 ),
                 "l_separation": l_separation,
                 "ab_separation": ab_separation,
-                "selected_lab_medoid_image_id": int(
-                    pool[medoid_index]["image_id"]
-                ),
-                "selected_dino_medoid_image_id": int(
-                    pool[dino_medoid_index]["image_id"]
+                "selected_joint_center_image_id": int(
+                    pool[center_index]["image_id"]
                 ),
             }
 
@@ -2227,15 +2356,22 @@ class DynamicExpertManager:
             ),
         }
 
-    def _select_irbank_members(self, pool):
+    def _select_irbank_members(self, pool, min_keep=1):
         eligible = [
             member for member in pool if member.get("memory_patch_ids")
         ]
         if not eligible:
             return []
-        keep = max(
-            1,
-            int(math.ceil(len(eligible) * self.novel_memory_keep_fraction)),
+        keep = min(
+            len(eligible),
+            max(
+                int(min_keep),
+                int(
+                    math.ceil(
+                        len(eligible) * self.novel_memory_keep_fraction
+                    )
+                ),
+            ),
         )
         return sorted(
             eligible,
@@ -2316,6 +2452,111 @@ class DynamicExpertManager:
             return None, 0, 0
         return float(uncovered / evaluated), uncovered, evaluated
 
+    def _candidate_admission_evidence(
+        self,
+        candidate_members,
+        photometric_profile,
+        support_threshold,
+    ):
+        selected_ids = set(
+            int(image_id)
+            for image_id in photometric_profile.get(
+                "selected_inlier_image_ids", []
+            )
+        )
+        selected_members = [
+            member
+            for member in candidate_members
+            if int(member["image_id"]) in selected_ids
+        ]
+        (
+            new_coverage_fraction,
+            new_coverage_count,
+            evaluated_count,
+        ) = self._candidate_new_coverage_fraction(
+            selected_members,
+            support_threshold,
+        )
+        channel_novel = bool(
+            new_coverage_fraction is not None
+            and new_coverage_fraction
+            >= self.budget_min_new_coverage_fraction
+        )
+        has_reliable_patch_memory = bool(
+            len(selected_members) >= 2
+            and all(
+                member.get("memory_patch_ids")
+                for member in selected_members
+            )
+        )
+        history_match = self._retired_photometric_state_match(
+            selected_members
+        )
+        profile_consistent = bool(
+            photometric_profile.get("consistent", False)
+        )
+        strict_low_risk_count = sum(
+            bool(member.get("historical_low_risk", False))
+            for member in selected_members
+        )
+        if (
+            profile_consistent
+            and history_match.get("matched", False)
+            and strict_low_risk_count
+            >= self.photometric_history_reentry_members
+        ):
+            decision = "history_reentry"
+        elif (
+            profile_consistent
+            and channel_novel
+            and has_reliable_patch_memory
+        ):
+            decision = "new_scoring_expert"
+        elif (
+            profile_consistent
+            and new_coverage_fraction is not None
+            and not channel_novel
+        ):
+            decision = "photometric_state_only"
+        else:
+            decision = "keep_collecting"
+        return {
+            "decision": decision,
+            "selected_members": selected_members,
+            "history_match": history_match,
+            "profile_consistent": profile_consistent,
+            "channel_novel": channel_novel,
+            "has_reliable_patch_memory": has_reliable_patch_memory,
+            "new_coverage_fraction": new_coverage_fraction,
+            "new_coverage_count": int(new_coverage_count),
+            "candidate_observation_count": int(evaluated_count),
+            "strict_low_risk_count": strict_low_risk_count,
+        }
+
+    def _record_photometric_state(self, members, step):
+        lab_center = self._photometric_pool_lab_center(members)
+        if lab_center is None:
+            return None
+        embeddings = [
+            member["embedding"]
+            for member in members
+            if member.get("embedding") is not None
+        ]
+        dino_center = (
+            F.normalize(torch.stack(embeddings).sum(dim=0), dim=0)
+            if embeddings
+            else None
+        )
+        state = {
+            "lab_center": lab_center.copy(),
+            "dino_center": dino_center,
+            "last_seen_step": int(step),
+            "support_count": len(members),
+        }
+        self.photometric_observed_states.append(state)
+        del self.photometric_observed_states[:-self.photometric_history_max]
+        return state
+
     def _expert_coverage_profiles(self):
         active_ids = {
             int(expert["expert_id"])
@@ -2364,11 +2605,308 @@ class DynamicExpertManager:
             }
         return profiles
 
+    def _candidate_expert_lab_distance_audit(self, candidate_members):
+        candidate_center = self._photometric_pool_lab_center(
+            candidate_members
+        )
+        member_count = sum(
+            member.get("lab_feature") is not None
+            for member in candidate_members
+        )
+        audit = {
+            "candidate_lab_center": (
+                candidate_center.tolist()
+                if candidate_center is not None
+                else None
+            ),
+            "candidate_lab_member_count": int(member_count),
+            "expert_lab_distances": [],
+            "lab_distance_missing_expert_ids": [],
+            "nearest_lab_expert_id": None,
+            "nearest_lab_total_distance": None,
+        }
+        if candidate_center is None:
+            return audit
+
+        for expert in self.active_experts:
+            expert_id = int(expert["expert_id"])
+            lab_state = expert.get("lab_state")
+            if lab_state is None or lab_state.get("center") is None:
+                audit["lab_distance_missing_expert_ids"].append(
+                    expert_id
+                )
+                continue
+            distances = self._lab_distances(
+                candidate_center,
+                np.asarray(lab_state["center"], dtype=np.float64),
+            )
+            l_threshold = lab_state.get("l_threshold")
+            ab_threshold = lab_state.get("ab_threshold")
+            l_threshold = (
+                float(l_threshold) if l_threshold is not None else None
+            )
+            ab_threshold = (
+                float(ab_threshold) if ab_threshold is not None else None
+            )
+            l_novelty_threshold = (
+                max(l_threshold, self.photometric_l_ewma_floor)
+                if l_threshold is not None
+                else None
+            )
+            ab_novelty_threshold = (
+                max(ab_threshold, self.photometric_ab_ewma_floor)
+                if ab_threshold is not None
+                else None
+            )
+            audit["expert_lab_distances"].append(
+                {
+                    "expert_id": expert_id,
+                    "lifecycle_state": expert.get(
+                        "lifecycle_state", "active"
+                    ),
+                    "admission_route": expert.get(
+                        "admission_route", "legacy"
+                    ),
+                    "l_threshold": l_threshold,
+                    "ab_threshold": ab_threshold,
+                    "l_novelty_threshold": l_novelty_threshold,
+                    "ab_novelty_threshold": ab_novelty_threshold,
+                    "l_outside_baseline": (
+                        distances["l_distance"] > l_novelty_threshold
+                        if l_novelty_threshold is not None
+                        else None
+                    ),
+                    "ab_outside_baseline": (
+                        distances["ab_distance"] > ab_novelty_threshold
+                        if ab_novelty_threshold is not None
+                        else None
+                    ),
+                    **distances,
+                }
+            )
+
+        if audit["expert_lab_distances"]:
+            nearest = min(
+                audit["expert_lab_distances"],
+                key=lambda item: item["total_distance"],
+            )
+            audit["nearest_lab_expert_id"] = int(
+                nearest["expert_id"]
+            )
+            audit["nearest_lab_total_distance"] = float(
+                nearest["total_distance"]
+            )
+        return audit
+
+    def _retired_photometric_state_match(self, candidate_members):
+        audit = {
+            "enabled": self.photometric_history_reentry_enabled,
+            "required_count": self.photometric_history_reentry_members,
+            "candidate_member_count": len(candidate_members),
+            "matched": False,
+            "matched_retired_expert_id": None,
+            "matched_retired_cluster_id": None,
+            "retired_state_profiles": [],
+        }
+        if (
+            not self.photometric_history_reentry_enabled
+            or len(candidate_members)
+            < self.photometric_history_reentry_members
+        ):
+            return audit
+
+        candidate_center = self._photometric_pool_lab_center(
+            candidate_members
+        )
+        if candidate_center is None:
+            return audit
+        candidate_embedding = F.normalize(
+            torch.stack(
+                [member["embedding"] for member in candidate_members]
+            ).sum(dim=0),
+            dim=0,
+        )
+
+        matches = []
+        for expert in self.retired_experts:
+            lab_state = expert.get("lab_state")
+            cluster_id = int(expert["cluster_id"])
+            if (
+                lab_state is None
+                or lab_state.get("center") is None
+                or not 0 <= cluster_id < len(self.clusters)
+            ):
+                continue
+            cluster_embedding = F.normalize(
+                self.clusters[cluster_id]["embedding_sum"],
+                dim=0,
+            )
+            dino_similarity = float(
+                candidate_embedding @ cluster_embedding
+            )
+            distances = self._lab_distances(
+                candidate_center,
+                np.asarray(lab_state["center"], dtype=np.float64),
+            )
+            l_threshold = max(
+                float(lab_state.get("l_threshold") or 0.0),
+                self.photometric_l_ewma_floor,
+            )
+            ab_threshold = max(
+                float(lab_state.get("ab_threshold") or 0.0),
+                self.photometric_ab_ewma_floor,
+            )
+            l_relative = distances["l_distance"] / l_threshold
+            ab_relative = distances["ab_distance"] / ab_threshold
+            matched = bool(
+                l_relative <= 1.0
+                and ab_relative <= 1.0
+                and dino_similarity
+                >= self.photometric_dino_similarity_floor
+            )
+            profile = {
+                "expert_id": int(expert["expert_id"]),
+                "cluster_id": cluster_id,
+                "deletion_step": expert.get("deletion_step"),
+                "dino_similarity": dino_similarity,
+                "l_threshold": l_threshold,
+                "ab_threshold": ab_threshold,
+                "l_relative_distance": float(l_relative),
+                "ab_relative_distance": float(ab_relative),
+                "matched": matched,
+                **distances,
+            }
+            audit["retired_state_profiles"].append(profile)
+            if matched:
+                matches.append(profile)
+
+        if not matches:
+            return audit
+        best = min(
+            matches,
+            key=lambda item: (
+                max(
+                    item["l_relative_distance"],
+                    item["ab_relative_distance"],
+                ),
+                -item["dino_similarity"],
+                -int(item.get("deletion_step") or -1),
+            ),
+        )
+        audit.update(
+            {
+                "matched": True,
+                "matched_retired_expert_id": int(best["expert_id"]),
+                "matched_retired_cluster_id": int(best["cluster_id"]),
+                "matched_profile": dict(best),
+            }
+        )
+        return audit
+
+    def _candidate_lab_novelty(self, audit):
+        distances = list(audit.get("expert_lab_distances", []))
+        active_count = len(self.active_experts)
+        comparable_to_all = bool(
+            active_count
+            and len(distances) == active_count
+            and not audit.get("lab_distance_missing_expert_ids")
+        )
+        novel_to_all = bool(
+            comparable_to_all
+            and all(
+                item.get("l_outside_baseline") is True
+                or item.get("ab_outside_baseline") is True
+                for item in distances
+            )
+        )
+        return {
+            "lab_comparable_to_all_experts": comparable_to_all,
+            "lab_novel_to_all_experts": novel_to_all,
+        }
+
+    def _expert_lab_uniqueness_profiles(self):
+        profiles = {}
+        for expert in self.active_experts:
+            expert_id = int(expert["expert_id"])
+            state = expert.get("lab_state")
+            nearest = None
+            if state is not None and state.get("center") is not None:
+                center = np.asarray(state["center"], dtype=np.float64)
+                for other in self.active_experts:
+                    other_id = int(other["expert_id"])
+                    if other_id == expert_id:
+                        continue
+                    other_state = other.get("lab_state")
+                    if (
+                        other_state is None
+                        or other_state.get("center") is None
+                    ):
+                        continue
+                    distances = self._lab_distances(
+                        center,
+                        np.asarray(
+                            other_state["center"], dtype=np.float64
+                        ),
+                    )
+                    l_scale = max(
+                        float(state.get("l_threshold") or 0.0),
+                        float(other_state.get("l_threshold") or 0.0),
+                        self.photometric_l_ewma_floor,
+                    )
+                    ab_scale = max(
+                        float(state.get("ab_threshold") or 0.0),
+                        float(other_state.get("ab_threshold") or 0.0),
+                        self.photometric_ab_ewma_floor,
+                    )
+                    relative_distance = max(
+                        distances["l_distance"] / l_scale,
+                        distances["ab_distance"] / ab_scale,
+                    )
+                    item = {
+                        "expert_id": other_id,
+                        "relative_distance": float(relative_distance),
+                        **distances,
+                    }
+                    if (
+                        nearest is None
+                        or item["relative_distance"]
+                        < nearest["relative_distance"]
+                    ):
+                        nearest = item
+            profiles[expert_id] = {
+                "nearest_expert_id": (
+                    int(nearest["expert_id"])
+                    if nearest is not None
+                    else None
+                ),
+                "nearest_relative_distance": (
+                    float(nearest["relative_distance"])
+                    if nearest is not None
+                    else None
+                ),
+                "nearest_l_distance": (
+                    float(nearest["l_distance"])
+                    if nearest is not None
+                    else None
+                ),
+                "nearest_ab_distance": (
+                    float(nearest["ab_distance"])
+                    if nearest is not None
+                    else None
+                ),
+                "photometrically_redundant": bool(
+                    nearest is not None
+                    and nearest["relative_distance"] <= 1.0
+                ),
+            }
+        return profiles
+
     def _select_budget_replacement(
         self,
         candidate_members,
         support_threshold,
         admission_route,
+        candidate_evidence=None,
     ):
         if admission_route == "legacy":
             replacement_enabled = self.legacy_budget_replacement
@@ -2379,24 +2917,46 @@ class DynamicExpertManager:
         evaluation = {
             "admission_route": admission_route,
             "replacement_enabled": bool(replacement_enabled),
+            "photometric_budget_admission_mode": (
+                self.photometric_budget_admission_mode
+            ),
             "minimum_new_coverage_fraction": float(
                 self.budget_min_new_coverage_fraction
             ),
             "replacement_margin": float(self.budget_replacement_margin),
         }
+        photometric_route = admission_route.startswith("photometric_drift")
+        if photometric_route:
+            evaluation.update(
+                self._candidate_expert_lab_distance_audit(
+                    candidate_members
+                )
+            )
+            evaluation.update(self._candidate_lab_novelty(evaluation))
         if not replacement_enabled:
             evaluation["outcome"] = "replacement_disabled"
             self.last_budget_replacement_evaluation = evaluation
             return None, None
 
-        (
-            new_coverage_fraction,
-            new_coverage_count,
-            candidate_observation_count,
-        ) = self._candidate_new_coverage_fraction(
-            candidate_members,
-            support_threshold,
-        )
+        if candidate_evidence is None:
+            (
+                new_coverage_fraction,
+                new_coverage_count,
+                candidate_observation_count,
+            ) = self._candidate_new_coverage_fraction(
+                candidate_members,
+                support_threshold,
+            )
+        else:
+            new_coverage_fraction = candidate_evidence.get(
+                "new_coverage_fraction"
+            )
+            new_coverage_count = int(
+                candidate_evidence.get("new_coverage_count", 0)
+            )
+            candidate_observation_count = int(
+                candidate_evidence.get("candidate_observation_count", 0)
+            )
         evaluation.update(
             {
                 "new_coverage_fraction": new_coverage_fraction,
@@ -2406,69 +2966,148 @@ class DynamicExpertManager:
                 ),
             }
         )
-        if new_coverage_fraction is None:
+        channel_novel = bool(
+            new_coverage_fraction is not None
+            and new_coverage_fraction
+            >= self.budget_min_new_coverage_fraction
+        )
+        lab_novel = bool(
+            photometric_route
+            and self.photometric_budget_admission_mode == "channel_or_lab"
+            and evaluation.get("lab_novel_to_all_experts", False)
+        )
+        evaluation["channel_novel"] = channel_novel
+        evaluation["lab_novel"] = lab_novel
+        if channel_novel and lab_novel:
+            evaluation["candidate_admission_evidence"] = "channel_and_lab"
+        elif channel_novel:
+            evaluation["candidate_admission_evidence"] = "channel"
+        elif lab_novel:
+            evaluation["candidate_admission_evidence"] = "lab"
+        else:
+            evaluation["candidate_admission_evidence"] = None
+
+        if new_coverage_fraction is None and not lab_novel:
             evaluation["outcome"] = "missing_candidate_support"
             self.last_budget_replacement_evaluation = evaluation
             return None, None
-        if (
-            new_coverage_fraction < self.budget_min_new_coverage_fraction
-        ):
+        if not channel_novel and not lab_novel:
             evaluation["outcome"] = "insufficient_new_coverage"
             self.last_budget_replacement_evaluation = evaluation
             return None, None
 
         coverage_profiles = self._expert_coverage_profiles()
+        lab_uniqueness_profiles = self._expert_lab_uniqueness_profiles()
         eligible = []
         for expert in self.active_experts:
             expert_id = int(expert["expert_id"])
             profile = coverage_profiles[expert_id]
+            lab_profile = lab_uniqueness_profiles[expert_id]
             is_dormant = (
                 expert.get("lifecycle_state", "active") == "dormant"
             )
-            if (
-                not is_dormant
+            coverage_replaceable = bool(
+                new_coverage_fraction is not None
                 and
                 new_coverage_fraction
-                <= profile["unique_fraction"]
+                > profile["unique_fraction"]
                 + self.budget_replacement_margin
+            )
+            lab_only_replaceable = bool(
+                lab_novel
+                and not channel_novel
+                and lab_profile["photometrically_redundant"]
+                and profile["unique_fraction"]
+                <= self.budget_replacement_margin
+            )
+            if not (
+                is_dormant
+                or coverage_replaceable
+                or lab_only_replaceable
             ):
                 continue
-            eligible.append((expert, profile))
+            eligible.append(
+                (expert, profile, lab_profile)
+            )
         if not eligible:
             evaluation["outcome"] = "no_redundant_victim"
             evaluation["expert_coverage_profiles"] = coverage_profiles
+            evaluation["expert_lab_uniqueness_profiles"] = (
+                lab_uniqueness_profiles
+            )
             self.last_budget_replacement_evaluation = evaluation
             return None, None
 
-        victim, victim_profile = min(
-            eligible,
-            key=lambda item: (
-                item[0].get("lifecycle_state", "active") != "dormant",
-                item[1]["unique_fraction"],
-                -item[1]["redundant_fraction"],
-                item[1]["coverage_fraction"],
-                int(item[0]["support_count"]),
-                int(item[0]["last_supported_step"]),
-                int(item[0]["admission_step"]),
-            ),
+        lab_aware_replacement = bool(
+            photometric_route
+            and self.photometric_budget_admission_mode == "channel_or_lab"
         )
+        if lab_aware_replacement:
+            victim, victim_profile, victim_lab_profile = min(
+                eligible,
+                key=lambda item: (
+                    item[0].get("lifecycle_state", "active") != "dormant",
+                    not item[2]["photometrically_redundant"],
+                    item[1]["unique_fraction"],
+                    item[1]["coverage_fraction"],
+                    (
+                        item[2]["nearest_relative_distance"]
+                        if item[2]["nearest_relative_distance"] is not None
+                        else float("inf")
+                    ),
+                    -item[1]["redundant_fraction"],
+                    int(item[0]["support_count"]),
+                    int(item[0]["last_supported_step"]),
+                    int(item[0]["admission_step"]),
+                ),
+            )
+        else:
+            victim, victim_profile, victim_lab_profile = min(
+                eligible,
+                key=lambda item: (
+                    item[0].get("lifecycle_state", "active") != "dormant",
+                    item[1]["unique_fraction"],
+                    -item[1]["redundant_fraction"],
+                    item[1]["coverage_fraction"],
+                    int(item[0]["support_count"]),
+                    int(item[0]["last_supported_step"]),
+                    int(item[0]["admission_step"]),
+                ),
+            )
         evaluation.update(
             {
                 "outcome": "accepted",
                 "victim_expert_id": int(victim["expert_id"]),
                 "victim_coverage": dict(victim_profile),
+                "victim_lab_uniqueness": dict(victim_lab_profile),
                 "victim_lifecycle_state": victim.get(
                     "lifecycle_state", "active"
                 ),
+                "lab_aware_replacement": lab_aware_replacement,
+                "expert_coverage_profiles": coverage_profiles,
+                "expert_lab_uniqueness_profiles": lab_uniqueness_profiles,
             }
         )
         self.last_budget_replacement_evaluation = evaluation
         return int(victim["expert_id"]), {
             "admission_route": admission_route,
-            "new_coverage_fraction": float(new_coverage_fraction),
+            "candidate_admission_evidence": evaluation[
+                "candidate_admission_evidence"
+            ],
+            "replacement_reason": (
+                "lab_or_coverage_budget_replacement"
+                if lab_novel
+                else "coverage_budget_replacement"
+            ),
+            "new_coverage_fraction": (
+                float(new_coverage_fraction)
+                if new_coverage_fraction is not None
+                else None
+            ),
             "new_coverage_count": int(new_coverage_count),
             "candidate_observation_count": int(candidate_observation_count),
             "victim_coverage": dict(victim_profile),
+            "victim_lab_uniqueness": dict(victim_lab_profile),
             "victim_lifecycle_state": victim.get(
                 "lifecycle_state", "active"
             ),
@@ -2492,7 +3131,14 @@ class DynamicExpertManager:
         ]
         expert["ttl"] = 0
         expert["deletion_step"] = int(step)
-        expert["last_event"] = "replaced_coverage_budget"
+        replacement_reason = dict(audit or {}).get(
+            "replacement_reason", "coverage_budget_replacement"
+        )
+        expert["last_event"] = (
+            "replaced_coverage_budget"
+            if replacement_reason == "coverage_budget_replacement"
+            else "replaced_lab_or_coverage_budget"
+        )
         expert["lifecycle_state"] = "retired"
         cluster = self.clusters[expert["cluster_id"]]
         if cluster["active_expert_id"] == expert["expert_id"]:
@@ -2501,7 +3147,7 @@ class DynamicExpertManager:
         self.last_budget_replacement = {
             "expert_id": int(expert_id),
             "step": int(step),
-            "reason": "coverage_budget_replacement",
+            "reason": replacement_reason,
             **dict(audit or {}),
         }
         return True
@@ -2513,6 +3159,7 @@ class DynamicExpertManager:
         cluster_members=None,
         admission_route="new_distribution",
         support_threshold=None,
+        candidate_evidence=None,
     ):
         cluster_members = list(cluster_members or [member])
         if len(self.active_experts) >= self.committee_cap:
@@ -2521,6 +3168,7 @@ class DynamicExpertManager:
                     cluster_members,
                     support_threshold,
                     admission_route,
+                    candidate_evidence=candidate_evidence,
                 )
             )
             if (
@@ -2634,7 +3282,11 @@ class DynamicExpertManager:
             )
             and self.photometric_candidate_window_mode != "history"
         )
-        if fixed_scale_photometric and not member["historical_low_risk"]:
+        if (
+            fixed_scale_photometric
+            and not self.photometric_adaptive_candidate_evidence
+            and not member["historical_low_risk"]
+        ):
             if self.novel_quarantine is not None:
                 self.last_novel_quarantine_event = {
                     "decision": "waiting_low_risk",
@@ -2771,6 +3423,133 @@ class DynamicExpertManager:
             return None, None
 
         self.novel_quarantine.append(member)
+        photometric_required_count = self.photometric_min_low_risk_members
+        provisional_profile = None
+        history_reentry_match = None
+        adaptive_admission_evidence = None
+        adaptive_photometric = bool(
+            self.novel_quarantine_route == "photometric_drift"
+            and self.photometric_candidate_window_mode
+            == "dynamic_low_risk"
+            and self.photometric_adaptive_candidate_evidence
+        )
+        if adaptive_photometric:
+            eligible_members = [
+                item
+                for item in self.novel_quarantine
+                if item.get("memory_patch_ids")
+            ]
+            if len(eligible_members) >= 2:
+                provisional_profile = self._photometric_pool_profile(
+                    eligible_members,
+                    self.photometric_trigger_expert_id,
+                    self.photometric_trigger_lab_center,
+                    required_count=2,
+                )
+                adaptive_admission_evidence = (
+                    self._candidate_admission_evidence(
+                        eligible_members,
+                        provisional_profile,
+                        support_threshold,
+                    )
+                )
+                decision = adaptive_admission_evidence["decision"]
+                if decision == "history_reentry":
+                    photometric_required_count = 2
+                    history_reentry_match = adaptive_admission_evidence[
+                        "history_match"
+                    ]
+                    provisional_profile["history_reentry"] = dict(
+                        history_reentry_match
+                    )
+                elif decision == "new_scoring_expert":
+                    photometric_required_count = 2
+                elif decision == "photometric_state_only":
+                    selected_members = adaptive_admission_evidence[
+                        "selected_members"
+                    ]
+                    self._record_photometric_state(selected_members, step)
+                    pool = list(self.novel_quarantine)
+                    self.novel_quarantine = None
+                    self.novel_quarantine_route = None
+                    self.photometric_trigger_expert_id = None
+                    self.photometric_trigger_lab_center = None
+                    self.photometric_support_streak = 0
+                    self.last_novel_quarantine_event = {
+                        "decision": "recorded_photometric_state_only",
+                        "confirmation_reason": "existing_channel_coverage",
+                        "start_step": int(pool[0]["step"]),
+                        "end_step": int(step),
+                        "size": len(pool),
+                        "route": "photometric_drift",
+                        "created_full_expert": False,
+                        "photometric_profile": provisional_profile,
+                        "candidate_evidence": {
+                            key: value
+                            for key, value in adaptive_admission_evidence.items()
+                            if key != "selected_members"
+                        },
+                        "selected_image_ids": [
+                            int(item["image_id"])
+                            for item in selected_members
+                        ],
+                    }
+                    self._finish_photometric_episode(
+                        provisional_profile.get("selected_lab_center")
+                        or self._photometric_pool_lab_center(
+                            selected_members
+                        )
+                    )
+                    return None, None
+        if (
+            not adaptive_photometric
+            and
+            self.novel_quarantine_route == "photometric_drift"
+            and self.photometric_candidate_window_mode == "dynamic_low_risk"
+            and self.photometric_history_reentry_enabled
+        ):
+            early_low_risk_members = [
+                item
+                for item in self.novel_quarantine
+                if item.get("historical_low_risk", False)
+            ]
+            if (
+                len(early_low_risk_members)
+                >= self.photometric_history_reentry_members
+            ):
+                history_profile = self._photometric_pool_profile(
+                    early_low_risk_members,
+                    self.photometric_trigger_expert_id,
+                    self.photometric_trigger_lab_center,
+                    required_count=(
+                        self.photometric_history_reentry_members
+                    ),
+                )
+                if history_profile["consistent"]:
+                    selected_ids = set(
+                        int(image_id)
+                        for image_id in history_profile.get(
+                            "selected_inlier_image_ids", []
+                        )
+                    )
+                    selected_members = [
+                        item
+                        for item in early_low_risk_members
+                        if int(item["image_id"]) in selected_ids
+                    ]
+                    history_reentry_match = (
+                        self._retired_photometric_state_match(
+                            selected_members
+                        )
+                    )
+                    if history_reentry_match["matched"]:
+                        photometric_required_count = (
+                            self.photometric_history_reentry_members
+                        )
+                        history_profile["history_reentry"] = dict(
+                            history_reentry_match
+                        )
+                        provisional_profile = history_profile
         if self.novel_quarantine_route == "photometric_drift":
             if self.photometric_candidate_window_mode == "fixed_low_risk":
                 required_steps = self.photometric_fixed_low_risk_members
@@ -2779,8 +3558,18 @@ class DynamicExpertManager:
                 == "dynamic_low_risk"
             ):
                 required_steps = (
-                    self.photometric_dynamic_min_low_risk_members
+                    2
+                    if adaptive_photometric
+                    else self.photometric_dynamic_min_low_risk_members
                 )
+                if (
+                    not adaptive_photometric
+                    and self.photometric_history_reentry_enabled
+                ):
+                    required_steps = min(
+                        required_steps,
+                        self.photometric_history_reentry_members,
+                    )
             elif self.photometric_relevant_history_enabled:
                 required_steps = max(
                     self.photometric_min_low_risk_members,
@@ -2796,6 +3585,7 @@ class DynamicExpertManager:
                 "start_step": self.novel_quarantine[0]["step"],
                 "size": len(self.novel_quarantine),
                 "required_steps": required_steps,
+                "required_confirmed_members": photometric_required_count,
                 "route": self.novel_quarantine_route,
             }
             return None, None
@@ -2805,12 +3595,68 @@ class DynamicExpertManager:
             and self.photometric_candidate_window_mode
             == "dynamic_low_risk"
         ):
-            provisional_profile = self._photometric_pool_profile(
-                self.novel_quarantine,
-                self.photometric_trigger_expert_id,
-                self.photometric_trigger_lab_center,
-            )
+            if adaptive_photometric:
+                decision = (
+                    adaptive_admission_evidence.get("decision")
+                    if adaptive_admission_evidence is not None
+                    else "keep_collecting"
+                )
+                if (
+                    decision == "keep_collecting"
+                    and len(self.novel_quarantine)
+                    < self.photometric_dynamic_max_low_risk_members
+                ):
+                    self.last_novel_quarantine_event = {
+                        "decision": "collecting_adaptive_evidence",
+                        "start_step": int(
+                            self.novel_quarantine[0]["step"]
+                        ),
+                        "size": len(self.novel_quarantine),
+                        "required_steps": (
+                            self.photometric_dynamic_max_low_risk_members
+                        ),
+                        "required_confirmed_members": 2,
+                        "route": self.novel_quarantine_route,
+                        "photometric_profile": provisional_profile,
+                        "candidate_evidence": (
+                            {
+                                key: value
+                                for key, value in (
+                                    adaptive_admission_evidence or {}
+                                ).items()
+                                if key != "selected_members"
+                            }
+                        ),
+                    }
+                    return None, None
+            elif provisional_profile is None:
+                provisional_low_risk_members = [
+                    item
+                    for item in self.novel_quarantine
+                    if item.get("historical_low_risk", False)
+                ]
+                if (
+                    len(provisional_low_risk_members)
+                    >= photometric_required_count
+                ):
+                    provisional_profile = self._photometric_pool_profile(
+                        provisional_low_risk_members,
+                        self.photometric_trigger_expert_id,
+                        self.photometric_trigger_lab_center,
+                        required_count=photometric_required_count,
+                    )
+                else:
+                    provisional_profile = {
+                        "consistent": False,
+                        "reason": "insufficient_low_risk",
+                        "evaluated_member_count": len(
+                            provisional_low_risk_members
+                        ),
+                        "required_count": photometric_required_count,
+                    }
             if (
+                not adaptive_photometric
+                and
                 not provisional_profile["consistent"]
                 and len(self.novel_quarantine)
                 < self.photometric_dynamic_max_low_risk_members
@@ -2821,6 +3667,9 @@ class DynamicExpertManager:
                     "size": len(self.novel_quarantine),
                     "required_steps": (
                         self.photometric_dynamic_max_low_risk_members
+                    ),
+                    "required_confirmed_members": (
+                        photometric_required_count
                     ),
                     "route": self.novel_quarantine_route,
                     "photometric_profile": provisional_profile,
@@ -2855,15 +3704,50 @@ class DynamicExpertManager:
 
         photometric_profile = None
         photometric_low_risk_members = None
+        photometric_admission_members = None
         if pool_route == "photometric_drift":
             photometric_low_risk_members = [
                 member
                 for member in pool
                 if member.get("historical_low_risk", False)
             ]
-            if (
+            if adaptive_photometric:
+                if (
+                    adaptive_admission_evidence is None
+                    or adaptive_admission_evidence["decision"]
+                    == "keep_collecting"
+                ):
+                    self.photometric_support_streak = 0
+                    self.last_novel_quarantine_event = {
+                        "decision": "rejected_adaptive_evidence_timeout",
+                        "confirmation_reason": "insufficient_joint_evidence",
+                        "start_step": int(pool[0]["step"]),
+                        "end_step": int(step),
+                        "size": len(pool),
+                        "route": pool_route,
+                        "created_full_expert": False,
+                        "photometric_profile": provisional_profile,
+                        "candidate_evidence": (
+                            {
+                                key: value
+                                for key, value in (
+                                    adaptive_admission_evidence or {}
+                                ).items()
+                                if key != "selected_members"
+                            }
+                        ),
+                    }
+                    self._finish_photometric_episode(
+                        self._photometric_pool_lab_center(pool)
+                    )
+                    return None, None
+                photometric_profile = provisional_profile
+                photometric_admission_members = (
+                    adaptive_admission_evidence["selected_members"]
+                )
+            elif (
                 len(photometric_low_risk_members)
-                < self.photometric_min_low_risk_members
+                < photometric_required_count
             ):
                 self.photometric_support_streak = 0
                 self.last_novel_quarantine_event = {
@@ -2886,20 +3770,36 @@ class DynamicExpertManager:
                     },
                     "low_risk_count": len(photometric_low_risk_members),
                     "required_low_risk_count": (
-                        self.photometric_min_low_risk_members
+                        photometric_required_count
                     ),
                     "low_risk_image_ids": [
                         int(member["image_id"])
                         for member in photometric_low_risk_members
                     ],
                 }
+                self._finish_photometric_episode(
+                    self._photometric_pool_lab_center(
+                        photometric_low_risk_members or pool
+                    )
+                )
                 return None, None
-            photometric_profile = self._photometric_pool_profile(
-                photometric_low_risk_members,
-                pool_trigger_expert_id,
-                pool_trigger_lab_center,
-            )
-            if not photometric_profile["consistent"]:
+            if adaptive_photometric:
+                pass
+            elif provisional_profile is not None and provisional_profile.get(
+                "history_reentry", {}
+            ).get("matched", False):
+                photometric_profile = provisional_profile
+            else:
+                photometric_profile = self._photometric_pool_profile(
+                    photometric_low_risk_members,
+                    pool_trigger_expert_id,
+                    pool_trigger_lab_center,
+                    required_count=photometric_required_count,
+                )
+            if (
+                not adaptive_photometric
+                and not photometric_profile["consistent"]
+            ):
                 self.photometric_support_streak = 0
                 self.last_novel_quarantine_event = {
                     "decision": "rejected_photometric_inconsistent",
@@ -2914,18 +3814,40 @@ class DynamicExpertManager:
                         photometric_low_risk_members
                     ),
                     "required_low_risk_count": (
-                        self.photometric_min_low_risk_members
+                        photometric_required_count
                     ),
                     "low_risk_image_ids": [
                         int(member["image_id"])
                         for member in photometric_low_risk_members
                     ],
                 }
+                self._finish_photometric_episode(
+                    photometric_profile.get("selected_lab_center")
+                    or self._photometric_pool_lab_center(
+                        photometric_low_risk_members
+                    )
+                )
                 return None, None
+            if not adaptive_photometric:
+                selected_image_ids = set(
+                    int(image_id)
+                    for image_id in photometric_profile.get(
+                        "selected_inlier_image_ids",
+                        [
+                            int(member["image_id"])
+                            for member in photometric_low_risk_members
+                        ],
+                    )
+                )
+                photometric_admission_members = [
+                    member
+                    for member in photometric_low_risk_members
+                    if int(member["image_id"]) in selected_image_ids
+                ]
 
         admission_pool = (
-            photometric_low_risk_members
-            if photometric_low_risk_members is not None
+            photometric_admission_members
+            if photometric_admission_members is not None
             else pool
         )
         representative_candidates = (
@@ -2940,6 +3862,25 @@ class DynamicExpertManager:
             representative_candidates,
             key=lambda item: item["ms_short_score"],
         )
+        photometric_history_reentry = bool(
+            pool_route == "photometric_drift"
+            and photometric_profile is not None
+            and photometric_profile.get("history_reentry", {}).get(
+                "matched", False
+            )
+        )
+        admission_route_base = (
+            "photometric_drift_history_reentry"
+            if photometric_history_reentry
+            else "photometric_drift_adaptive_coverage"
+            if (
+                adaptive_photometric
+                and adaptive_admission_evidence is not None
+                and adaptive_admission_evidence["decision"]
+                == "new_scoring_expert"
+            )
+            else pool_route
+        )
         if self.novel_admission_mode in {
             "soft_confirmed",
             "channel_irbank",
@@ -2950,14 +3891,24 @@ class DynamicExpertManager:
                 "channel_gate",
             }:
                 representatives = self._select_irbank_members(
-                    photometric_low_risk_members
+                    admission_pool
                     if pool_route == "photometric_drift"
-                    else pool
+                    else pool,
+                    min_keep=(
+                        photometric_required_count
+                        if (
+                            pool_route == "photometric_drift"
+                            and self.photometric_candidate_window_mode
+                            != "history"
+                        )
+                        else 1
+                    ),
                 )
                 if (
                     pool_route == "photometric_drift"
                     and self.photometric_candidate_window_mode != "history"
-                    and len(representatives) < 2
+                    and len(representatives)
+                    < photometric_required_count
                 ):
                     representatives = []
             else:
@@ -2983,7 +3934,7 @@ class DynamicExpertManager:
                         else None
                     ),
                     "required_low_risk_count": (
-                        self.photometric_min_low_risk_members
+                        photometric_required_count
                         if pool_route == "photometric_drift"
                         else None
                     ),
@@ -2996,6 +3947,12 @@ class DynamicExpertManager:
                         else []
                     ),
                 }
+                if pool_route == "photometric_drift":
+                    self._finish_photometric_episode(
+                        photometric_profile.get("selected_lab_center")
+                        if photometric_profile is not None
+                        else self._photometric_pool_lab_center(admission_pool)
+                    )
                 return None, None
             if self.novel_admission_mode == "channel_gate":
                 representative = representatives[0]
@@ -3007,8 +3964,9 @@ class DynamicExpertManager:
                         if pool_route == "photometric_drift"
                         else [representative]
                     ),
-                    admission_route=f"{pool_route}_channel_gate",
+                    admission_route=f"{admission_route_base}_channel_gate",
                     support_threshold=support_threshold,
+                    candidate_evidence=adaptive_admission_evidence,
                 )
                 self.last_novel_quarantine_event = {
                     "decision": (
@@ -3031,6 +3989,21 @@ class DynamicExpertManager:
                         for member in representatives
                     ),
                     "route": pool_route,
+                    "confirmation_reason": (
+                        adaptive_admission_evidence["decision"]
+                        if adaptive_admission_evidence is not None
+                        else None
+                    ),
+                    "created_full_expert": expert_id is not None,
+                    "candidate_evidence": (
+                        {
+                            key: value
+                            for key, value in adaptive_admission_evidence.items()
+                            if key != "selected_members"
+                        }
+                        if adaptive_admission_evidence is not None
+                        else None
+                    ),
                     "photometric_profile": photometric_profile,
                     "low_risk_count": (
                         len(photometric_low_risk_members)
@@ -3038,7 +4011,7 @@ class DynamicExpertManager:
                         else None
                     ),
                     "required_low_risk_count": (
-                        self.photometric_min_low_risk_members
+                        photometric_required_count
                         if pool_route == "photometric_drift"
                         else None
                     ),
@@ -3054,6 +4027,11 @@ class DynamicExpertManager:
                 if pool_route == "photometric_drift":
                     self.photometric_armed_expert_id = None
                     self.photometric_support_streak = 0
+                    self._finish_photometric_episode(
+                        photometric_profile.get("selected_lab_center")
+                        if photometric_profile is not None
+                        else self._photometric_pool_lab_center(admission_pool)
+                    )
                 return cluster_id, expert_id
             self.confirmed_provisional = {
                 "members": representatives,
@@ -3092,7 +4070,7 @@ class DynamicExpertManager:
                     else None
                 ),
                 "required_low_risk_count": (
-                    self.photometric_min_low_risk_members
+                    photometric_required_count
                     if pool_route == "photometric_drift"
                     else None
                 ),
@@ -3105,6 +4083,12 @@ class DynamicExpertManager:
                     else []
                 ),
             }
+            if pool_route == "photometric_drift":
+                self._finish_photometric_episode(
+                    photometric_profile.get("selected_lab_center")
+                    if photometric_profile is not None
+                    else self._photometric_pool_lab_center(admission_pool)
+                )
             return None, None
         cluster_id, expert_id = self._admit_quarantined_member(
             representative,
@@ -3115,9 +4099,9 @@ class DynamicExpertManager:
                 else [representative]
             ),
             admission_route=(
-                f"{pool_route}_provisional"
+                f"{admission_route_base}_provisional"
                 if self.novel_admission_mode == "provisional"
-                else f"{pool_route}_quarantine"
+                else f"{admission_route_base}_quarantine"
             ),
             support_threshold=support_threshold,
         )
@@ -3137,7 +4121,7 @@ class DynamicExpertManager:
                 else None
             ),
             "required_low_risk_count": (
-                self.photometric_min_low_risk_members
+                photometric_required_count
                 if pool_route == "photometric_drift"
                 else None
             ),
@@ -3153,6 +4137,11 @@ class DynamicExpertManager:
         if pool_route == "photometric_drift":
             self.photometric_armed_expert_id = None
             self.photometric_support_streak = 0
+            self._finish_photometric_episode(
+                photometric_profile.get("selected_lab_center")
+                if photometric_profile is not None
+                else self._photometric_pool_lab_center(admission_pool)
+            )
         return cluster_id, expert_id
 
 

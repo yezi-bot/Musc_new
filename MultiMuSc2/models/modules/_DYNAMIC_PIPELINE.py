@@ -675,6 +675,7 @@ def build_dynamic_committee_timeline(
                 "memory_reliability_threshold": memory_reliability_threshold,
                 "candidate_route": event["candidate_route"],
                 "admission_route": event["admission_route"],
+                "support_threshold": event["support_threshold"],
                 "novel_quarantine": event["novel_quarantine"],
                 "photometric_gate": event["photometric_gate"],
                 "budget_replacement": event["budget_replacement"],

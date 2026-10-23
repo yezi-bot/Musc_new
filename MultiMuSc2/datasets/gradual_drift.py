@@ -376,11 +376,154 @@ def build_multistage_drift_schedule(
     return schedule
 
 
+def build_repeated_state_drift_schedule(
+    state_sequence=("a", "b", "c", "a", "b", "a", "b", "c"),
+    initial_plateau_steps=4,
+    transition_steps=2,
+    plateau_steps=4,
+    final_plateau_extra_steps=0,
+):
+    if initial_plateau_steps < 4:
+        raise ValueError("initial_plateau_steps must be at least 4")
+    if transition_steps < 1:
+        raise ValueError("transition_steps must be positive")
+    if plateau_steps < 3:
+        raise ValueError("plateau_steps must be at least 3")
+    if final_plateau_extra_steps < 0:
+        raise ValueError(
+            "final_plateau_extra_steps must be non-negative"
+        )
+    if len(state_sequence) < 2:
+        raise ValueError("state_sequence must contain at least two states")
+
+    state_lookup = {
+        state["state_id"]: state
+        for state in MULTISTAGE_PHOTOMETRIC_STATES
+        if state["state_id"] in {"a", "b", "c", "d"}
+    }
+    unknown_states = [
+        state_id
+        for state_id in state_sequence
+        if state_id not in state_lookup
+    ]
+    if unknown_states:
+        raise ValueError(
+            f"unknown photometric states: {sorted(set(unknown_states))}"
+        )
+
+    schedule = []
+    visit_counts = {}
+
+    def next_visit(state_id):
+        visit_counts[state_id] = visit_counts.get(state_id, 0) + 1
+        return visit_counts[state_id]
+
+    def append_state(
+        state,
+        phase,
+        segment_kind,
+        state_id,
+        state_visit,
+        is_revisit,
+        **extra,
+    ):
+        schedule.append(
+            {
+                "step": len(schedule),
+                "phase": phase,
+                "segment_id": phase,
+                "segment_kind": segment_kind,
+                "state_id": state_id,
+                "state_visit": int(state_visit),
+                "is_revisit": bool(is_revisit),
+                "severity": _photometric_severity(state),
+                "brightness": float(state["brightness"]),
+                "contrast": float(state["contrast"]),
+                "saturation": float(state["saturation"]),
+                "hue": float(state["hue"]),
+                **extra,
+            }
+        )
+
+    initial_id = state_sequence[0]
+    initial = state_lookup[initial_id]
+    initial_visit = next_visit(initial_id)
+    initial_segment = f"state_{initial_id}_visit{initial_visit}"
+    for _ in range(initial_plateau_steps):
+        append_state(
+            initial,
+            initial_segment,
+            "plateau",
+            initial_id,
+            initial_visit,
+            False,
+        )
+
+    previous_id = initial_id
+    previous = initial
+    previous_visit = initial_visit
+    remaining_state_ids = tuple(state_sequence[1:])
+    for target_index, target_id in enumerate(remaining_state_ids):
+        target = state_lookup[target_id]
+        target_visit = next_visit(target_id)
+        target_is_revisit = target_visit > 1
+        transition_id = (
+            f"transition_{previous_id}_visit{previous_visit}"
+            f"_to_{target_id}_visit{target_visit}"
+        )
+        for offset in range(1, transition_steps + 1):
+            fraction = offset / float(transition_steps + 1)
+            interpolated = {
+                key: (
+                    float(previous[key])
+                    + fraction * (float(target[key]) - float(previous[key]))
+                )
+                for key in (
+                    "brightness",
+                    "contrast",
+                    "saturation",
+                    "hue",
+                )
+            }
+            append_state(
+                interpolated,
+                transition_id,
+                "transition",
+                target_id,
+                target_visit,
+                target_is_revisit,
+                from_state_id=previous_id,
+                from_state_visit=int(previous_visit),
+                to_state_id=target_id,
+                to_state_visit=int(target_visit),
+            )
+
+        plateau_id = f"state_{target_id}_visit{target_visit}"
+        target_plateau_steps = plateau_steps
+        if target_index == len(remaining_state_ids) - 1:
+            target_plateau_steps += final_plateau_extra_steps
+        for _ in range(target_plateau_steps):
+            append_state(
+                target,
+                plateau_id,
+                "plateau",
+                target_id,
+                target_visit,
+                target_is_revisit,
+            )
+        previous_id = target_id
+        previous = target
+        previous_visit = target_visit
+
+    return schedule
+
+
 def build_segment_balanced_stream_records(
     records,
     segment_sizes,
     anomaly_ratio,
     seed,
+    allow_reuse=False,
 ):
     if not 0.0 < anomaly_ratio < 1.0:
         raise ValueError("anomaly_ratio must be within (0, 1)")
@@ -412,16 +555,31 @@ def build_segment_balanced_stream_records(
 
     required_normal = sum(item[0] for item in segment_counts)
     required_anomaly = sum(item[1] for item in segment_counts)
-    if len(normal_records) < required_normal:
+    if not normal_records:
+        raise ValueError("no normal images available")
+    if not anomaly_records:
+        raise ValueError("no anomaly images available")
+    if len(normal_records) < required_normal and not allow_reuse:
         raise ValueError(
             f"not enough normal images: need {required_normal}, "
             f"found {len(normal_records)}"
         )
-    if len(anomaly_records) < required_anomaly:
+    if len(anomaly_records) < required_anomaly and not allow_reuse:
         raise ValueError(
             f"not enough anomaly images: need {required_anomaly}, "
             f"found {len(anomaly_records)}"
         )
+
+    def expand_pool(pool, required_count):
+        expanded = list(pool)
+        while len(expanded) < required_count:
+            cycle = list(pool)
+            generator.shuffle(cycle)
+            expanded.extend(cycle)
+        return expanded[:required_count]
+
+    normal_records = expand_pool(normal_records, required_normal)
+    anomaly_records = expand_pool(anomaly_records, required_anomaly)
 
     stream_records = []
     normal_offset = 0

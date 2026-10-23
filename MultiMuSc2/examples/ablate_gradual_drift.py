@@ -262,6 +262,28 @@ VARIANTS["photometric_multistage_cap2_replace"] = {
     "minimum_active_experts": 0,
     "lifecycle_mode": "dormant_replace",
 }
+VARIANTS["photometric_multistage_cap2_dual_replace"] = {
+    **VARIANTS["photometric_multistage_cap2_replace"],
+    "photometric_budget_admission_mode": "channel_or_lab",
+    "photometric_dynamic_min_low_risk_members": 3,
+    "photometric_min_low_risk_members": 3,
+}
+VARIANTS["photometric_multistage_cap2_dual_replace_fast_reentry"] = {
+    **VARIANTS["photometric_multistage_cap2_dual_replace"],
+    "photometric_dynamic_min_low_risk_members": 2,
+    "photometric_min_low_risk_members": 2,
+}
+VARIANTS["photometric_multistage_cap2_dual_replace_history_reentry"] = {
+    **VARIANTS["photometric_multistage_cap2_dual_replace"],
+    "photometric_history_reentry_enabled": True,
+    "photometric_history_reentry_members": 2,
+}
+VARIANTS["photometric_multistage_cap2_adaptive_evidence"] = {
+    **VARIANTS["photometric_multistage_cap2_dual_replace"],
+    "photometric_history_reentry_enabled": True,
+    "photometric_history_reentry_members": 2,
+    "photometric_adaptive_candidate_evidence": True,
+}
 
 PRIMARY_VARIANTS = [
     "cold_start_bootstrap",
@@ -348,6 +370,57 @@ def safe_auroc(labels, scores):
     return float(
         roc_auc_score(labels, scores)
     )
+
+
+def select_stream_source_records(
+    records,
+    data_root,
+    category,
+    normal_source="test-good",
+):
+    test_records = [tuple(record) for record in records]
+    test_normal_records = [
+        record for record in test_records if record[1] == "good"
+    ]
+    anomaly_records = [
+        record for record in test_records if record[1] != "good"
+    ]
+    train_normal_records = []
+    if normal_source in {"train-good", "test-and-train-good"}:
+        train_good_dir = (
+            Path(data_root).resolve() / category / "train" / "good"
+        )
+        if not train_good_dir.is_dir():
+            raise FileNotFoundError(
+                f"MVTec train/good directory not found: {train_good_dir}"
+            )
+        train_normal_records = [
+            (category, "good", str(image_path), None)
+            for image_path in sorted(train_good_dir.iterdir())
+            if image_path.is_file()
+        ]
+        if not train_normal_records:
+            raise ValueError(
+                f"no normal images found in {train_good_dir}"
+            )
+
+    if normal_source == "test-good":
+        normal_records = test_normal_records
+    elif normal_source == "train-good":
+        normal_records = train_normal_records
+    elif normal_source == "test-and-train-good":
+        normal_records = test_normal_records + train_normal_records
+    else:
+        raise ValueError(f"unknown normal_source: {normal_source}")
+
+    selected_records = normal_records + anomaly_records
+    return selected_records, {
+        "normal_source": normal_source,
+        "available_test_good_count": len(test_normal_records),
+        "available_train_good_count": len(train_normal_records),
+        "available_selected_good_count": len(normal_records),
+        "available_test_anomaly_count": len(anomaly_records),
+    }
 
 
 def configure_variant(
@@ -509,7 +582,9 @@ def configure_variant(
     committee["photometric_consistency_fraction"] = (
         args.photometric_consistency_fraction
     )
-    committee["photometric_min_low_risk_members"] = 2
+    committee["photometric_min_low_risk_members"] = int(
+        variant.get("photometric_min_low_risk_members", 2)
+    )
     committee["photometric_relevant_history_enabled"] = bool(
         variant.get("photometric_relevant_history_enabled", False)
     )
@@ -517,8 +592,20 @@ def configure_variant(
     committee["photometric_history_max"] = 16
     committee["photometric_history_distance_threshold"] = 3.0
     committee["photometric_dino_similarity_floor"] = 0.9
+    committee["photometric_history_reentry_enabled"] = bool(
+        variant.get("photometric_history_reentry_enabled", False)
+    )
+    committee["photometric_history_reentry_members"] = int(
+        variant.get("photometric_history_reentry_members", 2)
+    )
+    committee["photometric_adaptive_candidate_evidence"] = bool(
+        variant.get("photometric_adaptive_candidate_evidence", False)
+    )
     committee["photometric_budget_replacement"] = bool(
         variant.get("photometric_budget_replacement", True)
+    )
+    committee["photometric_budget_admission_mode"] = str(
+        variant.get("photometric_budget_admission_mode", "channel_only")
     )
     committee["legacy_budget_replacement"] = bool(
         variant.get(
@@ -1176,8 +1263,13 @@ def photometric_route_metrics(timeline):
     episode_end_steps = [
         int(record["step"])
         for record in timeline
-        if (record.get("photometric_gate") or {}).get(
-            "episode_ended", False
+        if (
+            (record.get("photometric_gate") or {}).get(
+                "episode_ended", False
+            )
+            or (record.get("novel_quarantine") or {}).get(
+                "episode_finished", False
+            )
         )
     ]
     abort_decisions = [
@@ -1404,6 +1496,10 @@ def expert_metrics(timeline, labels):
     budget_replacement_count = 0
     legacy_budget_replacement_count = 0
     photometric_budget_replacement_count = 0
+    channel_budget_admission_count = 0
+    lab_budget_admission_count = 0
+    channel_and_lab_budget_admission_count = 0
+    redundant_lab_victim_count = 0
     replacement_new_coverage_fractions = []
     replacement_victim_unique_fractions = []
     budget_replacement_attempt_count = 0
@@ -1413,6 +1509,9 @@ def expert_metrics(timeline, labels):
     final_expert_slots = 0
     dormant_transition_count = 0
     expert_reactivation_count = 0
+    history_reentry_admission_count = 0
+    adaptive_coverage_admission_count = 0
+    photometric_state_only_count = 0
 
     for record in timeline:
         active_after = record.get(
@@ -1439,6 +1538,11 @@ def expert_metrics(timeline, labels):
             expert_reactivation_count += int(
                 bool(event.get("reactivated_this_step", False))
             )
+        quarantine_event = record.get("novel_quarantine_event") or {}
+        photometric_state_only_count += int(
+            quarantine_event.get("decision")
+            == "recorded_photometric_state_only"
+        )
 
         deleted_ids = record.get(
             "deleted_expert_ids",
@@ -1455,6 +1559,13 @@ def expert_metrics(timeline, labels):
                 legacy_budget_replacement_count += 1
             elif route.startswith("photometric_drift"):
                 photometric_budget_replacement_count += 1
+            evidence = replacement.get("candidate_admission_evidence")
+            if evidence == "channel":
+                channel_budget_admission_count += 1
+            elif evidence == "lab":
+                lab_budget_admission_count += 1
+            elif evidence == "channel_and_lab":
+                channel_and_lab_budget_admission_count += 1
             if replacement.get("new_coverage_fraction") is not None:
                 replacement_new_coverage_fractions.append(
                     float(replacement["new_coverage_fraction"])
@@ -1464,6 +1575,10 @@ def expert_metrics(timeline, labels):
                 replacement_victim_unique_fractions.append(
                     float(victim_coverage["unique_fraction"])
                 )
+            victim_lab = replacement.get("victim_lab_uniqueness") or {}
+            redundant_lab_victim_count += int(
+                bool(victim_lab.get("photometrically_redundant", False))
+            )
         replacement_evaluation = (
             record.get("budget_replacement_evaluation") or {}
         )
@@ -1504,6 +1619,15 @@ def expert_metrics(timeline, labels):
 
         if admitted_expert is None:
             continue
+
+        if "history_reentry" in str(
+            admitted_expert.get("admission_route", "")
+        ):
+            history_reentry_admission_count += 1
+        if "adaptive_coverage" in str(
+            admitted_expert.get("admission_route", "")
+        ):
+            adaptive_coverage_admission_count += 1
 
         image_id = int(
             admitted_expert["image_id"]
@@ -1559,6 +1683,13 @@ def expert_metrics(timeline, labels):
         "final_expert_slots": final_expert_slots,
         "dormant_transition_count": dormant_transition_count,
         "expert_reactivation_count": expert_reactivation_count,
+        "history_reentry_admission_count": (
+            history_reentry_admission_count
+        ),
+        "adaptive_coverage_admission_count": (
+            adaptive_coverage_admission_count
+        ),
+        "photometric_state_only_count": photometric_state_only_count,
         "expert_admissions": (
             expert_admissions
         ),
@@ -1572,6 +1703,12 @@ def expert_metrics(timeline, labels):
         "photometric_budget_replacement_count": (
             photometric_budget_replacement_count
         ),
+        "channel_budget_admission_count": channel_budget_admission_count,
+        "lab_budget_admission_count": lab_budget_admission_count,
+        "channel_and_lab_budget_admission_count": (
+            channel_and_lab_budget_admission_count
+        ),
+        "redundant_lab_victim_count": redundant_lab_victim_count,
         "budget_replacement_new_coverage_fraction_median": (
             float(np.median(replacement_new_coverage_fractions))
             if replacement_new_coverage_fractions
@@ -2045,6 +2182,35 @@ def write_step_diagnostics(
                         "admitted_expert_id"
                     )
                 ),
+                "support_threshold": audit_record.get(
+                    "support_threshold"
+                ),
+                "current_expert_supports": json.dumps(
+                    audit_record.get("current_expert_supports", {}),
+                    ensure_ascii=False,
+                ),
+                "expert_lifecycle_events": json.dumps(
+                    audit_record.get("expert_lifecycle_events", []),
+                    ensure_ascii=False,
+                ),
+                "active_expert_ids_before": json.dumps(
+                    [
+                        expert["expert_id"]
+                        for expert in audit_record.get(
+                            "active_experts_before", []
+                        )
+                    ],
+                    ensure_ascii=False,
+                ),
+                "expert_slot_ids_before": json.dumps(
+                    [
+                        expert["expert_id"]
+                        for expert in audit_record.get(
+                            "expert_slots_before", []
+                        )
+                    ],
+                    ensure_ascii=False,
+                ),
                 "deleted_expert_ids": (
                     json.dumps(
                         deleted_ids,
@@ -2149,7 +2315,7 @@ def run_variant(
         else 1.0
     )
     run_output = (
-        Path(args.output_dir)
+        Path(args.output_dir).resolve()
         / args.category
         / drift_type
         / drift_level
@@ -2188,9 +2354,16 @@ def run_variant(
             "data_to_iterate"
         )
 
+    source_records, source_metadata = select_stream_source_records(
+        records=base_dataset.data_to_iterate,
+        data_root=args.data_root,
+        category=args.category,
+        normal_source=getattr(args, "normal_source", "test-good"),
+    )
+
     if schedule_override is None:
         stream_records = build_balanced_stream_records(
-            records=base_dataset.data_to_iterate,
+            records=source_records,
             total_steps=args.stream_samples,
             anomaly_ratio=args.anomaly_ratio,
             seed=seed,
@@ -2219,10 +2392,13 @@ def run_variant(
             else:
                 segment_sizes[-1] += 1
         stream_records = build_segment_balanced_stream_records(
-            records=base_dataset.data_to_iterate,
+            records=source_records,
             segment_sizes=segment_sizes,
             anomaly_ratio=args.anomaly_ratio,
             seed=seed,
+            allow_reuse=bool(
+                getattr(args, "allow_record_reuse", False)
+            ),
         )
 
     drift_dataset = GradualDriftDataset(
@@ -2327,6 +2503,7 @@ def run_variant(
 
     row = {
         "category": args.category,
+        **source_metadata,
         "drift_type": drift_type,
         "drift_level": drift_level,
         "drift_scale": drift_scale,
@@ -2337,6 +2514,16 @@ def run_variant(
         ),
         "anomaly_ratio": (
             args.anomaly_ratio
+        ),
+        "allow_record_reuse": bool(
+            getattr(args, "allow_record_reuse", False)
+        ),
+        "unique_source_image_count": len(
+            {str(record[2]) for record in stream_records}
+        ),
+        "reused_stream_record_count": (
+            len(stream_records)
+            - len({str(record[2]) for record in stream_records})
         ),
         "brightness_delta": (
             args.brightness_delta
@@ -2511,11 +2698,27 @@ def run_variant(
         "photometric_dino_similarity_floor": cfg["models"][
             "dynamic_committee"
         ].get("photometric_dino_similarity_floor"),
+        "photometric_history_reentry_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "photometric_history_reentry_enabled", False
+            )
+        ),
+        "photometric_history_reentry_members": cfg["models"][
+            "dynamic_committee"
+        ].get("photometric_history_reentry_members"),
+        "photometric_adaptive_candidate_evidence": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "photometric_adaptive_candidate_evidence", False
+            )
+        ),
         "photometric_budget_replacement": bool(
             cfg["models"]["dynamic_committee"].get(
                 "photometric_budget_replacement", True
             )
         ),
+        "photometric_budget_admission_mode": cfg["models"][
+            "dynamic_committee"
+        ].get("photometric_budget_admission_mode", "channel_only"),
         "drift_candidate_audit_enabled": bool(
             cfg["models"]["dynamic_committee"].get(
                 "drift_candidate_audit_enabled",

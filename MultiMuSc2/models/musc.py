@@ -719,9 +719,33 @@ class MuSc():
                                     'photometric_dino_similarity_floor', 0.9
                                 )
                             ),
+                            'photometric_history_reentry_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_history_reentry_enabled',
+                                    False,
+                                )
+                            ),
+                            'photometric_history_reentry_members': int(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_history_reentry_members',
+                                    2,
+                                )
+                            ),
+                            'photometric_adaptive_candidate_evidence': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_adaptive_candidate_evidence',
+                                    False,
+                                )
+                            ),
                             'photometric_budget_replacement': bool(
                                 self.dynamic_committee_cfg.get(
                                     'photometric_budget_replacement', True
+                                )
+                            ),
+                            'photometric_budget_admission_mode': str(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_budget_admission_mode',
+                                    'channel_only',
                                 )
                             ),
                             'legacy_budget_replacement': bool(
