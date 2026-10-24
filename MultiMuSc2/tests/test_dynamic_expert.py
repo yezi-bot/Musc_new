@@ -1287,7 +1287,11 @@ class DynamicExpertManagerTest(unittest.TestCase):
             manager.last_novel_quarantine_event["decision"],
             "recorded_photometric_state_only",
         )
-        self.assertEqual(len(manager.photometric_observed_states), 1)
+        self.assertEqual(len(manager.historical_states), 1)
+        self.assertEqual(
+            manager.historical_states[-1]["source_type"],
+            "photometric_only",
+        )
         self.assertEqual(len(manager.active_experts), 1)
 
     def test_relevant_lab_history_returns_limited_robust_suffix(self):
@@ -2158,6 +2162,7 @@ class DynamicExpertManagerTest(unittest.TestCase):
             photometric_min_low_risk_members=3,
             photometric_history_reentry_enabled=True,
             photometric_history_reentry_members=2,
+            photometric_adaptive_candidate_evidence=True,
             photometric_episode_enabled=True,
         )
 
@@ -2231,12 +2236,453 @@ class DynamicExpertManagerTest(unittest.TestCase):
             admitted["admission_route"],
             "photometric_drift_history_reentry_channel_gate",
         )
+        self.assertEqual(admitted["cluster_id"], 1)
+        self.assertEqual(admitted["reentry_from_expert_id"], 1)
+        self.assertEqual(len(manager.clusters), 2)
+        self.assertEqual(
+            manager.last_history_reentry_event["decision"],
+            "history_restored_free_slot",
+        )
         profile = manager.last_novel_quarantine_event["photometric_profile"]
         self.assertEqual(profile["required_count"], 2)
         self.assertTrue(profile["history_reentry"]["matched"])
         self.assertEqual(
             profile["history_reentry"]["matched_retired_expert_id"],
             1,
+        )
+
+    def test_history_reentry_reuses_cluster_and_swaps_at_full_budget(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            cold_start_lab_enabled=True,
+            novel_admission_mode="channel_gate",
+            photometric_candidate_enabled=True,
+            photometric_candidate_window_mode="dynamic_low_risk",
+            photometric_dynamic_min_low_risk_members=3,
+            photometric_dynamic_max_low_risk_members=6,
+            photometric_min_low_risk_members=3,
+            photometric_history_reentry_enabled=True,
+            photometric_history_reentry_members=2,
+            photometric_adaptive_candidate_evidence=True,
+            photometric_episode_enabled=True,
+        )
+
+        def member(step, value, features, supports):
+            return manager._quarantine_member(
+                step=step,
+                image_id=step,
+                dino_patch_features=features,
+                ms_score=0.1,
+                ms_short_score=0.1,
+                ms_short_ratio=0.8,
+                channel_support=0.2,
+                provisional_channel_support=0.5,
+                memory_patch_ids=[0],
+                lab_feature=torch.tensor(
+                    [value, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+                historical_ms_threshold=0.5,
+                current_expert_supports=supports,
+            )
+
+        state_a = member(0, 40.0, patch_features(1.0, 0.0), {})
+        state_b = member(1, 80.0, patch_features(0.0, 1.0), {})
+        state_c = member(2, 120.0, patch_features(-1.0, 0.0), {})
+        manager._admit_quarantined_member(
+            state_a,
+            0,
+            admission_route="photometric_drift_channel_gate",
+        )
+        manager._admit_quarantined_member(
+            state_b,
+            1,
+            admission_route="photometric_drift_channel_gate",
+        )
+        manager._replace_budgeted_expert(1, 2, {})
+        manager._admit_quarantined_member(
+            state_c,
+            2,
+            admission_route="photometric_drift_channel_gate",
+        )
+        manager.coverage_history = [
+            {
+                "step": 2,
+                "support_threshold": 0.5,
+                "supports": {0: 0.8, 2: 0.1},
+            }
+        ]
+        manager.photometric_episode_active = True
+        manager.photometric_episode_pending = False
+
+        admitted_id = None
+        for step, value in ((3, 80.0), (4, 81.0)):
+            current = member(
+                step,
+                value,
+                patch_features(0.0, 1.0),
+                {0: 0.1, 2: 0.1},
+            )
+            _, admitted_id = manager._advance_novel_quarantine(
+                step=step,
+                image_id=step,
+                dino_patch_features=patch_features(0.0, 1.0),
+                ms_score=current["ms_score"],
+                ms_short_score=current["ms_short_score"],
+                ms_short_ratio=current["ms_short_ratio"],
+                channel_support=current["channel_support"],
+                provisional_channel_support=current[
+                    "provisional_channel_support"
+                ],
+                trigger_route=("photometric_drift" if step == 3 else None),
+                memory_patch_ids=current["memory_patch_ids"],
+                lab_feature=torch.tensor(current["lab_feature"]),
+                photometric_trigger_expert_id=0,
+                photometric_trigger_lab_center=[
+                    40.0, 2.0, 1.0, 3.0, 2.0, 4.0
+                ],
+                historical_ms_threshold=0.5,
+                current_expert_supports={0: 0.1, 2: 0.1},
+                support_threshold=0.5,
+            )
+
+        self.assertEqual(admitted_id, 3)
+        restored = next(
+            expert
+            for expert in manager.active_experts
+            if expert["expert_id"] == admitted_id
+        )
+        self.assertEqual(restored["cluster_id"], 1)
+        self.assertEqual(restored["reentry_from_expert_id"], 1)
+        self.assertEqual(len(manager.clusters), 3)
+        self.assertEqual(len(manager.active_experts), 2)
+        self.assertEqual(
+            {expert["expert_id"] for expert in manager.active_experts},
+            {0, 3},
+        )
+        self.assertEqual(
+            manager.last_history_reentry_event["decision"],
+            "history_restored_by_replacement",
+        )
+        self.assertEqual(
+            manager.last_history_reentry_event["victim_expert_id"],
+            2,
+        )
+        self.assertEqual(
+            manager.last_budget_replacement["reason"],
+            "history_reentry_swap",
+        )
+
+    def test_history_reentry_skips_restore_when_current_expert_covers_state(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            cold_start_lab_enabled=True,
+            novel_admission_mode="channel_gate",
+            photometric_candidate_enabled=True,
+            photometric_candidate_window_mode="dynamic_low_risk",
+            photometric_dynamic_min_low_risk_members=3,
+            photometric_dynamic_max_low_risk_members=6,
+            photometric_min_low_risk_members=3,
+            photometric_history_reentry_enabled=True,
+            photometric_history_reentry_members=2,
+            photometric_adaptive_candidate_evidence=True,
+            photometric_episode_enabled=True,
+        )
+
+        def member(step, value, features, supports):
+            return manager._quarantine_member(
+                step=step,
+                image_id=step,
+                dino_patch_features=features,
+                ms_score=0.1,
+                ms_short_score=0.1,
+                ms_short_ratio=0.8,
+                channel_support=0.2,
+                provisional_channel_support=0.5,
+                memory_patch_ids=[0],
+                lab_feature=torch.tensor(
+                    [value, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+                historical_ms_threshold=0.5,
+                current_expert_supports=supports,
+            )
+
+        state_a = member(0, 40.0, patch_features(1.0, 0.0), {})
+        state_b = member(1, 80.0, patch_features(0.0, 1.0), {})
+        manager._admit_quarantined_member(
+            state_a,
+            0,
+            admission_route="photometric_drift_channel_gate",
+        )
+        manager._admit_quarantined_member(
+            state_b,
+            1,
+            admission_route="photometric_drift_channel_gate",
+        )
+        manager._replace_budgeted_expert(1, 2, {})
+        manager.photometric_episode_active = True
+        manager.photometric_episode_pending = False
+
+        admitted_id = None
+        for step, value in ((3, 80.0), (4, 81.0)):
+            current = member(
+                step,
+                value,
+                patch_features(0.0, 1.0),
+                {0: 0.8},
+            )
+            _, admitted_id = manager._advance_novel_quarantine(
+                step=step,
+                image_id=step,
+                dino_patch_features=patch_features(0.0, 1.0),
+                ms_score=current["ms_score"],
+                ms_short_score=current["ms_short_score"],
+                ms_short_ratio=current["ms_short_ratio"],
+                channel_support=current["channel_support"],
+                provisional_channel_support=current[
+                    "provisional_channel_support"
+                ],
+                trigger_route=("photometric_drift" if step == 3 else None),
+                memory_patch_ids=current["memory_patch_ids"],
+                lab_feature=torch.tensor(current["lab_feature"]),
+                photometric_trigger_expert_id=0,
+                photometric_trigger_lab_center=[
+                    40.0, 2.0, 1.0, 3.0, 2.0, 4.0
+                ],
+                historical_ms_threshold=0.5,
+                current_expert_supports={0: 0.8},
+                support_threshold=0.5,
+            )
+
+        self.assertIsNone(admitted_id)
+        self.assertEqual(len(manager.active_experts), 1)
+        self.assertEqual(
+            manager.last_history_reentry_event["decision"],
+            "history_shared_coverage",
+        )
+        self.assertIsNone(manager.clusters[1]["active_expert_id"])
+
+    def test_history_reentry_prefers_dormant_victim(self):
+        manager = DynamicExpertManager(committee_cap=2)
+        member_a = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.2,
+            provisional_channel_support=0.5,
+            memory_patch_ids=[0],
+            lab_feature=torch.tensor([40.0, 2.0, 1.0, 3.0, 2.0, 4.0]),
+            historical_ms_threshold=0.5,
+            current_expert_supports={},
+        )
+        member_b = manager._quarantine_member(
+            step=1,
+            image_id=1,
+            dino_patch_features=patch_features(0.0, 1.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.2,
+            provisional_channel_support=0.5,
+            memory_patch_ids=[0],
+            lab_feature=torch.tensor([80.0, 2.0, 1.0, 3.0, 2.0, 4.0]),
+            historical_ms_threshold=0.5,
+            current_expert_supports={},
+        )
+        manager._admit_quarantined_member(
+            member_a,
+            0,
+            admission_route="photometric_drift_channel_gate",
+        )
+        manager._admit_quarantined_member(
+            member_b,
+            1,
+            admission_route="photometric_drift_channel_gate",
+        )
+        manager.active_experts[1]["lifecycle_state"] = "dormant"
+        candidate = dict(member_a)
+        candidate["current_expert_supports"] = {0: 0.1}
+
+        victim_id, audit = manager._select_history_reentry_victim(
+            [candidate],
+            support_threshold=0.5,
+            admission_route="photometric_drift_history_reentry_channel_gate",
+        )
+
+        self.assertEqual(victim_id, 1)
+        self.assertEqual(audit["victim_lifecycle_state"], "dormant")
+
+    def test_photometric_only_state_is_matched_and_materialized(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            cold_start_lab_enabled=True,
+            photometric_history_reentry_enabled=True,
+            photometric_history_reentry_members=2,
+            photometric_adaptive_candidate_evidence=True,
+            photometric_budget_admission_mode="channel_or_lab",
+        )
+
+        def member(step, score=0.1):
+            return manager._quarantine_member(
+                step=step,
+                image_id=step,
+                dino_patch_features=patch_features(1.0, 0.0),
+                ms_score=score,
+                ms_short_score=score,
+                ms_short_ratio=0.8,
+                channel_support=0.2,
+                provisional_channel_support=0.5,
+                memory_patch_ids=[0],
+                lab_feature=torch.tensor(
+                    [60.0, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+                historical_ms_threshold=0.5,
+                current_expert_supports={},
+            )
+
+        manager._record_photometric_state([member(0)], step=0)
+        candidates = [member(1), member(2)]
+        match = manager._historical_state_match(candidates)
+
+        self.assertTrue(match["matched"])
+        self.assertEqual(match["matched_source_type"], "photometric_only")
+        cluster_id, expert_id = manager._activate_historical_state(
+            match,
+            candidates,
+            step=2,
+            support_threshold=0.5,
+            admission_route="photometric_drift_history_reentry_channel_gate",
+            candidate_evidence={
+                "history_match": match,
+                "new_coverage_fraction": None,
+                "new_coverage_count": 0,
+                "candidate_observation_count": 0,
+            },
+        )
+
+        self.assertEqual(cluster_id, 0)
+        self.assertEqual(expert_id, 0)
+        self.assertEqual(
+            manager.last_history_reentry_event["decision"],
+            "history_materialized_free_slot",
+        )
+        self.assertEqual(len(manager.historical_states), 1)
+        self.assertEqual(
+            manager.historical_states[0]["active_expert_id"],
+            expert_id,
+        )
+        self.assertTrue(manager.historical_states[0]["has_patch_memory"])
+
+    def test_history_joint_risk_allows_one_mild_member(self):
+        manager = DynamicExpertManager(
+            cold_start_lab_enabled=True,
+            photometric_history_reentry_enabled=True,
+            photometric_history_reentry_members=2,
+        )
+
+        def member(step, score):
+            return manager._quarantine_member(
+                step=step,
+                image_id=step,
+                dino_patch_features=patch_features(1.0, 0.0),
+                ms_score=score,
+                ms_short_score=score,
+                ms_short_ratio=0.8,
+                channel_support=0.2,
+                provisional_channel_support=0.5,
+                memory_patch_ids=[0],
+                lab_feature=torch.tensor(
+                    [60.0, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+                historical_ms_threshold=0.5,
+                current_expert_supports={},
+            )
+
+        manager._record_photometric_state([member(0, 0.1)], step=0)
+        candidates = [member(1, 0.1), member(2, 0.6)]
+        evidence = manager._candidate_admission_evidence(
+            candidates,
+            {
+                "consistent": True,
+                "selected_inlier_image_ids": [1, 2],
+            },
+            support_threshold=0.5,
+        )
+
+        self.assertEqual(evidence["strict_low_risk_count"], 1)
+        self.assertTrue(evidence["risk_profile"]["acceptable"])
+        self.assertEqual(evidence["decision"], "history_reentry")
+
+    def test_history_joint_risk_rejects_extreme_member(self):
+        manager = DynamicExpertManager(
+            cold_start_lab_enabled=True,
+            photometric_history_reentry_enabled=True,
+            photometric_history_reentry_members=2,
+        )
+
+        def member(step, score):
+            return manager._quarantine_member(
+                step=step,
+                image_id=step,
+                dino_patch_features=patch_features(1.0, 0.0),
+                ms_score=score,
+                ms_short_score=score,
+                ms_short_ratio=0.8,
+                channel_support=0.2,
+                provisional_channel_support=0.5,
+                memory_patch_ids=[0],
+                lab_feature=torch.tensor(
+                    [60.0, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+                historical_ms_threshold=0.5,
+                current_expert_supports={},
+            )
+
+        manager._record_photometric_state([member(0, 0.1)], step=0)
+        candidates = [member(1, 0.1), member(2, 1.1)]
+        evidence = manager._candidate_admission_evidence(
+            candidates,
+            {
+                "consistent": True,
+                "selected_inlier_image_ids": [1, 2],
+            },
+            support_threshold=0.5,
+        )
+
+        self.assertFalse(evidence["risk_profile"]["acceptable"])
+        self.assertEqual(evidence["decision"], "keep_collecting")
+
+    def test_historical_state_registry_is_bounded(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            photometric_history_max=4,
+            photometric_history_min=2,
+        )
+        for step in range(6):
+            member = manager._quarantine_member(
+                step=step,
+                image_id=step,
+                dino_patch_features=patch_features(1.0, 0.0),
+                ms_score=0.1,
+                ms_short_score=0.1,
+                ms_short_ratio=0.8,
+                channel_support=0.2,
+                provisional_channel_support=0.5,
+                memory_patch_ids=[0],
+                lab_feature=torch.tensor(
+                    [20.0 * step, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+                historical_ms_threshold=0.5,
+                current_expert_supports={},
+            )
+            manager._record_photometric_state([member], step=step)
+
+        self.assertEqual(len(manager.historical_states), 4)
+        self.assertEqual(
+            [state["last_seen_step"] for state in manager.historical_states],
+            [5, 4, 3, 2],
         )
 
     def test_photometric_handled_state_blocks_repeat_then_rearms(self):

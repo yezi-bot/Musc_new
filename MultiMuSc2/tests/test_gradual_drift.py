@@ -148,6 +148,120 @@ class GradualDriftLabAuditTest(unittest.TestCase):
             0.0,
         )
 
+    def test_expert_metrics_counts_photometric_state_only_from_timeline(self):
+        timeline = [
+            {
+                "active_experts_after": [],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": None,
+                "novel_quarantine": {
+                    "decision": "recorded_photometric_state_only"
+                },
+            }
+        ]
+
+        metrics = expert_metrics(timeline, labels=np.asarray([0]))
+
+        self.assertEqual(metrics["photometric_state_only_count"], 1)
+
+    def test_expert_metrics_counts_history_reentry_outcomes(self):
+        decisions = (
+            "history_shared_coverage",
+            "history_restored_free_slot",
+            "history_restored_by_replacement",
+            "history_materialized_free_slot",
+            "history_materialized_by_replacement",
+            "history_reentry_rejected",
+        )
+        timeline = [
+            {
+                "active_experts_after": [],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": None,
+                "history_reentry": {"decision": decision},
+                "historical_states": [{"state_id": 0}],
+            }
+            for decision in decisions
+        ]
+
+        metrics = expert_metrics(timeline, labels=np.zeros(len(timeline)))
+
+        self.assertEqual(metrics["history_shared_coverage_count"], 1)
+        self.assertEqual(metrics["history_restored_free_slot_count"], 1)
+        self.assertEqual(
+            metrics["history_restored_by_replacement_count"], 1
+        )
+        self.assertEqual(metrics["history_reentry_rejected_count"], 1)
+        self.assertEqual(metrics["history_materialized_free_slot_count"], 1)
+        self.assertEqual(
+            metrics["history_materialized_by_replacement_count"], 1
+        )
+        self.assertEqual(metrics["max_historical_state_count"], 1)
+
+    def test_expert_metrics_counts_polluted_expert_scoring_exposure(self):
+        clean_expert = {
+            "expert_id": 0,
+            "image_id": 0,
+            "admission_route": "bootstrap",
+        }
+        polluted_expert = {
+            "expert_id": 1,
+            "image_id": 1,
+            "admission_route": "photometric_drift",
+        }
+        timeline = [
+            {
+                "step": 0,
+                "active_experts_after": [clean_expert],
+                "expert_slots_after": [clean_expert],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": 0,
+            },
+            {
+                "step": 1,
+                "active_experts_after": [clean_expert, polluted_expert],
+                "expert_slots_after": [clean_expert, polluted_expert],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": 1,
+            },
+            *[
+                {
+                    "step": step,
+                    "active_experts_after": [
+                        clean_expert,
+                        polluted_expert,
+                    ],
+                    "expert_slots_after": [
+                        clean_expert,
+                        polluted_expert,
+                    ],
+                    "deleted_expert_ids": [],
+                    "admitted_expert_id": None,
+                }
+                for step in range(2, 5)
+            ],
+        ]
+        scoring = [
+            {"step": 0, "active_expert_ids": []},
+            {"step": 1, "active_expert_ids": [0, 1]},
+            {"step": 2, "active_expert_ids": [0, 1]},
+            {"step": 3, "active_expert_ids": [1]},
+            {"step": 3, "active_expert_ids": [0, 1]},
+            {"step": 4, "active_expert_ids": [0]},
+        ]
+
+        metrics = expert_metrics(
+            timeline,
+            labels=np.asarray([0, 1, 0, 1, 0]),
+            scoring=scoring,
+        )
+
+        self.assertEqual(metrics["polluted_expert_admissions"], 1)
+        self.assertEqual(metrics["polluted_expert_scoring_step_count"], 2)
+        self.assertEqual(
+            metrics["polluted_expert_future_anomaly_scoring_count"], 1
+        )
+
     def test_multistage_schedule_has_distinct_absolute_states(self):
         schedule = build_multistage_drift_schedule()
 

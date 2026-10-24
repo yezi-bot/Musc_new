@@ -682,6 +682,8 @@ def build_dynamic_committee_timeline(
                 "budget_replacement_evaluation": event[
                     "budget_replacement_evaluation"
                 ],
+                "history_reentry": event.get("history_reentry"),
+                "historical_states": event.get("historical_states", []),
                 "bootstrap": event["bootstrap"],
                 "lab_drift_profile": lab_drift_profile,
                 "drift_candidate_audit": drift_candidate_audit,

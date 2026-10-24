@@ -731,6 +731,18 @@ class MuSc():
                                     2,
                                 )
                             ),
+                            'photometric_history_median_risk_max': float(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_history_median_risk_max',
+                                    1.25,
+                                )
+                            ),
+                            'photometric_history_extreme_risk_max': float(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_history_extreme_risk_max',
+                                    2.0,
+                                )
+                            ),
                             'photometric_adaptive_candidate_evidence': bool(
                                 self.dynamic_committee_cfg.get(
                                     'photometric_adaptive_candidate_evidence',

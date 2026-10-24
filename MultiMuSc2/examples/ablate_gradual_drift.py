@@ -598,6 +598,12 @@ def configure_variant(
     committee["photometric_history_reentry_members"] = int(
         variant.get("photometric_history_reentry_members", 2)
     )
+    committee["photometric_history_median_risk_max"] = float(
+        variant.get("photometric_history_median_risk_max", 1.25)
+    )
+    committee["photometric_history_extreme_risk_max"] = float(
+        variant.get("photometric_history_extreme_risk_max", 2.0)
+    )
     committee["photometric_adaptive_candidate_evidence"] = bool(
         variant.get("photometric_adaptive_candidate_evidence", False)
     )
@@ -1478,7 +1484,7 @@ def phase_metrics(
     return result
 
 
-def expert_metrics(timeline, labels):
+def expert_metrics(timeline, labels, scoring=None):
     labels = np.asarray(labels)
 
     max_active_experts = 0
@@ -1487,6 +1493,8 @@ def expert_metrics(timeline, labels):
     expert_deletions = 0
     known_admission_sources = 0
     polluted_expert_admissions = 0
+    expert_source_labels = {}
+    expert_birth_steps = {}
     first_expert_admission_step = None
     first_expert_admission_route = None
     first_expert_image_id = None
@@ -1510,6 +1518,13 @@ def expert_metrics(timeline, labels):
     dormant_transition_count = 0
     expert_reactivation_count = 0
     history_reentry_admission_count = 0
+    history_shared_coverage_count = 0
+    history_restored_free_slot_count = 0
+    history_restored_by_replacement_count = 0
+    history_materialized_free_slot_count = 0
+    history_materialized_by_replacement_count = 0
+    history_reentry_rejected_count = 0
+    max_historical_state_count = 0
     adaptive_coverage_admission_count = 0
     photometric_state_only_count = 0
 
@@ -1529,6 +1544,13 @@ def expert_metrics(timeline, labels):
         expert_slots_after = record.get(
             "expert_slots_after", active_after
         )
+        record_step = int(record.get("step", 0))
+        for expert in expert_slots_after:
+            expert_id = int(expert["expert_id"])
+            image_id = int(expert["image_id"])
+            expert_birth_steps.setdefault(expert_id, record_step)
+            if 0 <= image_id < len(labels):
+                expert_source_labels[expert_id] = bool(labels[image_id])
         final_expert_slots = len(expert_slots_after)
         max_expert_slots = max(max_expert_slots, final_expert_slots)
         for event in record.get("expert_lifecycle_events", []):
@@ -1538,10 +1560,42 @@ def expert_metrics(timeline, labels):
             expert_reactivation_count += int(
                 bool(event.get("reactivated_this_step", False))
             )
-        quarantine_event = record.get("novel_quarantine_event") or {}
+        quarantine_event = (
+            record.get("novel_quarantine")
+            or record.get("novel_quarantine_event")
+            or {}
+        )
         photometric_state_only_count += int(
             quarantine_event.get("decision")
             == "recorded_photometric_state_only"
+        )
+        history_event = (
+            record.get("history_reentry")
+            or quarantine_event.get("history_reentry")
+            or {}
+        )
+        history_decision = history_event.get("decision")
+        history_shared_coverage_count += int(
+            history_decision == "history_shared_coverage"
+        )
+        history_restored_free_slot_count += int(
+            history_decision == "history_restored_free_slot"
+        )
+        history_restored_by_replacement_count += int(
+            history_decision == "history_restored_by_replacement"
+        )
+        history_materialized_free_slot_count += int(
+            history_decision == "history_materialized_free_slot"
+        )
+        history_materialized_by_replacement_count += int(
+            history_decision == "history_materialized_by_replacement"
+        )
+        history_reentry_rejected_count += int(
+            history_decision == "history_reentry_rejected"
+        )
+        max_historical_state_count = max(
+            max_historical_state_count,
+            len(record.get("historical_states", [])),
         )
 
         deleted_ids = record.get(
@@ -1671,6 +1725,44 @@ def expert_metrics(timeline, labels):
         if known_admission_sources > 0
         else None
     )
+    polluted_expert_scoring_step_count = None
+    polluted_expert_future_anomaly_scoring_count = None
+    if scoring is not None:
+        polluted_scoring_steps = set()
+        polluted_anomaly_steps = set()
+        polluted_expert_ids = {
+            expert_id
+            for expert_id, is_anomaly in expert_source_labels.items()
+            if is_anomaly
+        }
+        for scoring_index, scoring_record in enumerate(scoring):
+            scoring_step = int(
+                scoring_record.get("step", scoring_index)
+            )
+            participating_polluted_ids = {
+                int(expert_id)
+                for expert_id in scoring_record.get(
+                    "active_expert_ids", []
+                )
+                if (
+                    int(expert_id) in polluted_expert_ids
+                    and scoring_step
+                    > expert_birth_steps.get(int(expert_id), scoring_step)
+                )
+            }
+            if not participating_polluted_ids:
+                continue
+            polluted_scoring_steps.add(scoring_step)
+            if 0 <= scoring_step < len(labels) and bool(
+                labels[scoring_step]
+            ):
+                polluted_anomaly_steps.add(scoring_step)
+        polluted_expert_scoring_step_count = len(
+            polluted_scoring_steps
+        )
+        polluted_expert_future_anomaly_scoring_count = len(
+            polluted_anomaly_steps
+        )
 
     return {
         "max_active_experts": (
@@ -1686,6 +1778,21 @@ def expert_metrics(timeline, labels):
         "history_reentry_admission_count": (
             history_reentry_admission_count
         ),
+        "history_shared_coverage_count": history_shared_coverage_count,
+        "history_restored_free_slot_count": (
+            history_restored_free_slot_count
+        ),
+        "history_restored_by_replacement_count": (
+            history_restored_by_replacement_count
+        ),
+        "history_materialized_free_slot_count": (
+            history_materialized_free_slot_count
+        ),
+        "history_materialized_by_replacement_count": (
+            history_materialized_by_replacement_count
+        ),
+        "history_reentry_rejected_count": history_reentry_rejected_count,
+        "max_historical_state_count": max_historical_state_count,
         "adaptive_coverage_admission_count": (
             adaptive_coverage_admission_count
         ),
@@ -1758,6 +1865,12 @@ def expert_metrics(timeline, labels):
         ),
         "polluted_admission_fraction": (
             polluted_fraction
+        ),
+        "polluted_expert_scoring_step_count": (
+            polluted_expert_scoring_step_count
+        ),
+        "polluted_expert_future_anomaly_scoring_count": (
+            polluted_expert_future_anomaly_scoring_count
         ),
         "first_expert_admission_step": first_expert_admission_step,
         "first_expert_admission_route": first_expert_admission_route,
@@ -2748,6 +2861,7 @@ def run_variant(
         expert_metrics(
             timeline=timeline,
             labels=labels,
+            scoring=audit.get("scoring"),
         )
     )
 

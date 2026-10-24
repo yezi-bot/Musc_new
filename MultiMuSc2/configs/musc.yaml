@@ -30,6 +30,8 @@ models:
     photometric_budget_admission_mode: channel_only
     photometric_history_reentry_enabled: false
     photometric_history_reentry_members: 2
+    photometric_history_median_risk_max: 1.25
+    photometric_history_extreme_risk_max: 2.0
     photometric_adaptive_candidate_evidence: false
     legacy_budget_replacement: true
     budget_coverage_window: 32

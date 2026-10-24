@@ -69,6 +69,8 @@ class DynamicExpertManager:
     photometric_dino_similarity_floor=0.9,
     photometric_history_reentry_enabled=False,
     photometric_history_reentry_members=2,
+    photometric_history_median_risk_max=1.25,
+    photometric_history_extreme_risk_max=2.0,
     photometric_adaptive_candidate_evidence=False,
     photometric_budget_replacement=True,
     photometric_budget_admission_mode="channel_only",
@@ -268,6 +270,10 @@ class DynamicExpertManager:
             raise ValueError(
                 "photometric_history_max must be at least photometric_history_min"
             )
+      if photometric_history_max < committee_cap:
+            raise ValueError(
+                "photometric_history_max must be at least committee_cap"
+            )
       if photometric_history_distance_threshold <= 0.0:
             raise ValueError(
                 "photometric_history_distance_threshold must be positive"
@@ -287,6 +293,18 @@ class DynamicExpertManager:
             raise ValueError(
                 "photometric_history_reentry_members must not exceed "
                 "photometric_dynamic_max_low_risk_members"
+            )
+      if photometric_history_median_risk_max < 1.0:
+            raise ValueError(
+                "photometric_history_median_risk_max must be at least 1"
+            )
+      if (
+            photometric_history_extreme_risk_max
+            < photometric_history_median_risk_max
+      ):
+            raise ValueError(
+                "photometric_history_extreme_risk_max must be at least "
+                "photometric_history_median_risk_max"
             )
       if budget_coverage_window < 1:
             raise ValueError("budget_coverage_window must be at least 1")
@@ -428,6 +446,12 @@ class DynamicExpertManager:
       self.photometric_history_reentry_members = int(
             photometric_history_reentry_members
       )
+      self.photometric_history_median_risk_max = float(
+            photometric_history_median_risk_max
+      )
+      self.photometric_history_extreme_risk_max = float(
+            photometric_history_extreme_risk_max
+      )
       self.photometric_adaptive_candidate_evidence = bool(
             photometric_adaptive_candidate_evidence
         )
@@ -484,9 +508,11 @@ class DynamicExpertManager:
       self.photometric_handled_lab_center = None
       self.photometric_rearm_streak = 0
       self.photometric_pool_abort_reason = None
-      self.photometric_observed_states = []
+      self.historical_states = []
+      self.next_historical_state_id = 0
       self.last_budget_replacement = None
       self.last_budget_replacement_evaluation = None
+      self.last_history_reentry_event = None
       self.coverage_history = []
 
     def provisional_expert_before_step(self):
@@ -1051,6 +1077,11 @@ class DynamicExpertManager:
             "lab_state": self._build_lab_state(selected),
         }
         self.active_experts.append(expert)
+        self._register_expert_historical_state(
+            expert,
+            "active",
+            step,
+        )
         self.admitted_count += 1
         self.next_expert_id += 1
         self.last_bootstrap_event = {
@@ -2260,6 +2291,11 @@ class DynamicExpertManager:
                     cluster["active_expert_id"] = None
 
                 self.retired_experts.append(expert)
+                self._register_expert_historical_state(
+                    expert,
+                    "retired",
+                    step,
+                )
                 deleted_expert_ids.append(expert_id)
             else:
                 survivors.append(expert)
@@ -2452,6 +2488,266 @@ class DynamicExpertManager:
             return None, 0, 0
         return float(uncovered / evaluated), uncovered, evaluated
 
+    def _historical_state_dino_center(self, cluster_id):
+        if cluster_id is None or not 0 <= int(cluster_id) < len(self.clusters):
+            return None
+        embedding_sum = self.clusters[int(cluster_id)].get("embedding_sum")
+        if embedding_sum is None or float(embedding_sum.norm()) == 0.0:
+            return None
+        return F.normalize(embedding_sum, dim=0).detach().cpu()
+
+    def _trim_historical_states(self):
+        if len(self.historical_states) <= self.photometric_history_max:
+            return
+        active = [
+            state
+            for state in self.historical_states
+            if state.get("active_expert_id") is not None
+        ]
+        inactive = sorted(
+            (
+                state
+                for state in self.historical_states
+                if state.get("active_expert_id") is None
+            ),
+            key=lambda state: (
+                int(state.get("last_seen_step", -1)),
+                int(state.get("support_count", 0)),
+            ),
+            reverse=True,
+        )
+        remaining = max(self.photometric_history_max - len(active), 0)
+        self.historical_states = active + inactive[:remaining]
+
+    def _upsert_historical_state(
+        self,
+        *,
+        source_type,
+        step,
+        lab_center,
+        dino_center,
+        support_count,
+        source_expert_id=None,
+        active_expert_id=None,
+        cluster_id=None,
+        l_threshold=None,
+        ab_threshold=None,
+        has_patch_memory=False,
+        state_id=None,
+        accumulate_support=False,
+    ):
+        if lab_center is None or dino_center is None:
+            return None
+        lab_center = np.asarray(lab_center, dtype=np.float64)
+        dino_center = F.normalize(dino_center.detach().cpu(), dim=0)
+        existing = None
+        if state_id is not None:
+            existing = next(
+                (
+                    state
+                    for state in self.historical_states
+                    if int(state["state_id"]) == int(state_id)
+                ),
+                None,
+            )
+        if existing is None and source_expert_id is not None:
+            existing = next(
+                (
+                    state
+                    for state in self.historical_states
+                    if state.get("source_expert_id") is not None
+                    and int(state["source_expert_id"])
+                    == int(source_expert_id)
+                ),
+                None,
+            )
+        if existing is None and source_type == "photometric_only":
+            for state in self.historical_states:
+                if state.get("source_type") != "photometric_only":
+                    continue
+                distances = self._lab_distances(
+                    lab_center,
+                    np.asarray(state["lab_center"], dtype=np.float64),
+                )
+                state_l_threshold = max(
+                    float(state.get("l_threshold") or 0.0),
+                    self.photometric_l_ewma_floor,
+                )
+                state_ab_threshold = max(
+                    float(state.get("ab_threshold") or 0.0),
+                    self.photometric_ab_ewma_floor,
+                )
+                similarity = float(dino_center @ state["dino_center"])
+                if (
+                    distances["l_distance"] <= state_l_threshold
+                    and distances["ab_distance"] <= state_ab_threshold
+                    and similarity >= self.photometric_dino_similarity_floor
+                ):
+                    existing = state
+                    break
+
+        values = {
+            "source_type": str(source_type),
+            "source_expert_id": (
+                int(source_expert_id)
+                if source_expert_id is not None
+                else None
+            ),
+            "active_expert_id": (
+                int(active_expert_id)
+                if active_expert_id is not None
+                else None
+            ),
+            "cluster_id": int(cluster_id) if cluster_id is not None else None,
+            "lab_center": lab_center.copy(),
+            "l_threshold": (
+                float(l_threshold) if l_threshold is not None else None
+            ),
+            "ab_threshold": (
+                float(ab_threshold) if ab_threshold is not None else None
+            ),
+            "dino_center": dino_center,
+            "has_patch_memory": bool(has_patch_memory),
+            "last_seen_step": int(step),
+        }
+        if existing is None:
+            existing = {
+                "state_id": int(self.next_historical_state_id),
+                "created_step": int(step),
+                "support_count": int(support_count),
+                **values,
+            }
+            self.next_historical_state_id += 1
+            self.historical_states.append(existing)
+        else:
+            previous_count = int(existing.get("support_count", 0))
+            existing.update(values)
+            existing["support_count"] = (
+                previous_count + int(support_count)
+                if accumulate_support
+                else max(previous_count, int(support_count))
+            )
+        self._trim_historical_states()
+        return existing
+
+    def _register_expert_historical_state(
+        self,
+        expert,
+        source_type,
+        step,
+        state_id=None,
+    ):
+        lab_state = expert.get("lab_state")
+        if lab_state is None or lab_state.get("center") is None:
+            return None
+        cluster_id = expert.get("cluster_id")
+        if state_id is None and cluster_id is not None:
+            cluster_state = next(
+                (
+                    state
+                    for state in self.historical_states
+                    if state.get("cluster_id") is not None
+                    and int(state["cluster_id"]) == int(cluster_id)
+                ),
+                None,
+            )
+            if cluster_state is not None:
+                state_id = int(cluster_state["state_id"])
+        dino_center = self._historical_state_dino_center(cluster_id)
+        return self._upsert_historical_state(
+            source_type=source_type,
+            step=step,
+            lab_center=lab_state["center"],
+            dino_center=dino_center,
+            support_count=expert.get("support_count", 0),
+            source_expert_id=expert.get("expert_id"),
+            active_expert_id=(
+                expert.get("expert_id") if source_type == "active" else None
+            ),
+            cluster_id=cluster_id,
+            l_threshold=lab_state.get("l_threshold"),
+            ab_threshold=lab_state.get("ab_threshold"),
+            has_patch_memory=(dino_center is not None),
+            state_id=state_id,
+        )
+
+    def _sync_historical_states(self, step=None):
+        sync_step = self.last_step if step is None else int(step)
+        for expert in self.active_experts:
+            self._register_expert_historical_state(
+                expert,
+                "active",
+                expert.get("last_supported_step", sync_step),
+            )
+        for expert in self.retired_experts:
+            cluster_id = int(expert["cluster_id"])
+            if (
+                0 <= cluster_id < len(self.clusters)
+                and self.clusters[cluster_id].get("active_expert_id")
+                is not None
+            ):
+                continue
+            self._register_expert_historical_state(
+                expert,
+                "retired",
+                expert.get("deletion_step", sync_step),
+            )
+
+    @staticmethod
+    def _historical_state_audit_item(state):
+        return {
+            "state_id": int(state["state_id"]),
+            "source_type": state.get("source_type"),
+            "source_expert_id": state.get("source_expert_id"),
+            "active_expert_id": state.get("active_expert_id"),
+            "cluster_id": state.get("cluster_id"),
+            "has_patch_memory": bool(
+                state.get("has_patch_memory", False)
+            ),
+            "created_step": int(state.get("created_step", -1)),
+            "last_seen_step": int(state.get("last_seen_step", -1)),
+            "support_count": int(state.get("support_count", 0)),
+            "lab_center": np.asarray(
+                state["lab_center"], dtype=np.float64
+            ).tolist(),
+        }
+
+    def _historical_state_audit(self):
+        return [
+            self._historical_state_audit_item(state)
+            for state in self.historical_states
+        ]
+
+    def _candidate_risk_profile(self, candidate_members):
+        ratios = []
+        low_risk_count = 0
+        for member in candidate_members:
+            threshold = member.get("historical_ms_threshold")
+            score = member.get("ms_score")
+            if threshold is None or score is None or float(threshold) <= 0.0:
+                continue
+            ratio = float(score) / max(float(threshold), 1e-12)
+            ratios.append(ratio)
+            low_risk_count += int(ratio <= 1.0)
+        median_ratio = float(np.median(ratios)) if ratios else None
+        max_ratio = float(max(ratios)) if ratios else None
+        acceptable = bool(
+            len(ratios) == len(candidate_members)
+            and low_risk_count >= 1
+            and median_ratio <= self.photometric_history_median_risk_max
+            and max_ratio <= self.photometric_history_extreme_risk_max
+        )
+        return {
+            "evaluated_count": len(ratios),
+            "low_risk_count": int(low_risk_count),
+            "risk_ratios": ratios,
+            "median_risk_ratio": median_ratio,
+            "max_risk_ratio": max_ratio,
+            "median_risk_max": self.photometric_history_median_risk_max,
+            "extreme_risk_max": self.photometric_history_extreme_risk_max,
+            "acceptable": acceptable,
+        }
+
     def _candidate_admission_evidence(
         self,
         candidate_members,
@@ -2489,7 +2785,7 @@ class DynamicExpertManager:
                 for member in selected_members
             )
         )
-        history_match = self._retired_photometric_state_match(
+        history_match = self._historical_state_match(
             selected_members
         )
         profile_consistent = bool(
@@ -2499,11 +2795,20 @@ class DynamicExpertManager:
             bool(member.get("historical_low_risk", False))
             for member in selected_members
         )
+        risk_profile = self._candidate_risk_profile(selected_members)
+        history_match_strength = float(
+            history_match.get("joint_match_strength", 0.0)
+        )
+        history_required_count = (
+            self.photometric_history_reentry_members
+            if history_match_strength >= 0.5
+            else self.photometric_history_reentry_members + 1
+        )
         if (
             profile_consistent
             and history_match.get("matched", False)
-            and strict_low_risk_count
-            >= self.photometric_history_reentry_members
+            and len(selected_members) >= history_required_count
+            and risk_profile["acceptable"]
         ):
             decision = "history_reentry"
         elif (
@@ -2531,6 +2836,8 @@ class DynamicExpertManager:
             "new_coverage_count": int(new_coverage_count),
             "candidate_observation_count": int(evaluated_count),
             "strict_low_risk_count": strict_low_risk_count,
+            "history_required_count": int(history_required_count),
+            "risk_profile": risk_profile,
         }
 
     def _record_photometric_state(self, members, step):
@@ -2547,15 +2854,25 @@ class DynamicExpertManager:
             if embeddings
             else None
         )
-        state = {
-            "lab_center": lab_center.copy(),
-            "dino_center": dino_center,
-            "last_seen_step": int(step),
-            "support_count": len(members),
-        }
-        self.photometric_observed_states.append(state)
-        del self.photometric_observed_states[:-self.photometric_history_max]
-        return state
+        historical_state = self._upsert_historical_state(
+            source_type="photometric_only",
+            step=step,
+            lab_center=lab_center,
+            dino_center=dino_center,
+            support_count=len(members),
+            l_threshold=self.photometric_l_ewma_floor,
+            ab_threshold=self.photometric_ab_ewma_floor,
+            has_patch_memory=False,
+            accumulate_support=True,
+        )
+        return (
+            {
+                **self._historical_state_audit_item(historical_state),
+                "historical_state_id": int(historical_state["state_id"]),
+            }
+            if historical_state is not None
+            else None
+        )
 
     def _expert_coverage_profiles(self):
         active_ids = {
@@ -2698,14 +3015,18 @@ class DynamicExpertManager:
             )
         return audit
 
-    def _retired_photometric_state_match(self, candidate_members):
+    def _historical_state_match(self, candidate_members):
         audit = {
             "enabled": self.photometric_history_reentry_enabled,
             "required_count": self.photometric_history_reentry_members,
             "candidate_member_count": len(candidate_members),
             "matched": False,
+            "matched_state_id": None,
+            "matched_source_type": None,
+            "matched_active_expert_id": None,
             "matched_retired_expert_id": None,
             "matched_retired_cluster_id": None,
+            "state_profiles": [],
             "retired_state_profiles": [],
         }
         if (
@@ -2720,6 +3041,7 @@ class DynamicExpertManager:
         )
         if candidate_center is None:
             return audit
+        self._sync_historical_states()
         candidate_embedding = F.normalize(
             torch.stack(
                 [member["embedding"] for member in candidate_members]
@@ -2728,32 +3050,24 @@ class DynamicExpertManager:
         )
 
         matches = []
-        for expert in self.retired_experts:
-            lab_state = expert.get("lab_state")
-            cluster_id = int(expert["cluster_id"])
-            if (
-                lab_state is None
-                or lab_state.get("center") is None
-                or not 0 <= cluster_id < len(self.clusters)
-            ):
+        for state in self.historical_states:
+            lab_center = state.get("lab_center")
+            state_embedding = state.get("dino_center")
+            if lab_center is None or state_embedding is None:
                 continue
-            cluster_embedding = F.normalize(
-                self.clusters[cluster_id]["embedding_sum"],
-                dim=0,
-            )
             dino_similarity = float(
-                candidate_embedding @ cluster_embedding
+                candidate_embedding @ state_embedding
             )
             distances = self._lab_distances(
                 candidate_center,
-                np.asarray(lab_state["center"], dtype=np.float64),
+                np.asarray(lab_center, dtype=np.float64),
             )
             l_threshold = max(
-                float(lab_state.get("l_threshold") or 0.0),
+                float(state.get("l_threshold") or 0.0),
                 self.photometric_l_ewma_floor,
             )
             ab_threshold = max(
-                float(lab_state.get("ab_threshold") or 0.0),
+                float(state.get("ab_threshold") or 0.0),
                 self.photometric_ab_ewma_floor,
             )
             l_relative = distances["l_distance"] / l_threshold
@@ -2764,19 +3078,49 @@ class DynamicExpertManager:
                 and dino_similarity
                 >= self.photometric_dino_similarity_floor
             )
+            max_relative = max(l_relative, ab_relative)
+            lab_strength = max(0.0, 1.0 - max_relative)
+            dino_denominator = max(
+                1.0 - self.photometric_dino_similarity_floor,
+                1e-12,
+            )
+            dino_strength = min(
+                1.0,
+                max(
+                    0.0,
+                    (
+                        dino_similarity
+                        - self.photometric_dino_similarity_floor
+                    )
+                    / dino_denominator,
+                ),
+            )
             profile = {
-                "expert_id": int(expert["expert_id"]),
-                "cluster_id": cluster_id,
-                "deletion_step": expert.get("deletion_step"),
+                "state_id": int(state["state_id"]),
+                "source_type": state.get("source_type"),
+                "source_expert_id": state.get("source_expert_id"),
+                "active_expert_id": state.get("active_expert_id"),
+                "cluster_id": state.get("cluster_id"),
+                "last_seen_step": state.get("last_seen_step"),
+                "has_patch_memory": bool(
+                    state.get("has_patch_memory", False)
+                ),
                 "dino_similarity": dino_similarity,
                 "l_threshold": l_threshold,
                 "ab_threshold": ab_threshold,
                 "l_relative_distance": float(l_relative),
                 "ab_relative_distance": float(ab_relative),
+                "lab_match_strength": float(lab_strength),
+                "dino_match_strength": float(dino_strength),
+                "joint_match_strength": float(
+                    (lab_strength + dino_strength) / 2.0
+                ),
                 "matched": matched,
                 **distances,
             }
-            audit["retired_state_profiles"].append(profile)
+            audit["state_profiles"].append(profile)
+            if state.get("source_type") == "retired":
+                audit["retired_state_profiles"].append(profile)
             if matched:
                 matches.append(profile)
 
@@ -2790,18 +3134,381 @@ class DynamicExpertManager:
                     item["ab_relative_distance"],
                 ),
                 -item["dino_similarity"],
-                -int(item.get("deletion_step") or -1),
+                -int(item.get("last_seen_step") or -1),
             ),
         )
         audit.update(
             {
                 "matched": True,
-                "matched_retired_expert_id": int(best["expert_id"]),
-                "matched_retired_cluster_id": int(best["cluster_id"]),
+                "matched_state_id": int(best["state_id"]),
+                "matched_source_type": best.get("source_type"),
+                "matched_active_expert_id": best.get("active_expert_id"),
+                "matched_retired_expert_id": (
+                    int(best["source_expert_id"])
+                    if best.get("source_type") == "retired"
+                    and best.get("source_expert_id") is not None
+                    else None
+                ),
+                "matched_retired_cluster_id": (
+                    int(best["cluster_id"])
+                    if best.get("source_type") == "retired"
+                    and best.get("cluster_id") is not None
+                    else None
+                ),
+                "joint_match_strength": float(
+                    best["joint_match_strength"]
+                ),
                 "matched_profile": dict(best),
             }
         )
         return audit
+
+    def _retired_photometric_state_match(self, candidate_members):
+        return self._historical_state_match(candidate_members)
+
+    def _history_reentry_support_profile(
+        self,
+        candidate_members,
+        support_threshold,
+    ):
+        active_ids = {
+            int(expert["expert_id"])
+            for expert in self.active_experts
+            if expert.get("lifecycle_state", "active") == "active"
+        }
+        support_counts = {expert_id: 0 for expert_id in active_ids}
+        evaluated_count = 0
+        supported_count = 0
+        for member in candidate_members:
+            supports = {
+                int(expert_id): float(support)
+                for expert_id, support in member.get(
+                    "current_expert_supports", {}
+                ).items()
+                if int(expert_id) in active_ids
+            }
+            if not supports or support_threshold is None:
+                continue
+            evaluated_count += 1
+            member_supported = False
+            for expert_id, support in supports.items():
+                if support >= support_threshold:
+                    support_counts[expert_id] += 1
+                    member_supported = True
+            supported_count += int(member_supported)
+
+        member_count = len(candidate_members)
+        return {
+            "candidate_member_count": int(member_count),
+            "evaluated_member_count": int(evaluated_count),
+            "supported_member_count": int(supported_count),
+            "existing_support_fraction": (
+                float(supported_count / member_count)
+                if member_count
+                else 0.0
+            ),
+            "fully_evaluated": bool(
+                member_count and evaluated_count == member_count
+            ),
+            "fully_covered": bool(
+                member_count
+                and evaluated_count == member_count
+                and supported_count == member_count
+            ),
+            "expert_support_fractions": {
+                str(expert_id): (
+                    float(count / member_count) if member_count else 0.0
+                )
+                for expert_id, count in support_counts.items()
+            },
+        }
+
+    def _select_history_reentry_victim(
+        self,
+        candidate_members,
+        support_threshold,
+        admission_route,
+    ):
+        if not self.active_experts:
+            return None, None
+
+        support_profile = self._history_reentry_support_profile(
+            candidate_members,
+            support_threshold,
+        )
+        support_fractions = support_profile["expert_support_fractions"]
+        coverage_profiles = self._expert_coverage_profiles()
+        lab_profiles = self._expert_lab_uniqueness_profiles()
+        victim = min(
+            self.active_experts,
+            key=lambda expert: (
+                expert.get("lifecycle_state", "active") != "dormant",
+                support_fractions.get(str(int(expert["expert_id"])), 0.0),
+                not lab_profiles[int(expert["expert_id"])][
+                    "photometrically_redundant"
+                ],
+                coverage_profiles[int(expert["expert_id"])][
+                    "unique_fraction"
+                ],
+                int(expert["last_supported_step"]),
+                int(expert["support_count"]),
+                int(expert["admission_step"]),
+            ),
+        )
+        victim_id = int(victim["expert_id"])
+        audit = {
+            "admission_route": admission_route,
+            "candidate_admission_evidence": "history_reentry",
+            "replacement_reason": "history_reentry_swap",
+            "outcome": "accepted",
+            "victim_expert_id": victim_id,
+            "victim_lifecycle_state": victim.get(
+                "lifecycle_state", "active"
+            ),
+            "victim_coverage": dict(coverage_profiles[victim_id]),
+            "victim_lab_uniqueness": dict(lab_profiles[victim_id]),
+            "history_reentry_support": support_profile,
+        }
+        self.last_budget_replacement_evaluation = dict(audit)
+        return victim_id, audit
+
+    def _activate_historical_state(
+        self,
+        history_match,
+        candidate_members,
+        step,
+        support_threshold,
+        admission_route,
+        candidate_evidence=None,
+    ):
+        state_id = history_match.get("matched_state_id")
+        matched_state = next(
+            (
+                state
+                for state in self.historical_states
+                if int(state["state_id"]) == int(state_id)
+            ),
+            None,
+        ) if state_id is not None else None
+        retired_expert = (
+            next(
+                (
+                    expert
+                    for expert in self.retired_experts
+                    if matched_state is not None
+                    and matched_state.get("source_expert_id") is not None
+                    and int(expert["expert_id"])
+                    == int(matched_state["source_expert_id"])
+                ),
+                None,
+            )
+            if matched_state is not None
+            else None
+        )
+        support_profile = self._history_reentry_support_profile(
+            candidate_members,
+            support_threshold,
+        )
+        event = {
+            "matched_state_id": state_id,
+            "matched_source_type": (
+                matched_state.get("source_type")
+                if matched_state is not None
+                else None
+            ),
+            "matched_source_expert_id": (
+                matched_state.get("source_expert_id")
+                if matched_state is not None
+                else None
+            ),
+            "matched_cluster_id": (
+                matched_state.get("cluster_id")
+                if matched_state is not None
+                else None
+            ),
+            "candidate_image_ids": [
+                int(member["image_id"]) for member in candidate_members
+            ],
+            "existing_support": support_profile,
+            "restored_expert_id": None,
+            "victim_expert_id": None,
+        }
+        if matched_state is None:
+            event["decision"] = "history_reentry_rejected"
+            event["reason"] = "missing_historical_state"
+            self.last_history_reentry_event = event
+            return None, None
+
+        active_expert_id = matched_state.get("active_expert_id")
+        if active_expert_id is not None or support_profile["fully_covered"]:
+            matched_state["last_seen_step"] = int(step)
+            matched_state["support_count"] += len(candidate_members)
+            event["decision"] = "history_shared_coverage"
+            event["reason"] = (
+                "matched_state_already_active"
+                if active_expert_id is not None
+                else "existing_expert_coverage"
+            )
+            self.last_history_reentry_event = event
+            return matched_state.get("cluster_id"), None
+
+        cluster_id = matched_state.get("cluster_id")
+        can_restore_cluster = bool(
+            matched_state.get("has_patch_memory", False)
+            and cluster_id is not None
+            and 0 <= int(cluster_id) < len(self.clusters)
+            and retired_expert is not None
+        )
+        if not can_restore_cluster:
+            representative = min(
+                candidate_members,
+                key=lambda item: item["ms_short_score"],
+            )
+            replaced_before = self.last_budget_replacement
+            historical_ids_before = {
+                int(state["state_id"])
+                for state in self.historical_states
+            }
+            new_cluster_id, expert_id = self._admit_quarantined_member(
+                representative,
+                step,
+                cluster_members=candidate_members,
+                admission_route=admission_route,
+                support_threshold=support_threshold,
+                candidate_evidence=candidate_evidence,
+            )
+            if expert_id is None:
+                event["decision"] = "history_reentry_rejected"
+                event["reason"] = "historical_state_materialization_failed"
+                self.last_history_reentry_event = event
+                return None, None
+            new_expert = next(
+                expert
+                for expert in self.active_experts
+                if int(expert["expert_id"]) == int(expert_id)
+            )
+            self.historical_states = [
+                state
+                for state in self.historical_states
+                if int(state["state_id"]) in historical_ids_before
+                or state.get("source_expert_id") != int(expert_id)
+            ]
+            self._register_expert_historical_state(
+                new_expert,
+                "active",
+                step,
+                state_id=state_id,
+            )
+            replaced_now = bool(
+                self.last_budget_replacement is not None
+                and self.last_budget_replacement is not replaced_before
+                and int(self.last_budget_replacement.get("step", -1))
+                == int(step)
+            )
+            event["decision"] = (
+                "history_materialized_by_replacement"
+                if replaced_now
+                else "history_materialized_free_slot"
+            )
+            event["reason"] = "historical_state_materialized"
+            event["restored_expert_id"] = int(expert_id)
+            event["victim_expert_id"] = (
+                int(self.last_budget_replacement["expert_id"])
+                if replaced_now
+                else None
+            )
+            self.last_history_reentry_event = event
+            return new_cluster_id, expert_id
+
+        cluster_id = int(cluster_id)
+        cluster = self.clusters[cluster_id]
+        restored_with_replacement = False
+        if len(self.active_experts) >= self.committee_cap:
+            victim_id, replacement_audit = (
+                self._select_budget_replacement(
+                    candidate_members,
+                    support_threshold,
+                    admission_route,
+                    candidate_evidence=candidate_evidence,
+                )
+            )
+            if (
+                victim_id is None
+                or not self._replace_budgeted_expert(
+                    victim_id,
+                    step,
+                    replacement_audit,
+                )
+            ):
+                event["decision"] = "history_reentry_rejected"
+                event["reason"] = "replacement_failed"
+                self.last_history_reentry_event = event
+                return None, None
+            event["victim_expert_id"] = int(victim_id)
+            restored_with_replacement = True
+
+        existing_members = {
+            (int(member["step"]), int(member["image_id"]))
+            for member in cluster["members"]
+        }
+        for member in candidate_members:
+            key = (int(member["step"]), int(member["image_id"]))
+            if key in existing_members:
+                continue
+            cluster["members"].append(member)
+            cluster["embedding_sum"] += member["embedding"]
+            existing_members.add(key)
+
+        representative = min(
+            candidate_members,
+            key=lambda item: item["ms_short_score"],
+        )
+        expert_id = self.next_expert_id
+        restored_expert = {
+            "expert_id": expert_id,
+            "image_id": int(representative["image_id"]),
+            "cluster_id": cluster_id,
+            "admission_step": int(step),
+            "cluster_support_at_admission": len(candidate_members),
+            "max_support_gap": 0,
+            "last_supported_step": int(step),
+            "support_count": len(candidate_members),
+            "patience": self.base_ttl,
+            "ttl": self.base_ttl,
+            "deletion_step": None,
+            "last_event": "history_reentry",
+            "lifecycle_state": "active",
+            "last_channel_support": None,
+            "representative_mode": self.representative_mode,
+            "admission_ttl_mode": self.admission_ttl_mode,
+            "admission_route": admission_route,
+            "lab_state": self._build_lab_state(candidate_members),
+            "admission_candidate_ms_score": representative["ms_score"],
+            "admission_candidate_channel_support": representative[
+                "channel_support"
+            ],
+            "reentry_from_expert_id": int(retired_expert["expert_id"]),
+            "reentry_count": int(retired_expert.get("reentry_count", 0)) + 1,
+        }
+        cluster["active_expert_id"] = expert_id
+        self.active_experts.append(restored_expert)
+        self._register_expert_historical_state(
+            restored_expert,
+            "active",
+            step,
+            state_id=state_id,
+        )
+        self.admitted_count += 1
+        self.next_expert_id += 1
+        event["decision"] = (
+            "history_restored_by_replacement"
+            if restored_with_replacement
+            else "history_restored_free_slot"
+        )
+        event["reason"] = "retired_state_restored"
+        event["restored_expert_id"] = int(expert_id)
+        self.last_history_reentry_event = event
+        return cluster_id, expert_id
 
     def _candidate_lab_novelty(self, audit):
         distances = list(audit.get("expert_lab_distances", []))
@@ -2874,6 +3581,9 @@ class DynamicExpertManager:
                     ):
                         nearest = item
             profiles[expert_id] = {
+                "has_lab_state": bool(
+                    state is not None and state.get("center") is not None
+                ),
                 "nearest_expert_id": (
                     int(nearest["expert_id"])
                     if nearest is not None
@@ -2900,6 +3610,101 @@ class DynamicExpertManager:
                 ),
             }
         return profiles
+
+    def _expert_contribution_profiles(
+        self,
+        coverage_profiles,
+        lab_uniqueness_profiles,
+        reference_step,
+    ):
+        profiles = {}
+        for expert in self.active_experts:
+            expert_id = int(expert["expert_id"])
+            coverage = coverage_profiles[expert_id]
+            lab = lab_uniqueness_profiles[expert_id]
+            channel_score = float(coverage["unique_fraction"])
+            nearest_relative = lab.get("nearest_relative_distance")
+            lab_score = (
+                min(float(nearest_relative), 1.0)
+                if nearest_relative is not None
+                else 1.0
+                if lab.get("has_lab_state", False)
+                else 0.0
+            )
+            age = max(
+                0,
+                int(reference_step) - int(expert["last_supported_step"]),
+            )
+            recent_score = max(
+                0.0,
+                1.0 - age / max(float(self.budget_coverage_window), 1.0),
+            )
+            if expert.get("lifecycle_state", "active") == "dormant":
+                recent_score = 0.0
+            contribution = (
+                channel_score + lab_score + recent_score
+            ) / 3.0
+            profiles[expert_id] = {
+                "channel_unique_score": channel_score,
+                "lab_unique_score": lab_score,
+                "recent_support_score": recent_score,
+                "contribution_score": float(contribution),
+            }
+        return profiles
+
+    def _candidate_contribution_profile(
+        self,
+        evaluation,
+        candidate_evidence,
+    ):
+        new_coverage = evaluation.get("new_coverage_fraction")
+        channel_score = (
+            min(max(float(new_coverage), 0.0), 1.0)
+            if new_coverage is not None
+            else 0.0
+        )
+        relative_distances = []
+        for item in evaluation.get("expert_lab_distances", []):
+            l_threshold = item.get("l_novelty_threshold")
+            ab_threshold = item.get("ab_novelty_threshold")
+            if l_threshold is None or ab_threshold is None:
+                continue
+            relative_distances.append(
+                max(
+                    float(item["l_distance"]) / max(float(l_threshold), 1e-12),
+                    float(item["ab_distance"]) / max(float(ab_threshold), 1e-12),
+                )
+            )
+        lab_score = (
+            min(min(relative_distances), 1.0)
+            if relative_distances
+            else 0.0
+        )
+        history_match = dict(candidate_evidence or {}).get(
+            "history_match", {}
+        )
+        history_score = (
+            min(
+                max(
+                    float(history_match.get("joint_match_strength", 0.0)),
+                    0.0,
+                ),
+                1.0,
+            )
+            if history_match.get("matched", False)
+            else 0.0
+        )
+        reliability_score = history_score if history_score > 0.0 else 1.0
+        contribution = (
+            channel_score + lab_score + reliability_score
+        ) / 3.0
+        return {
+            "channel_new_coverage_score": channel_score,
+            "lab_unique_score": lab_score,
+            "history_match_score": history_score,
+            "candidate_reliability_score": reliability_score,
+            "contribution_score": float(contribution),
+        }
 
     def _select_budget_replacement(
         self,
@@ -2976,9 +3781,17 @@ class DynamicExpertManager:
             and self.photometric_budget_admission_mode == "channel_or_lab"
             and evaluation.get("lab_novel_to_all_experts", False)
         )
+        history_novel = bool(
+            dict(candidate_evidence or {}).get("history_match", {}).get(
+                "matched", False
+            )
+        )
         evaluation["channel_novel"] = channel_novel
         evaluation["lab_novel"] = lab_novel
-        if channel_novel and lab_novel:
+        evaluation["history_novel"] = history_novel
+        if history_novel:
+            evaluation["candidate_admission_evidence"] = "history"
+        elif channel_novel and lab_novel:
             evaluation["candidate_admission_evidence"] = "channel_and_lab"
         elif channel_novel:
             evaluation["candidate_admission_evidence"] = "channel"
@@ -2987,47 +3800,45 @@ class DynamicExpertManager:
         else:
             evaluation["candidate_admission_evidence"] = None
 
-        if new_coverage_fraction is None and not lab_novel:
+        if new_coverage_fraction is None and not lab_novel and not history_novel:
             evaluation["outcome"] = "missing_candidate_support"
             self.last_budget_replacement_evaluation = evaluation
             return None, None
-        if not channel_novel and not lab_novel:
+        if not channel_novel and not lab_novel and not history_novel:
             evaluation["outcome"] = "insufficient_new_coverage"
             self.last_budget_replacement_evaluation = evaluation
             return None, None
 
         coverage_profiles = self._expert_coverage_profiles()
         lab_uniqueness_profiles = self._expert_lab_uniqueness_profiles()
+        reference_step = max(
+            [int(member.get("step", self.last_step)) for member in candidate_members]
+            or [self.last_step]
+        )
+        expert_contributions = self._expert_contribution_profiles(
+            coverage_profiles,
+            lab_uniqueness_profiles,
+            reference_step,
+        )
+        candidate_contribution = self._candidate_contribution_profile(
+            evaluation,
+            candidate_evidence,
+        )
         eligible = []
         for expert in self.active_experts:
             expert_id = int(expert["expert_id"])
             profile = coverage_profiles[expert_id]
             lab_profile = lab_uniqueness_profiles[expert_id]
-            is_dormant = (
-                expert.get("lifecycle_state", "active") == "dormant"
-            )
-            coverage_replaceable = bool(
-                new_coverage_fraction is not None
-                and
-                new_coverage_fraction
-                > profile["unique_fraction"]
+            expert_contribution = expert_contributions[expert_id]
+            replaceable = bool(
+                candidate_contribution["contribution_score"]
+                > expert_contribution["contribution_score"]
                 + self.budget_replacement_margin
             )
-            lab_only_replaceable = bool(
-                lab_novel
-                and not channel_novel
-                and lab_profile["photometrically_redundant"]
-                and profile["unique_fraction"]
-                <= self.budget_replacement_margin
-            )
-            if not (
-                is_dormant
-                or coverage_replaceable
-                or lab_only_replaceable
-            ):
+            if not replaceable:
                 continue
             eligible.append(
-                (expert, profile, lab_profile)
+                (expert, profile, lab_profile, expert_contribution)
             )
         if not eligible:
             evaluation["outcome"] = "no_redundant_victim"
@@ -3035,6 +3846,8 @@ class DynamicExpertManager:
             evaluation["expert_lab_uniqueness_profiles"] = (
                 lab_uniqueness_profiles
             )
+            evaluation["expert_contribution_profiles"] = expert_contributions
+            evaluation["candidate_contribution"] = candidate_contribution
             self.last_budget_replacement_evaluation = evaluation
             return None, None
 
@@ -3043,32 +3856,22 @@ class DynamicExpertManager:
             and self.photometric_budget_admission_mode == "channel_or_lab"
         )
         if lab_aware_replacement:
-            victim, victim_profile, victim_lab_profile = min(
+            victim, victim_profile, victim_lab_profile, victim_contribution = min(
                 eligible,
                 key=lambda item: (
                     item[0].get("lifecycle_state", "active") != "dormant",
-                    not item[2]["photometrically_redundant"],
-                    item[1]["unique_fraction"],
-                    item[1]["coverage_fraction"],
-                    (
-                        item[2]["nearest_relative_distance"]
-                        if item[2]["nearest_relative_distance"] is not None
-                        else float("inf")
-                    ),
-                    -item[1]["redundant_fraction"],
+                    item[3]["contribution_score"],
                     int(item[0]["support_count"]),
                     int(item[0]["last_supported_step"]),
                     int(item[0]["admission_step"]),
                 ),
             )
         else:
-            victim, victim_profile, victim_lab_profile = min(
+            victim, victim_profile, victim_lab_profile, victim_contribution = min(
                 eligible,
                 key=lambda item: (
                     item[0].get("lifecycle_state", "active") != "dormant",
-                    item[1]["unique_fraction"],
-                    -item[1]["redundant_fraction"],
-                    item[1]["coverage_fraction"],
+                    item[3]["contribution_score"],
                     int(item[0]["support_count"]),
                     int(item[0]["last_supported_step"]),
                     int(item[0]["admission_step"]),
@@ -3080,12 +3883,15 @@ class DynamicExpertManager:
                 "victim_expert_id": int(victim["expert_id"]),
                 "victim_coverage": dict(victim_profile),
                 "victim_lab_uniqueness": dict(victim_lab_profile),
+                "victim_contribution": dict(victim_contribution),
+                "candidate_contribution": dict(candidate_contribution),
                 "victim_lifecycle_state": victim.get(
                     "lifecycle_state", "active"
                 ),
                 "lab_aware_replacement": lab_aware_replacement,
                 "expert_coverage_profiles": coverage_profiles,
                 "expert_lab_uniqueness_profiles": lab_uniqueness_profiles,
+                "expert_contribution_profiles": expert_contributions,
             }
         )
         self.last_budget_replacement_evaluation = evaluation
@@ -3095,7 +3901,9 @@ class DynamicExpertManager:
                 "candidate_admission_evidence"
             ],
             "replacement_reason": (
-                "lab_or_coverage_budget_replacement"
+                "history_reentry_swap"
+                if history_novel
+                else "lab_or_coverage_budget_replacement"
                 if lab_novel
                 else "coverage_budget_replacement"
             ),
@@ -3108,6 +3916,8 @@ class DynamicExpertManager:
             "candidate_observation_count": int(candidate_observation_count),
             "victim_coverage": dict(victim_profile),
             "victim_lab_uniqueness": dict(victim_lab_profile),
+            "victim_contribution": dict(victim_contribution),
+            "candidate_contribution": dict(candidate_contribution),
             "victim_lifecycle_state": victim.get(
                 "lifecycle_state", "active"
             ),
@@ -3134,16 +3944,22 @@ class DynamicExpertManager:
         replacement_reason = dict(audit or {}).get(
             "replacement_reason", "coverage_budget_replacement"
         )
-        expert["last_event"] = (
-            "replaced_coverage_budget"
-            if replacement_reason == "coverage_budget_replacement"
-            else "replaced_lab_or_coverage_budget"
-        )
+        if replacement_reason == "coverage_budget_replacement":
+            expert["last_event"] = "replaced_coverage_budget"
+        elif replacement_reason == "history_reentry_swap":
+            expert["last_event"] = "replaced_history_reentry"
+        else:
+            expert["last_event"] = "replaced_lab_or_coverage_budget"
         expert["lifecycle_state"] = "retired"
         cluster = self.clusters[expert["cluster_id"]]
         if cluster["active_expert_id"] == expert["expert_id"]:
             cluster["active_expert_id"] = None
         self.retired_experts.append(expert)
+        self._register_expert_historical_state(
+            expert,
+            "retired",
+            step,
+        )
         self.last_budget_replacement = {
             "expert_id": int(expert_id),
             "step": int(step),
@@ -3220,6 +4036,11 @@ class DynamicExpertManager:
             ],
         }
         self.active_experts.append(expert)
+        self._register_expert_historical_state(
+            expert,
+            "active",
+            step,
+        )
         self.admitted_count += 1
         self.next_expert_id += 1
         return cluster_id, expert["expert_id"]
@@ -3956,21 +4777,40 @@ class DynamicExpertManager:
                 return None, None
             if self.novel_admission_mode == "channel_gate":
                 representative = representatives[0]
-                cluster_id, expert_id = self._admit_quarantined_member(
-                    representative,
-                    step,
-                    cluster_members=(
-                        representatives
-                        if pool_route == "photometric_drift"
-                        else [representative]
-                    ),
-                    admission_route=f"{admission_route_base}_channel_gate",
-                    support_threshold=support_threshold,
-                    candidate_evidence=adaptive_admission_evidence,
+                admission_route = f"{admission_route_base}_channel_gate"
+                if photometric_history_reentry:
+                    cluster_id, expert_id = self._activate_historical_state(
+                        history_reentry_match,
+                        representatives,
+                        step,
+                        support_threshold,
+                        admission_route,
+                        candidate_evidence=adaptive_admission_evidence,
+                    )
+                else:
+                    cluster_id, expert_id = self._admit_quarantined_member(
+                        representative,
+                        step,
+                        cluster_members=(
+                            representatives
+                            if pool_route == "photometric_drift"
+                            else [representative]
+                        ),
+                        admission_route=admission_route,
+                        support_threshold=support_threshold,
+                        candidate_evidence=adaptive_admission_evidence,
+                    )
+                history_decision = (
+                    self.last_history_reentry_event.get("decision")
+                    if photometric_history_reentry
+                    and self.last_history_reentry_event is not None
+                    else None
                 )
                 self.last_novel_quarantine_event = {
                     "decision": (
-                        "confirmed_channel_gate"
+                        history_decision
+                        if history_decision is not None
+                        else "confirmed_channel_gate"
                         if expert_id is not None
                         else "cap_rejected"
                     ),
@@ -3995,6 +4835,7 @@ class DynamicExpertManager:
                         else None
                     ),
                     "created_full_expert": expert_id is not None,
+                    "history_reentry": self.last_history_reentry_event,
                     "candidate_evidence": (
                         {
                             key: value
@@ -4620,6 +5461,7 @@ class DynamicExpertManager:
         ) = self._novel_thresholds()
         self.last_budget_replacement = None
         self.last_budget_replacement_evaluation = None
+        self.last_history_reentry_event = None
         self._record_coverage_observation(
             step,
             ms_score,
@@ -4691,12 +5533,20 @@ class DynamicExpertManager:
             )
             if replaced_expert_id not in deleted_expert_ids:
                 deleted_expert_ids.append(replaced_expert_id)
+            replacement_reason = self.last_budget_replacement.get(
+                "reason", "coverage_budget_replacement"
+            )
+            replacement_decision = (
+                "replaced_history_reentry"
+                if replacement_reason == "history_reentry_swap"
+                else "replaced_coverage_budget"
+            )
             expert_lifecycle_events.append(
                 {
                     "step": int(step),
                     "expert_id": replaced_expert_id,
-                    "decision": "replaced_coverage_budget",
-                    "signal_decision": "replaced_coverage_budget",
+                    "decision": replacement_decision,
+                    "signal_decision": replacement_decision,
                     "deleted_this_step": True,
                     "alive_after": False,
                 }
@@ -4805,6 +5655,8 @@ class DynamicExpertManager:
             "budget_replacement_evaluation": (
                 self.last_budget_replacement_evaluation
             ),
+            "history_reentry": self.last_history_reentry_event,
+            "historical_states": self._historical_state_audit(),
             "bootstrap": self.last_bootstrap_event,
             "cluster_id": cluster_id,
             "admitted_expert_id":

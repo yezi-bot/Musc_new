@@ -167,7 +167,7 @@ class GradualDriftDataset(torch.utils.data.Dataset):
             "image_path": str(image_path),
             "stream_step": int(index),
             "drift_phase": drift["phase"],
-            "drift_state_id": drift.get("state_id"),
+            "drift_state_id": str(drift.get("state_id") or ""),
             "drift_severity": float(drift["severity"]),
             "lab_feature": lab_feature,
         }
