@@ -582,9 +582,46 @@ class MuSc():
                                     'cold_start_required_members', 3
                                 )
                             ),
+                            'cold_start_confidence_history': int(
+                                self.dynamic_committee_cfg.get(
+                                    'cold_start_confidence_history', 16
+                                )
+                            ),
+                            'cold_start_reference_confidence_mode': (
+                                self.dynamic_committee_cfg.get(
+                                    'cold_start_reference_confidence_mode',
+                                    'state',
+                                )
+                            ),
                             'cold_start_lab_enabled': bool(
                                 self.dynamic_committee_cfg.get(
                                     'cold_start_lab_enabled', False
+                                )
+                            ),
+                            'cold_start_provisional_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'cold_start_provisional_enabled', False
+                                )
+                            ),
+                            'cold_start_provisional_confirm_steps': int(
+                                self.dynamic_committee_cfg.get(
+                                    'cold_start_provisional_confirm_steps', 2
+                                )
+                            ),
+                            'cold_start_provisional_max_wait_steps': int(
+                                self.dynamic_committee_cfg.get(
+                                    'cold_start_provisional_max_wait_steps', 4
+                                )
+                            ),
+                            'cold_start_provisional_weight': float(
+                                self.dynamic_committee_cfg.get(
+                                    'cold_start_provisional_weight', 0.25
+                                )
+                            ),
+                            'cold_start_provisional_min_channel_support': float(
+                                self.dynamic_committee_cfg.get(
+                                    'cold_start_provisional_min_channel_support',
+                                    0.05,
                                 )
                             ),
                             'lab_ewma_alpha': float(
@@ -698,6 +735,65 @@ class MuSc():
                                     False,
                                 )
                             ),
+                            'photometric_fitness_history_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_fitness_history_enabled',
+                                    False,
+                                )
+                            ),
+                            'budget_coverage_loss_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_coverage_loss_enabled', False
+                                )
+                            ),
+                            'budget_coverage_min_loss_only': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_coverage_min_loss_only', False
+                                )
+                            ),
+                            'budget_coverage_joint_eviction_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_coverage_joint_eviction_enabled',
+                                    False,
+                                )
+                            ),
+                            'budget_patch_coverage_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_patch_coverage_enabled', False
+                                )
+                            ),
+                            'budget_patch_prototype_count': int(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_patch_prototype_count', 32
+                                )
+                            ),
+                            'budget_patch_victim_selection_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_patch_victim_selection_enabled',
+                                    False,
+                                )
+                            ),
+                            'budget_patch_kcenter_victim_selection_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_patch_kcenter_victim_selection_enabled',
+                                    False,
+                                )
+                            ),
+                            'budget_coverage_channel_weight': float(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_coverage_channel_weight', 1.0
+                                )
+                            ),
+                            'budget_coverage_lab_weight': float(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_coverage_lab_weight', 1.0
+                                )
+                            ),
+                            'budget_coverage_dino_weight': float(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_coverage_dino_weight', 1.0
+                                )
+                            ),
                             'photometric_history_min': int(
                                 self.dynamic_committee_cfg.get(
                                     'photometric_history_min', 3
@@ -706,6 +802,27 @@ class MuSc():
                             'photometric_history_max': int(
                                 self.dynamic_committee_cfg.get(
                                     'photometric_history_max', 16
+                                )
+                            ),
+                            'photometric_state_registry_cap': (
+                                int(
+                                    self.dynamic_committee_cfg[
+                                        'photometric_state_registry_cap'
+                                    ]
+                                )
+                                if self.dynamic_committee_cfg.get(
+                                    'photometric_state_registry_cap'
+                                ) is not None
+                                else None
+                            ),
+                            'photometric_state_distribution_enabled': (
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_state_distribution_enabled'
+                                )
+                            ),
+                            'photometric_temporary_state_enabled': (
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_temporary_state_enabled'
                                 )
                             ),
                             'photometric_history_distance_threshold': float(
@@ -747,6 +864,34 @@ class MuSc():
                                 self.dynamic_committee_cfg.get(
                                     'photometric_adaptive_candidate_evidence',
                                     False,
+                                )
+                            ),
+                            'photometric_stable_lab_anchor_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_stable_lab_anchor_enabled',
+                                    False,
+                                )
+                            ),
+                            'photometric_denstream_support_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_denstream_support_enabled',
+                                    False,
+                                )
+                            ),
+                            'photometric_denstream_decay': float(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_denstream_decay', 0.9
+                                )
+                            ),
+                            'photometric_denstream_mature_support': float(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_denstream_mature_support', 0.5
+                                )
+                            ),
+                            'photometric_denstream_discard_support': float(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_denstream_discard_support',
+                                    0.05,
                                 )
                             ),
                             'photometric_budget_replacement': bool(

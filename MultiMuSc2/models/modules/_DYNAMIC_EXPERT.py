@@ -42,6 +42,13 @@ class DynamicExpertManager:
     cold_start_max_samples=6,
     cold_start_required_members=3,
     cold_start_lab_enabled=False,
+    cold_start_provisional_enabled=False,
+    cold_start_provisional_confirm_steps=2,
+    cold_start_provisional_max_wait_steps=4,
+    cold_start_provisional_weight=0.25,
+    cold_start_provisional_min_channel_support=0.05,
+    cold_start_confidence_history=16,
+    cold_start_reference_confidence_mode="state",
     lab_ewma_alpha=0.3,
     lab_ewma_threshold_k=3.0,
     lab_ewma_confirm_steps=2,
@@ -63,6 +70,7 @@ class DynamicExpertManager:
     photometric_consistency_fraction=0.75,
     photometric_min_low_risk_members=2,
     photometric_relevant_history_enabled=False,
+    photometric_fitness_history_enabled=False,
     photometric_history_min=3,
     photometric_history_max=16,
     photometric_history_distance_threshold=3.0,
@@ -71,13 +79,31 @@ class DynamicExpertManager:
     photometric_history_reentry_members=2,
     photometric_history_median_risk_max=1.25,
     photometric_history_extreme_risk_max=2.0,
+    photometric_state_registry_cap=None,
+    photometric_state_distribution_enabled=None,
+    photometric_temporary_state_enabled=None,
     photometric_adaptive_candidate_evidence=False,
+    photometric_stable_lab_anchor_enabled=False,
+    photometric_denstream_support_enabled=False,
+    photometric_denstream_decay=0.9,
+    photometric_denstream_mature_support=0.5,
+    photometric_denstream_discard_support=0.05,
     photometric_budget_replacement=True,
     photometric_budget_admission_mode="channel_only",
     legacy_budget_replacement=True,
     budget_coverage_window=32,
     budget_min_new_coverage_fraction=0.5,
     budget_replacement_margin=0.0,
+    budget_coverage_loss_enabled=False,
+    budget_coverage_min_loss_only=False,
+    budget_coverage_joint_eviction_enabled=False,
+    budget_patch_coverage_enabled=False,
+    budget_patch_prototype_count=32,
+    budget_patch_victim_selection_enabled=False,
+    budget_patch_kcenter_victim_selection_enabled=False,
+    budget_coverage_channel_weight=1.0,
+    budget_coverage_lab_weight=1.0,
+    budget_coverage_dino_weight=1.0,
     minimum_active_experts=0,
     lifecycle_mode="ttl_delete",
     drift_candidate_audit_enabled=False,
@@ -178,8 +204,10 @@ class DynamicExpertManager:
             raise ValueError(
                 "novel_memory_keep_fraction must be within (0, 1]"
             )
-      if cold_start_mode not in {"legacy", "adaptive"}:
-            raise ValueError("cold_start_mode must be legacy or adaptive")
+      if cold_start_mode not in {"legacy", "adaptive", "confidence"}:
+            raise ValueError(
+                "cold_start_mode must be legacy, adaptive, or confidence"
+            )
       if cold_start_min_samples < 2:
             raise ValueError("cold_start_min_samples must be at least 2")
       if cold_start_max_samples < cold_start_min_samples:
@@ -190,6 +218,36 @@ class DynamicExpertManager:
             raise ValueError(
                 "cold_start_required_members must be between 2 and "
                 "cold_start_min_samples"
+            )
+      if cold_start_provisional_confirm_steps < 1:
+            raise ValueError(
+                "cold_start_provisional_confirm_steps must be positive"
+            )
+      if cold_start_provisional_max_wait_steps < cold_start_provisional_confirm_steps:
+            raise ValueError(
+                "cold_start_provisional_max_wait_steps must be at least "
+                "cold_start_provisional_confirm_steps"
+            )
+      if not 0.0 <= cold_start_provisional_weight <= 1.0:
+            raise ValueError(
+                "cold_start_provisional_weight must be within [0, 1]"
+            )
+      if not 0.0 <= cold_start_provisional_min_channel_support <= 1.0:
+            raise ValueError(
+                "cold_start_provisional_min_channel_support must be within "
+                "[0, 1]"
+            )
+      if cold_start_confidence_history < 2:
+            raise ValueError(
+                "cold_start_confidence_history must be at least 2"
+            )
+      if cold_start_reference_confidence_mode not in {
+            "state",
+            "prequential",
+        }:
+            raise ValueError(
+                "cold_start_reference_confidence_mode must be state or "
+                "prequential"
             )
       if not 0.0 < lab_ewma_alpha <= 1.0:
             raise ValueError("lab_ewma_alpha must be within (0, 1]")
@@ -274,6 +332,36 @@ class DynamicExpertManager:
             raise ValueError(
                 "photometric_history_max must be at least committee_cap"
             )
+      if photometric_state_registry_cap is None:
+            photometric_state_registry_cap = 2 * committee_cap
+      if photometric_state_registry_cap < committee_cap:
+            raise ValueError(
+                "photometric_state_registry_cap must be at least committee_cap"
+            )
+      if photometric_state_distribution_enabled is None:
+            photometric_state_distribution_enabled = bool(
+                photometric_adaptive_candidate_evidence
+            )
+      if photometric_temporary_state_enabled is None:
+            photometric_temporary_state_enabled = bool(
+                photometric_adaptive_candidate_evidence
+            )
+      if not 0.0 < photometric_denstream_decay <= 1.0:
+            raise ValueError(
+                "photometric_denstream_decay must be within (0, 1]"
+            )
+      if photometric_denstream_mature_support <= 0.0:
+            raise ValueError(
+                "photometric_denstream_mature_support must be positive"
+            )
+      if not (
+            0.0 <= photometric_denstream_discard_support
+            < photometric_denstream_mature_support
+      ):
+            raise ValueError(
+                "photometric_denstream_discard_support must be non-negative "
+                "and below photometric_denstream_mature_support"
+            )
       if photometric_history_distance_threshold <= 0.0:
             raise ValueError(
                 "photometric_history_distance_threshold must be positive"
@@ -316,6 +404,15 @@ class DynamicExpertManager:
             raise ValueError(
                 "budget_replacement_margin must be within [0, 1]"
             )
+      coverage_weights = (
+            budget_coverage_channel_weight,
+            budget_coverage_lab_weight,
+            budget_coverage_dino_weight,
+      )
+      if any(float(weight) < 0.0 for weight in coverage_weights):
+            raise ValueError("budget coverage weights must be non-negative")
+      if sum(float(weight) for weight in coverage_weights) <= 0.0:
+            raise ValueError("at least one budget coverage weight must be positive")
       if photometric_budget_admission_mode not in {
             "channel_only",
             "channel_or_lab",
@@ -377,6 +474,27 @@ class DynamicExpertManager:
       self.cold_start_max_samples = int(cold_start_max_samples)
       self.cold_start_required_members = int(cold_start_required_members)
       self.cold_start_lab_enabled = bool(cold_start_lab_enabled)
+      self.cold_start_provisional_enabled = bool(
+            cold_start_provisional_enabled
+        )
+      self.cold_start_provisional_confirm_steps = int(
+            cold_start_provisional_confirm_steps
+        )
+      self.cold_start_provisional_max_wait_steps = int(
+            cold_start_provisional_max_wait_steps
+        )
+      self.cold_start_provisional_weight = float(
+            cold_start_provisional_weight
+        )
+      self.cold_start_provisional_min_channel_support = float(
+            cold_start_provisional_min_channel_support
+        )
+      self.cold_start_confidence_history = int(
+            cold_start_confidence_history
+        )
+      self.cold_start_reference_confidence_mode = (
+            cold_start_reference_confidence_mode
+        )
       self.lab_ewma_alpha = float(lab_ewma_alpha)
       self.lab_ewma_threshold_k = float(lab_ewma_threshold_k)
       self.lab_ewma_confirm_steps = int(lab_ewma_confirm_steps)
@@ -432,6 +550,9 @@ class DynamicExpertManager:
       self.photometric_relevant_history_enabled = bool(
             photometric_relevant_history_enabled
       )
+      self.photometric_fitness_history_enabled = bool(
+            photometric_fitness_history_enabled
+        )
       self.photometric_history_min = int(photometric_history_min)
       self.photometric_history_max = int(photometric_history_max)
       self.photometric_history_distance_threshold = float(
@@ -452,8 +573,32 @@ class DynamicExpertManager:
       self.photometric_history_extreme_risk_max = float(
             photometric_history_extreme_risk_max
       )
+      self.photometric_state_registry_cap = int(
+            photometric_state_registry_cap
+      )
+      self.photometric_state_distribution_enabled = bool(
+            photometric_state_distribution_enabled
+      )
+      self.photometric_temporary_state_enabled = bool(
+            photometric_temporary_state_enabled
+      )
       self.photometric_adaptive_candidate_evidence = bool(
             photometric_adaptive_candidate_evidence
+        )
+      self.photometric_stable_lab_anchor_enabled = bool(
+            photometric_stable_lab_anchor_enabled
+        )
+      self.photometric_denstream_support_enabled = bool(
+            photometric_denstream_support_enabled
+        )
+      self.photometric_denstream_decay = float(
+            photometric_denstream_decay
+        )
+      self.photometric_denstream_mature_support = float(
+            photometric_denstream_mature_support
+        )
+      self.photometric_denstream_discard_support = float(
+            photometric_denstream_discard_support
         )
       self.photometric_budget_replacement = bool(
             photometric_budget_replacement
@@ -467,6 +612,40 @@ class DynamicExpertManager:
             budget_min_new_coverage_fraction
       )
       self.budget_replacement_margin = float(budget_replacement_margin)
+      self.budget_coverage_loss_enabled = bool(
+            budget_coverage_loss_enabled
+      )
+      self.budget_coverage_min_loss_only = bool(
+            budget_coverage_min_loss_only
+      )
+      self.budget_coverage_joint_eviction_enabled = bool(
+            budget_coverage_joint_eviction_enabled
+      )
+      self.budget_patch_coverage_enabled = bool(
+            budget_patch_coverage_enabled
+      )
+      self.budget_patch_prototype_count = int(
+            budget_patch_prototype_count
+      )
+      if self.budget_patch_prototype_count <= 0:
+            raise ValueError(
+                "budget_patch_prototype_count must be positive"
+            )
+      self.budget_patch_victim_selection_enabled = bool(
+            budget_patch_victim_selection_enabled
+      )
+      self.budget_patch_kcenter_victim_selection_enabled = bool(
+            budget_patch_kcenter_victim_selection_enabled
+      )
+      self.budget_coverage_channel_weight = float(
+            budget_coverage_channel_weight
+      )
+      self.budget_coverage_lab_weight = float(
+            budget_coverage_lab_weight
+      )
+      self.budget_coverage_dino_weight = float(
+            budget_coverage_dino_weight
+      )
       self.minimum_active_experts = int(minimum_active_experts)
       self.lifecycle_mode = lifecycle_mode
       self.drift_candidate_audit_enabled = bool(
@@ -488,8 +667,12 @@ class DynamicExpertManager:
       self.novel_quarantine = None
       self.novel_quarantine_route = None
       self.last_novel_quarantine_event = None
+      self.last_fitness_history_profile = None
       self.confirmed_provisional = None
       self.bootstrap_members = []
+      self.bootstrap_provisional = None
+      self.bootstrap_confidence_members = []
+      self.bootstrap_confidence_expert_id = None
       self.last_bootstrap_event = None
       self.drift_candidate_pool = None
       self.last_drift_candidate_audit_event = None
@@ -510,12 +693,28 @@ class DynamicExpertManager:
       self.photometric_pool_abort_reason = None
       self.historical_states = []
       self.next_historical_state_id = 0
+      self.state_lifecycle_events = []
       self.last_budget_replacement = None
       self.last_budget_replacement_evaluation = None
       self.last_history_reentry_event = None
       self.coverage_history = []
 
     def provisional_expert_before_step(self):
+        if self.bootstrap_provisional is not None:
+            representatives = self.bootstrap_provisional["members"]
+            representative = representatives[0]
+            return {
+                "image_id": int(representative["image_id"]),
+                "image_ids": [
+                    int(member["image_id"]) for member in representatives
+                ],
+                "memory_members": [],
+                "representative_step": int(representative["step"]),
+                "start_step": int(self.bootstrap_provisional["start_step"]),
+                "pool_size": len(representatives),
+                "weight": float(self.cold_start_provisional_weight),
+                "state": "bootstrap_provisional",
+            }
         if (
             self.novel_admission_mode
             not in {
@@ -606,6 +805,35 @@ class DynamicExpertManager:
             }
             if expert.get("admission_route", "legacy") != "legacy":
                 snapshot["admission_route"] = expert["admission_route"]
+            if expert.get("scoring_weight") is not None:
+                snapshot["scoring_weight"] = float(
+                    expert["scoring_weight"]
+                )
+                snapshot["state_confidence"] = float(
+                    expert.get("state_confidence", expert["scoring_weight"])
+                )
+                snapshot["normality_confidence"] = float(
+                    expert.get("normality_confidence", 1.0)
+                )
+                snapshot["reference_confidence"] = float(
+                    expert.get(
+                        "reference_confidence", expert["scoring_weight"]
+                    )
+                )
+            if expert.get("state_effective_support") is not None:
+                snapshot["state_effective_support"] = float(
+                    expert["state_effective_support"]
+                )
+                snapshot["state_member_image_ids"] = [
+                    int(member_id)
+                    for member_id in expert.get(
+                        "state_member_image_ids", [expert["image_id"]]
+                    )
+                ]
+                snapshot["state_member_weights"] = [
+                    float(weight)
+                    for weight in expert.get("state_member_weights", [])
+                ]
             if expert.get("lab_state") is not None:
                 snapshot["lab_state"] = dict(expert["lab_state"])
             snapshots.append(snapshot)
@@ -625,6 +853,21 @@ class DynamicExpertManager:
             }
             if expert.get("admission_route", "legacy") != "legacy":
                 snapshot["admission_route"] = expert["admission_route"]
+            if expert.get("scoring_weight") is not None:
+                snapshot["scoring_weight"] = float(
+                    expert["scoring_weight"]
+                )
+                snapshot["state_confidence"] = float(
+                    expert.get("state_confidence", expert["scoring_weight"])
+                )
+                snapshot["normality_confidence"] = float(
+                    expert.get("normality_confidence", 1.0)
+                )
+                snapshot["reference_confidence"] = float(
+                    expert.get(
+                        "reference_confidence", expert["scoring_weight"]
+                    )
+                )
             snapshots.append(snapshot)
         return snapshots
 
@@ -660,6 +903,27 @@ class DynamicExpertManager:
                     "admission_ttl_mode"
                 ],
                 "admission_route": expert.get("admission_route", "legacy"),
+                "scoring_weight": expert.get("scoring_weight"),
+                "state_confidence": expert.get("state_confidence"),
+                "normality_confidence": expert.get(
+                    "normality_confidence"
+                ),
+                "reference_confidence": expert.get(
+                    "reference_confidence"
+                ),
+                "state_effective_support": expert.get(
+                    "state_effective_support"
+                ),
+                "state_member_image_ids": [
+                    int(member_id)
+                    for member_id in expert.get(
+                        "state_member_image_ids", []
+                    )
+                ],
+                "state_member_weights": [
+                    float(weight)
+                    for weight in expert.get("state_member_weights", [])
+                ],
                 "lifecycle_state": expert.get(
                     "lifecycle_state", "active"
                 ),
@@ -815,6 +1079,44 @@ class DynamicExpertManager:
             dim=0,
         ).cpu()
 
+    def _patch_coreset(self, dino_patch_features, patch_ids=None):
+        if not self.budget_patch_coverage_enabled:
+            return None
+        features = dino_patch_features.detach().float().cpu()
+        if features.ndim != 2:
+            raise ValueError(
+                "dino_patch_features must have shape "
+                "[patch_count, feature_dim]"
+            )
+        if patch_ids:
+            indices = torch.as_tensor(
+                sorted({int(patch_id) for patch_id in patch_ids}),
+                dtype=torch.long,
+            )
+            features = features.index_select(0, indices)
+        features = F.normalize(features, dim=1)
+        budget = min(
+            int(self.budget_patch_prototype_count),
+            int(features.shape[0]),
+        )
+        if budget == int(features.shape[0]):
+            return features
+        center = F.normalize(features.mean(dim=0), dim=0)
+        first = int((features @ center).argmax())
+        selected = [first]
+        maximum_similarity = features @ features[first]
+        for _ in range(1, budget):
+            next_index = int(maximum_similarity.argmin())
+            selected.append(next_index)
+            maximum_similarity = torch.maximum(
+                maximum_similarity,
+                features @ features[next_index],
+            )
+        return features.index_select(
+            0,
+            torch.as_tensor(selected, dtype=torch.long),
+        )
+
     @staticmethod
     def _lab_feature(value):
         if value is None:
@@ -837,11 +1139,17 @@ class DynamicExpertManager:
             "total_distance": float(np.linalg.norm(delta)),
         }
 
-    def _build_lab_state(self, members):
+    def _build_lab_state(
+        self,
+        members,
+        existing_state=None,
+        freeze_anchor=True,
+        step=None,
+    ):
         features = [
-            member["lab_feature"]
+            member.get("lab_feature")
             for member in members
-            if member["lab_feature"] is not None
+            if member.get("lab_feature") is not None
         ]
         if not self.cold_start_lab_enabled or len(features) != len(members):
             return None
@@ -855,6 +1163,7 @@ class DynamicExpertManager:
         state = {
             "member_image_ids": [int(member["image_id"]) for member in members],
             "center": center.tolist(),
+            "coverage_center": center.tolist(),
             "recent_lab_history": [
                 {
                     "step": int(member["step"]),
@@ -871,6 +1180,9 @@ class DynamicExpertManager:
             "l_streak": 0,
             "ab_streak": 0,
             "drift_confirmed": False,
+            "detector_center": center.tolist(),
+            "detector_ready": bool(freeze_anchor),
+            "detector_rebase_count": 0,
         }
         for channel in ("l", "ab"):
             values = np.asarray(
@@ -886,7 +1198,158 @@ class DynamicExpertManager:
                 median + self.lab_ewma_threshold_k * scale
             )
             state[f"{channel}_ewma"] = median
+
+        existing_state = existing_state or {}
+        if existing_state.get("detector_ready", False):
+            state["detector_center"] = list(
+                existing_state.get(
+                    "detector_center",
+                    existing_state.get(
+                        "anchor_center",
+                        existing_state.get("center", center.tolist()),
+                    ),
+                )
+            )
+            state["detector_ready"] = True
+            state["detector_rebase_count"] = int(
+                existing_state.get("detector_rebase_count", 0)
+            )
+            state["recent_lab_history"] = list(
+                existing_state.get("recent_lab_history", [])
+            )
+            state["candidate_lab_history"] = list(
+                existing_state.get("candidate_lab_history", [])
+            )
+            for channel in ("l", "ab"):
+                for suffix in (
+                    "baseline_median",
+                    "baseline_mad",
+                    "threshold",
+                    "ewma",
+                    "streak",
+                ):
+                    key = f"{channel}_{suffix}"
+                    if key in existing_state:
+                        state[key] = existing_state[key]
+            state["drift_confirmed"] = bool(
+                existing_state.get("drift_confirmed", False)
+            )
+
+        if not self.photometric_stable_lab_anchor_enabled:
+            return state
+
+        anchor_frozen = bool(existing_state.get("anchor_frozen", False))
+        if anchor_frozen:
+            state["anchor_center"] = list(existing_state["anchor_center"])
+            state["anchor_member_image_ids"] = list(
+                existing_state.get("anchor_member_image_ids", [])
+            )
+            state["anchor_created_step"] = existing_state.get(
+                "anchor_created_step"
+            )
+            state["anchor_frozen"] = True
+            state["recent_lab_history"] = list(
+                existing_state.get("recent_lab_history", [])
+            )
+            state["candidate_lab_history"] = list(
+                existing_state.get("candidate_lab_history", [])
+            )
+            for channel in ("l", "ab"):
+                for suffix in (
+                    "baseline_median",
+                    "baseline_mad",
+                    "threshold",
+                    "ewma",
+                    "streak",
+                ):
+                    state[f"{channel}_{suffix}"] = existing_state[
+                        f"{channel}_{suffix}"
+                    ]
+            state["drift_confirmed"] = bool(
+                existing_state.get("drift_confirmed", False)
+            )
+            return state
+
+        state["anchor_center"] = center.tolist()
+        state["anchor_member_image_ids"] = [
+            int(member["image_id"]) for member in members
+        ]
+        state["anchor_created_step"] = (
+            int(step) if step is not None else None
+        )
+        state["anchor_frozen"] = bool(freeze_anchor)
+        state["candidate_lab_history"] = []
         return state
+
+    def _rebase_lab_detector(self, expert, members, step):
+        state = expert.get("lab_state")
+        features = [
+            member.get("lab_feature")
+            for member in members
+            if member.get("lab_feature") is not None
+        ]
+        if state is None or not features:
+            return False
+
+        features = np.stack(features, axis=0)
+        center = np.median(features, axis=0)
+        profiles = [
+            self._lab_distances(feature, center) for feature in features
+        ]
+        state["detector_center"] = center.tolist()
+        state["detector_ready"] = True
+        state["detector_rebase_count"] = int(
+            state.get("detector_rebase_count", 0)
+        ) + 1
+        state["detector_rebase_step"] = int(step)
+        state["drift_confirmed"] = False
+        state["candidate_lab_history"] = []
+        state["recent_lab_history"] = [
+            {
+                "step": int(member["step"]),
+                "image_id": int(member["image_id"]),
+                "feature": np.asarray(
+                    member["lab_feature"], dtype=np.float64
+                ).tolist(),
+            }
+            for member in members
+            if member.get("lab_feature") is not None
+        ][-self.photometric_history_max:]
+        for channel in ("l", "ab"):
+            values = np.asarray(
+                [profile[f"{channel}_distance"] for profile in profiles],
+                dtype=np.float64,
+            )
+            median = float(np.median(values))
+            mad = float(np.median(np.abs(values - median)))
+            scale = max(1.4826 * mad, 1e-12)
+            state[f"{channel}_baseline_median"] = median
+            state[f"{channel}_baseline_mad"] = mad
+            state[f"{channel}_threshold"] = float(
+                median + self.lab_ewma_threshold_k * scale
+            )
+            state[f"{channel}_ewma"] = median
+            state[f"{channel}_streak"] = 0
+        return True
+
+    def _rebase_photometric_trigger_detector(self, members, step):
+        expert_id = (
+            self.photometric_trigger_expert_id
+            if self.photometric_trigger_expert_id is not None
+            else self.photometric_episode_reference_expert_id
+        )
+        expert = next(
+            (
+                item
+                for item in self.active_experts
+                if expert_id is not None
+                and int(item["expert_id"]) == int(expert_id)
+            ),
+            None,
+        )
+        if expert is None:
+            return False
+        return self._rebase_lab_detector(expert, members, step)
 
     def _relevant_lab_history_profile(self, state, current_record):
         records = list(state.get("recent_lab_history", []))
@@ -978,7 +1441,277 @@ class DynamicExpertManager:
             "history_shortened": int(best["size"]) < len(records),
         }
 
-    def _advance_cold_start(
+    def _admit_bootstrap_expert(
+        self,
+        selected,
+        similarities,
+        step,
+        pool_size,
+        minimum_similarity,
+        *,
+        forced,
+        confirmation_steps=0,
+    ):
+        medoid_index = int(similarities.mean(dim=1).argmax())
+        representative = selected[medoid_index]
+        cluster_id = len(self.clusters)
+        self.clusters.append(
+            {
+                "embedding_sum": torch.stack(
+                    [item["embedding"] for item in selected]
+                ).sum(dim=0),
+                "members": selected,
+                "active_expert_id": self.next_expert_id,
+            }
+        )
+        expert = {
+            "expert_id": self.next_expert_id,
+            "image_id": representative["image_id"],
+            "cluster_id": cluster_id,
+            "admission_step": int(step),
+            "cluster_support_at_admission": len(selected),
+            "max_support_gap": 0,
+            "last_supported_step": int(step),
+            "support_count": len(selected),
+            "patience": self.base_ttl,
+            "ttl": self.base_ttl,
+            "deletion_step": None,
+            "last_event": "admitted",
+            "lifecycle_state": "active",
+            "last_channel_support": None,
+            "representative_mode": "bootstrap_medoid",
+            "admission_ttl_mode": "base",
+            "admission_route": "bootstrap",
+            "lab_state": self._build_lab_state(selected, step=step),
+        }
+        self.active_experts.append(expert)
+        self._register_expert_historical_state(expert, "active", step)
+        self.admitted_count += 1
+        self.next_expert_id += 1
+        self.bootstrap_provisional = None
+        self.last_bootstrap_event = {
+            "decision": "admitted",
+            "pool_size": int(pool_size),
+            "selected_image_ids": [
+                int(item["image_id"]) for item in selected
+            ],
+            "representative_image_id": int(representative["image_id"]),
+            "minimum_similarity": float(minimum_similarity),
+            "forced": bool(forced),
+            "confirmation_steps": int(confirmation_steps),
+        }
+        return True, cluster_id, expert["expert_id"], "bootstrap"
+
+    @staticmethod
+    def _continuous_rank(values, higher_is_better=True):
+        values = np.asarray(values, dtype=np.float64)
+        finite = np.isfinite(values)
+        ranks = np.full(values.shape, 0.5, dtype=np.float64)
+        finite_values = values[finite]
+        if finite_values.size == 0:
+            return ranks
+        for index in np.flatnonzero(finite):
+            value = values[index]
+            lower = float(np.sum(finite_values < value))
+            equal = float(np.sum(finite_values == value))
+            rank = (lower + 0.5 * equal) / finite_values.size
+            ranks[index] = rank if higher_is_better else 1.0 - rank
+        return ranks
+
+    @staticmethod
+    def _prequential_rank(value, history, higher_is_better):
+        if value is None or not np.isfinite(value):
+            return None
+        history = np.asarray(history, dtype=np.float64)
+        history = history[np.isfinite(history)]
+        if history.size == 0:
+            return None
+        if higher_is_better:
+            supported = np.sum(history <= float(value))
+        else:
+            supported = np.sum(history >= float(value))
+        return float((1.0 + supported) / (history.size + 1.0))
+
+    def _bootstrap_prequential_profile(self, prior_members, member):
+        structural_support = None
+        if len(prior_members) >= 2:
+            prior_embeddings = torch.stack(
+                [item["embedding"] for item in prior_members]
+            )
+            prior_similarities = prior_embeddings @ prior_embeddings.T
+            prior_mask = ~torch.eye(
+                len(prior_members),
+                dtype=torch.bool,
+                device=prior_similarities.device,
+            )
+            prior_centralities = prior_similarities[prior_mask].reshape(
+                len(prior_members), len(prior_members) - 1
+            ).median(dim=1).values
+            current_similarities = (
+                prior_embeddings @ member["embedding"]
+            )
+            current_centrality = float(
+                current_similarities.median().item()
+            )
+            structural_support = self._prequential_rank(
+                current_centrality,
+                prior_centralities.detach().cpu().numpy(),
+                higher_is_better=True,
+            )
+
+        risk_support = self._prequential_rank(
+            member.get("ms_score"),
+            [item.get("ms_score") for item in prior_members],
+            higher_is_better=False,
+        )
+        channel_support = self._prequential_rank(
+            member.get("channel_support"),
+            [item.get("channel_support") for item in prior_members],
+            higher_is_better=True,
+        )
+        supports = [
+            value
+            for value in (
+                structural_support,
+                risk_support,
+                channel_support,
+            )
+            if value is not None
+        ]
+        combined_support = (
+            float(np.prod(supports) ** (1.0 / len(supports)))
+            if supports
+            else None
+        )
+        return {
+            "structural_support": structural_support,
+            "risk_support": risk_support,
+            "channel_support": channel_support,
+            "combined_support": combined_support,
+            "evidence_count": len(supports),
+        }
+
+    def _bootstrap_confidence_profile(self, members):
+        embeddings = torch.stack([member["embedding"] for member in members])
+        similarities = embeddings @ embeddings.T
+        count = len(members)
+        if count == 1:
+            structural_centrality = np.asarray([1.0], dtype=np.float64)
+        else:
+            mask = ~torch.eye(
+                count,
+                dtype=torch.bool,
+                device=similarities.device,
+            )
+            structural_centrality = similarities[mask].reshape(
+                count, count - 1
+            ).median(dim=1).values.cpu().numpy()
+
+        structural_rank = self._continuous_rank(
+            structural_centrality,
+            higher_is_better=True,
+        )
+        risk_rank = self._continuous_rank(
+            [
+                member["ms_score"]
+                if member.get("ms_score") is not None
+                else np.nan
+                for member in members
+            ],
+            higher_is_better=False,
+        )
+        support_rank = self._continuous_rank(
+            [
+                member["channel_support"]
+                if member.get("channel_support") is not None
+                else np.nan
+                for member in members
+            ],
+            higher_is_better=True,
+        )
+        evidence = np.cbrt(
+            np.maximum(structural_rank, 1e-12)
+            * np.maximum(risk_rank, 1e-12)
+            * np.maximum(support_rank, 1e-12)
+        )
+        if self.cold_start_reference_confidence_mode == "prequential":
+            prequential_weights = np.asarray(
+                [
+                    member.get("prequential_support")
+                    if member.get("prequential_support") is not None
+                    else 0.5
+                    for member in members
+                ],
+                dtype=np.float64,
+            )
+            evidence *= np.clip(prequential_weights, 1e-6, 1.0)
+        weights = evidence / evidence.sum()
+        weight_tensor = torch.as_tensor(
+            weights,
+            dtype=similarities.dtype,
+            device=similarities.device,
+        )
+        medoid_scores = similarities @ weight_tensor
+        representative_index = int(medoid_scores.argmax())
+        effective_support = float(1.0 / np.square(weights).sum())
+
+        if count == 1:
+            coherence = 1.0
+        else:
+            pair_weights = np.outer(weights, weights)
+            np.fill_diagonal(pair_weights, 0.0)
+            pair_total = float(pair_weights.sum())
+            pair_similarities = similarities.detach().cpu().numpy()
+            coherence = float(
+                (pair_weights * ((pair_similarities + 1.0) * 0.5)).sum()
+                / max(pair_total, 1e-12)
+            )
+        state_confidence = float(
+            np.clip(
+                (1.0 - 1.0 / effective_support) * coherence,
+                0.0,
+                1.0,
+            )
+        )
+        prequential_supports = np.asarray(
+            [
+                member.get("prequential_support", np.nan)
+                if member.get("prequential_support") is not None
+                else np.nan
+                for member in members
+            ],
+            dtype=np.float64,
+        )
+        finite_prequential = prequential_supports[
+            np.isfinite(prequential_supports)
+        ]
+        if self.cold_start_reference_confidence_mode == "prequential":
+            normality_confidence = (
+                float(finite_prequential.mean())
+                if finite_prequential.size
+                else 0.0
+            )
+            reference_confidence = float(
+                state_confidence * normality_confidence
+            )
+        else:
+            normality_confidence = 1.0
+            reference_confidence = state_confidence
+        return {
+            "weights": weights,
+            "similarities": similarities,
+            "representative_index": representative_index,
+            "effective_support": effective_support,
+            "coherence": coherence,
+            "confidence": state_confidence,
+            "state_confidence": state_confidence,
+            "normality_confidence": normality_confidence,
+            "reference_confidence": reference_confidence,
+            "prequential_support_count": int(finite_prequential.size),
+            "structural_centrality": structural_centrality,
+        }
+
+    def _advance_confidence_cold_start(
         self,
         step,
         image_id,
@@ -987,21 +1720,304 @@ class DynamicExpertManager:
         channel_support,
         lab_feature,
     ):
+        member = {
+            "step": int(step),
+            "image_id": int(image_id),
+            "embedding": self._image_embedding(dino_patch_features),
+            "patch_prototypes": self._patch_coreset(
+                dino_patch_features
+            ),
+            "quality": float(channel_support or 0.0) - float(ms_score or 0.0),
+            "ms_score": ms_score,
+            "channel_support": channel_support,
+            "ms_threshold": None,
+            "support_threshold": None,
+            "candidate_route": "bootstrap_confidence",
+            "provisional_channel_support": None,
+            "lab_feature": self._lab_feature(lab_feature),
+        }
+        prequential_profile = None
+        if self.cold_start_reference_confidence_mode == "prequential":
+            prequential_profile = self._bootstrap_prequential_profile(
+                self.bootstrap_confidence_members,
+                member,
+            )
+            member["prequential_support"] = prequential_profile[
+                "combined_support"
+            ]
+            member["prequential_profile"] = prequential_profile
+        self.bootstrap_confidence_members.append(member)
+        del self.bootstrap_confidence_members[
+            :-self.cold_start_confidence_history
+        ]
+        profile = self._bootstrap_confidence_profile(
+            self.bootstrap_confidence_members
+        )
+        representative = self.bootstrap_confidence_members[
+            profile["representative_index"]
+        ]
+        member_ids = [
+            int(item["image_id"])
+            for item in self.bootstrap_confidence_members
+        ]
+
+        expert = next(
+            (
+                item
+                for item in self.active_experts
+                if item.get("expert_id")
+                == self.bootstrap_confidence_expert_id
+            ),
+            None,
+        )
+        created = expert is None
+        if created:
+            cluster_id = len(self.clusters)
+            expert = {
+                "expert_id": self.next_expert_id,
+                "image_id": int(representative["image_id"]),
+                "cluster_id": cluster_id,
+                "admission_step": int(step),
+                "cluster_support_at_admission": 1,
+                "max_support_gap": 0,
+                "last_supported_step": int(step),
+                "support_count": 1,
+                "patience": self.base_ttl,
+                "ttl": self.base_ttl,
+                "deletion_step": None,
+                "last_event": "confidence_state_created",
+                "lifecycle_state": "active",
+                "last_channel_support": channel_support,
+                "representative_mode": "confidence_medoid",
+                "admission_ttl_mode": "confidence_managed",
+                "admission_route": "bootstrap_confidence",
+                "lab_state": None,
+            }
+            self.clusters.append(
+                {
+                    "embedding_sum": representative["embedding"].clone(),
+                    "members": list(self.bootstrap_confidence_members),
+                    "active_expert_id": expert["expert_id"],
+                }
+            )
+            self.active_experts.append(expert)
+            self.bootstrap_confidence_expert_id = int(expert["expert_id"])
+            self.admitted_count += 1
+            self.next_expert_id += 1
+        else:
+            cluster_id = int(expert["cluster_id"])
+
+        weights = profile["weights"]
+        weighted_embedding = torch.stack(
+            [
+                item["embedding"] * float(weight)
+                for item, weight in zip(
+                    self.bootstrap_confidence_members, weights
+                )
+            ]
+        ).sum(dim=0)
+        self.clusters[cluster_id]["embedding_sum"] = weighted_embedding
+        self.clusters[cluster_id]["members"] = list(
+            self.bootstrap_confidence_members
+        )
+        expert["image_id"] = int(representative["image_id"])
+        expert["last_supported_step"] = int(step)
+        expert["support_count"] = len(self.bootstrap_confidence_members)
+        expert["last_event"] = (
+            "confidence_state_created"
+            if created
+            else "confidence_state_updated"
+        )
+        expert["lifecycle_state"] = "active"
+        expert["last_channel_support"] = channel_support
+        expert["scoring_weight"] = float(
+            profile["reference_confidence"]
+        )
+        expert["state_confidence"] = float(
+            profile["state_confidence"]
+        )
+        expert["normality_confidence"] = float(
+            profile["normality_confidence"]
+        )
+        expert["reference_confidence"] = float(
+            profile["reference_confidence"]
+        )
+        expert["state_effective_support"] = float(
+            profile["effective_support"]
+        )
+        expert["state_member_image_ids"] = member_ids
+        expert["state_member_weights"] = [
+            float(weight) for weight in weights
+        ]
+        expert["lab_state"] = self._build_lab_state(
+            self.bootstrap_confidence_members,
+            existing_state=expert.get("lab_state"),
+            freeze_anchor=bool(profile["reference_confidence"] > 0.0),
+            step=step,
+        )
+        self._register_expert_historical_state(expert, "active", step)
+
+        self.last_bootstrap_event = {
+            "decision": expert["last_event"],
+            "pool_size": len(self.bootstrap_confidence_members),
+            "selected_image_ids": member_ids,
+            "representative_image_id": int(representative["image_id"]),
+            "state_confidence": float(profile["state_confidence"]),
+            "normality_confidence": float(
+                profile["normality_confidence"]
+            ),
+            "reference_confidence": float(
+                profile["reference_confidence"]
+            ),
+            "prequential_support": (
+                prequential_profile["combined_support"]
+                if prequential_profile is not None
+                else None
+            ),
+            "prequential_profile": prequential_profile,
+            "prequential_support_count": int(
+                profile["prequential_support_count"]
+            ),
+            "state_effective_support": float(profile["effective_support"]),
+            "state_coherence": float(profile["coherence"]),
+            "member_weights": [float(weight) for weight in weights],
+            "forced": False,
+        }
+        return (
+            True,
+            cluster_id,
+            expert["expert_id"] if created else None,
+            "bootstrap_confidence",
+        )
+
+    def _advance_cold_start(
+        self,
+        step,
+        image_id,
+        dino_patch_features,
+        ms_score,
+        channel_support,
+        provisional_channel_support,
+        lab_feature,
+    ):
         embedding = self._image_embedding(dino_patch_features)
         member = {
             "step": int(step),
             "image_id": int(image_id),
             "embedding": embedding,
+            "patch_prototypes": self._patch_coreset(
+                dino_patch_features
+            ),
             "quality": float(channel_support or 0.0) - float(ms_score or 0.0),
             "ms_score": ms_score,
             "channel_support": channel_support,
             "ms_threshold": None,
             "support_threshold": None,
             "candidate_route": "bootstrap",
-            "provisional_channel_support": None,
+            "provisional_channel_support": provisional_channel_support,
             "lab_feature": self._lab_feature(lab_feature),
         }
+
+        if self.bootstrap_provisional is not None:
+            provisional = self.bootstrap_provisional
+            similarity = float(embedding @ provisional["embedding_center"])
+            support_values = [
+                float(value)
+                for value in (provisional_channel_support, channel_support)
+                if value is not None
+            ]
+            observed_support = max(support_values) if support_values else None
+            support_ok = bool(
+                observed_support is not None
+                and observed_support
+                >= self.cold_start_provisional_min_channel_support
+            )
+            risk_ceiling = provisional.get("risk_ceiling")
+            risk_ok = bool(
+                ms_score is not None
+                and np.isfinite(float(ms_score))
+                and (
+                    risk_ceiling is None
+                    or float(ms_score) <= float(risk_ceiling)
+                )
+            )
+            consistent = bool(
+                similarity >= self.duplicate_similarity
+                and support_ok
+                and risk_ok
+            )
+            provisional["wait_steps"] += 1
+            provisional["confirm_streak"] = (
+                provisional["confirm_streak"] + 1 if consistent else 0
+            )
+            provisional["last_similarity"] = similarity
+            provisional["last_channel_support"] = observed_support
+            provisional["last_ms_score"] = ms_score
+            if (
+                provisional["confirm_streak"]
+                >= self.cold_start_provisional_confirm_steps
+            ):
+                return self._admit_bootstrap_expert(
+                    provisional["members"],
+                    provisional["similarities"],
+                    step,
+                    provisional["pool_size"],
+                    provisional["minimum_similarity"],
+                    forced=False,
+                    confirmation_steps=provisional["confirm_streak"],
+                )
+            if (
+                provisional["wait_steps"]
+                >= self.cold_start_provisional_max_wait_steps
+            ):
+                provisional_ids = [
+                    int(item["image_id"]) for item in provisional["members"]
+                ]
+                self.bootstrap_provisional = None
+                self.bootstrap_members = [member]
+                self.last_bootstrap_event = {
+                    "decision": "rolled_back",
+                    "pool_size": int(provisional["pool_size"]),
+                    "selected_image_ids": [],
+                    "provisional_image_ids": provisional_ids,
+                    "minimum_similarity": float(
+                        provisional["minimum_similarity"]
+                    ),
+                    "confirmation_similarity": similarity,
+                    "confirmation_channel_support": observed_support,
+                    "confirmation_ms_score": ms_score,
+                    "confirmation_risk_ceiling": risk_ceiling,
+                    "confirmation_steps": int(provisional["confirm_streak"]),
+                    "forced": False,
+                }
+                return True, None, None, "bootstrap"
+            self.last_bootstrap_event = {
+                "decision": "provisional_confirming",
+                "pool_size": int(provisional["pool_size"]),
+                "selected_image_ids": [],
+                "provisional_image_ids": [
+                    int(item["image_id"]) for item in provisional["members"]
+                ],
+                "minimum_similarity": float(
+                    provisional["minimum_similarity"]
+                ),
+                "confirmation_similarity": similarity,
+                "confirmation_channel_support": observed_support,
+                "confirmation_ms_score": ms_score,
+                "confirmation_risk_ceiling": risk_ceiling,
+                "confirmation_steps": int(provisional["confirm_streak"]),
+                "forced": False,
+            }
+            return True, None, None, "bootstrap"
+
         self.bootstrap_members.append(member)
+        if (
+            self.cold_start_provisional_enabled
+            and len(self.bootstrap_members) > self.cold_start_max_samples
+        ):
+            self.bootstrap_members = self.bootstrap_members[
+                -self.cold_start_max_samples:
+            ]
         pool_size = len(self.bootstrap_members)
         self.last_bootstrap_event = {
             "decision": "collecting",
@@ -1034,67 +2050,75 @@ class DynamicExpertManager:
             ]
             minimum = float(pair_values.min())
             mean = float(pair_values.mean())
-            score = (minimum, mean, tuple(-index for index in indices))
+            mean_quality = float(
+                np.mean([item["quality"] for item in selected])
+            )
+            score = (
+                minimum,
+                mean,
+                mean_quality,
+                tuple(-index for index in indices),
+            )
             if best is None or score > best[0]:
                 best = (score, indices, selected, similarities)
 
         minimum_similarity = best[0][0]
-        forced = pool_size >= self.cold_start_max_samples
+        forced = bool(
+            not self.cold_start_provisional_enabled
+            and pool_size >= self.cold_start_max_samples
+        )
         if minimum_similarity < self.duplicate_similarity and not forced:
             return True, None, None, "bootstrap"
 
         _, _, selected, similarities = best
-        medoid_index = int(similarities.mean(dim=1).argmax())
-        representative = selected[medoid_index]
-        cluster_id = len(self.clusters)
-        self.clusters.append(
-            {
-                "embedding_sum": torch.stack(
-                    [item["embedding"] for item in selected]
-                ).sum(dim=0),
+        if self.cold_start_provisional_enabled:
+            selected_risks = [
+                float(item["ms_score"])
+                for item in selected
+                if item.get("ms_score") is not None
+                and np.isfinite(float(item["ms_score"]))
+            ]
+            embedding_center = F.normalize(
+                torch.stack([item["embedding"] for item in selected]).sum(dim=0),
+                dim=0,
+            )
+            self.bootstrap_provisional = {
                 "members": selected,
-                "active_expert_id": self.next_expert_id,
+                "similarities": similarities,
+                "embedding_center": embedding_center,
+                "start_step": int(step),
+                "pool_size": int(pool_size),
+                "minimum_similarity": float(minimum_similarity),
+                "wait_steps": 0,
+                "confirm_streak": 0,
+                "last_similarity": None,
+                "last_channel_support": None,
+                "last_ms_score": None,
+                "risk_ceiling": (
+                    max(selected_risks) if selected_risks else None
+                ),
             }
-        )
-        expert = {
-            "expert_id": self.next_expert_id,
-            "image_id": representative["image_id"],
-            "cluster_id": cluster_id,
-            "admission_step": int(step),
-            "cluster_support_at_admission": len(selected),
-            "max_support_gap": 0,
-            "last_supported_step": int(step),
-            "support_count": len(selected),
-            "patience": self.base_ttl,
-            "ttl": self.base_ttl,
-            "deletion_step": None,
-            "last_event": "admitted",
-            "lifecycle_state": "active",
-            "last_channel_support": None,
-            "representative_mode": "bootstrap_medoid",
-            "admission_ttl_mode": "base",
-            "admission_route": "bootstrap",
-            "lab_state": self._build_lab_state(selected),
-        }
-        self.active_experts.append(expert)
-        self._register_expert_historical_state(
-            expert,
-            "active",
+            self.last_bootstrap_event = {
+                "decision": "provisional_created",
+                "pool_size": int(pool_size),
+                "selected_image_ids": [],
+                "provisional_image_ids": [
+                    int(item["image_id"]) for item in selected
+                ],
+                "minimum_similarity": float(minimum_similarity),
+                "risk_ceiling": self.bootstrap_provisional["risk_ceiling"],
+                "confirmation_steps": 0,
+                "forced": False,
+            }
+            return True, None, None, "bootstrap"
+        return self._admit_bootstrap_expert(
+            selected,
+            similarities,
             step,
+            pool_size,
+            minimum_similarity,
+            forced=forced,
         )
-        self.admitted_count += 1
-        self.next_expert_id += 1
-        self.last_bootstrap_event = {
-            "decision": "admitted",
-            "pool_size": pool_size,
-            "selected_image_ids": [
-                int(item["image_id"]) for item in selected
-            ],
-            "representative_image_id": int(representative["image_id"]),
-            "minimum_similarity": minimum_similarity,
-            "forced": bool(forced),
-        }
-        return True, cluster_id, expert["expert_id"], "bootstrap"
 
     def advance_lab_state(self, lab_feature, step=None, image_id=None):
         feature = self._lab_feature(lab_feature)
@@ -1104,6 +2128,11 @@ class DynamicExpertManager:
             expert
             for expert in self.active_experts
             if expert.get("lab_state") is not None
+            and expert["lab_state"].get("detector_ready", True)
+            and (
+                not self.photometric_stable_lab_anchor_enabled
+                or expert["lab_state"].get("anchor_frozen", False)
+            )
         ]
         if not candidates:
             return None
@@ -1111,22 +2140,29 @@ class DynamicExpertManager:
         profiles = []
         for expert in candidates:
             state = expert["lab_state"]
+            reference_center = np.asarray(
+                state.get(
+                    "anchor_center",
+                    state.get("detector_center", state["center"]),
+                ),
+                dtype=np.float64,
+            )
             distances = self._lab_distances(
                 feature,
-                np.asarray(state["center"], dtype=np.float64),
+                reference_center,
             )
             profiles.append((distances["total_distance"], expert, distances))
         _, expert, distances = min(profiles, key=lambda item: item[0])
         state = expert["lab_state"]
+        record_step = self.last_step + 1 if step is None else int(step)
+        record_image_id = record_step if image_id is None else int(image_id)
+        current_record = {
+            "step": record_step,
+            "image_id": record_image_id,
+            "feature": feature.tolist(),
+        }
         relevant_profile = None
         if self.photometric_relevant_history_enabled:
-            record_step = self.last_step + 1 if step is None else int(step)
-            record_image_id = record_step if image_id is None else int(image_id)
-            current_record = {
-                "step": record_step,
-                "image_id": record_image_id,
-                "feature": feature.tolist(),
-            }
             relevant_profile = self._relevant_lab_history_profile(
                 state,
                 current_record,
@@ -1134,12 +2170,14 @@ class DynamicExpertManager:
             history = list(state.get("recent_lab_history", []))
             history.append(current_record)
             state["recent_lab_history"] = history[-self.photometric_history_max:]
+        channel_hits = {}
         for channel in ("l", "ab"):
             state[f"{channel}_ewma"] = float(
                 state["alpha"] * distances[f"{channel}_distance"]
                 + (1.0 - state["alpha"]) * state[f"{channel}_ewma"]
             )
             hit = state[f"{channel}_ewma"] > state[f"{channel}_threshold"]
+            channel_hits[channel] = bool(hit)
             state[f"{channel}_streak"] = (
                 state[f"{channel}_streak"] + 1 if hit else 0
             )
@@ -1151,13 +2189,89 @@ class DynamicExpertManager:
         just_confirmed = bool(
             state["drift_confirmed"] and not previously_confirmed
         )
+        candidate_center = None
+        candidate_distances = None
+        candidate_history = []
+        if self.photometric_stable_lab_anchor_enabled:
+            if any(channel_hits.values()):
+                candidate_history = list(
+                    state.get("candidate_lab_history", [])
+                )
+                candidate_history.append(current_record)
+                candidate_history = candidate_history[
+                    -self.photometric_history_max:
+                ]
+            state["candidate_lab_history"] = candidate_history
+            if candidate_history:
+                candidate_center = np.median(
+                    np.stack(
+                        [
+                            np.asarray(record["feature"], dtype=np.float64)
+                            for record in candidate_history
+                        ],
+                        axis=0,
+                    ),
+                    axis=0,
+                )
+                candidate_distances = self._lab_distances(
+                    candidate_center,
+                    np.asarray(state["anchor_center"], dtype=np.float64),
+                )
+        anchor_center = np.asarray(
+            state.get(
+                "anchor_center",
+                state.get("detector_center", state["center"]),
+            ),
+            dtype=np.float64,
+        )
+        coverage_center = np.asarray(
+            state.get("coverage_center", state["center"]),
+            dtype=np.float64,
+        )
+        anchor_to_coverage = self._lab_distances(
+            coverage_center,
+            anchor_center,
+        )
         return {
             "expert_id": int(expert["expert_id"]),
             "current_lab_feature": feature.copy().tolist(),
-            "lab_center": np.asarray(
-                state["center"],
-                dtype=np.float64,
-            ).copy().tolist(),
+            "lab_center": anchor_center.copy().tolist(),
+            "stable_lab_anchor_enabled": bool(
+                self.photometric_stable_lab_anchor_enabled
+            ),
+            "anchor_frozen": bool(state.get("anchor_frozen", False)),
+            "lab_anchor_center": anchor_center.copy().tolist(),
+            "lab_coverage_center": coverage_center.copy().tolist(),
+            "candidate_lab_center": (
+                candidate_center.copy().tolist()
+                if candidate_center is not None
+                else None
+            ),
+            "candidate_lab_count": len(candidate_history),
+            "anchor_to_coverage_l_distance": anchor_to_coverage[
+                "l_distance"
+            ],
+            "anchor_to_coverage_ab_distance": anchor_to_coverage[
+                "ab_distance"
+            ],
+            "anchor_to_coverage_total_distance": anchor_to_coverage[
+                "total_distance"
+            ],
+            "anchor_to_candidate_l_distance": (
+                candidate_distances["l_distance"]
+                if candidate_distances is not None
+                else None
+            ),
+            "anchor_to_candidate_ab_distance": (
+                candidate_distances["ab_distance"]
+                if candidate_distances is not None
+                else None
+            ),
+            "anchor_to_candidate_total_distance": (
+                candidate_distances["total_distance"]
+                if candidate_distances is not None
+                else None
+            ),
             **distances,
             "l_ewma": state["l_ewma"],
             "ab_ewma": state["ab_ewma"],
@@ -2053,7 +3167,10 @@ class DynamicExpertManager:
             became_dormant = False
             reactivated = False
 
-            if state_before == "dormant":
+            if expert.get("admission_route") == "bootstrap_confidence":
+                expert["lifecycle_state"] = "active"
+                expert["last_event"] = "confidence_managed"
+            elif state_before == "dormant":
                 if (
                     current_support is not None
                     and support_threshold is not None
@@ -2184,7 +3301,9 @@ class DynamicExpertManager:
                 unit_interval=True,
             )
 
-            if (
+            if expert.get("admission_route") == "bootstrap_confidence":
+                event = "confidence_managed"
+            elif (
                 support is None
                 or support_threshold is None
             ):
@@ -2232,7 +3351,11 @@ class DynamicExpertManager:
                         last_supported_step_before
                     ),
                     "signal_decision": signal_decision,
-                    "tentative_delete": expert["ttl"] <= 0,
+                    "tentative_delete": (
+                        expert["ttl"] <= 0
+                        and expert.get("admission_route")
+                        != "bootstrap_confidence"
+                    ),
                 }
             )
 
@@ -2372,6 +3495,10 @@ class DynamicExpertManager:
             "step": int(step),
             "image_id": int(image_id),
             "embedding": self._image_embedding(dino_patch_features),
+            "patch_prototypes": self._patch_coreset(
+                dino_patch_features,
+                patch_ids=memory_patch_ids,
+            ),
             "quality": float(provisional_channel_support or 0.0),
             "ms_score": ms_score,
             "ms_short_score": ms_short_score,
@@ -2414,6 +3541,156 @@ class DynamicExpertManager:
             key=lambda item: item["ms_short_score"],
         )[:keep]
 
+    def _fitness_history_profile(self, history, current_member):
+        current_step = int(current_member["step"])
+        current_image_id = int(current_member["image_id"])
+        history = [
+            member
+            for member in list(history)[-self.photometric_history_max:]
+            if int(member["step"]) < current_step
+            and int(member["image_id"]) != current_image_id
+        ]
+        if not history:
+            return [], {
+                "available_count": 0,
+                "selected_count": 0,
+                "effective_history_size": 0.0,
+                "selected_image_ids": [],
+                "member_profiles": [],
+            }
+
+        ages = np.asarray(
+            [max(current_step - int(member["step"]), 1) for member in history],
+            dtype=np.float64,
+        )
+        recency_scale = max(float(np.median(ages)), 1.0)
+        current_embedding = current_member["embedding"]
+        current_lab = current_member.get("lab_feature")
+        current_supports = current_member.get("current_expert_supports", {})
+        profiles = []
+
+        for member, age in zip(history, ages):
+            lab_similarity = 1.0
+            member_lab = member.get("lab_feature")
+            if current_lab is not None and member_lab is not None:
+                lab_distance = self._lab_distances(
+                    np.asarray(current_lab, dtype=np.float64),
+                    np.asarray(member_lab, dtype=np.float64),
+                )["total_distance"]
+                lab_similarity = math.exp(-lab_distance)
+            else:
+                lab_distance = None
+
+            dino_similarity = float(
+                F.cosine_similarity(
+                    current_embedding.reshape(1, -1),
+                    member["embedding"].reshape(1, -1),
+                ).item()
+            )
+            dino_affinity = min(max((dino_similarity + 1.0) / 2.0, 0.0), 1.0)
+
+            member_supports = member.get("current_expert_supports", {})
+            shared_expert_ids = sorted(
+                set(current_supports).intersection(member_supports)
+            )
+            if shared_expert_ids:
+                channel_affinity = float(
+                    np.mean(
+                        [
+                            1.0
+                            - abs(
+                                float(current_supports[expert_id])
+                                - float(member_supports[expert_id])
+                            )
+                            for expert_id in shared_expert_ids
+                        ]
+                    )
+                )
+            elif (
+                current_member.get("channel_support") is not None
+                and member.get("channel_support") is not None
+            ):
+                channel_affinity = 1.0 - abs(
+                    float(current_member["channel_support"])
+                    - float(member["channel_support"])
+                )
+            else:
+                channel_affinity = 1.0
+            channel_affinity = min(max(channel_affinity, 0.0), 1.0)
+            recency_affinity = math.exp(-float(age) / recency_scale)
+            similarity_components = np.asarray(
+                [
+                    lab_similarity,
+                    dino_affinity,
+                    channel_affinity,
+                ],
+                dtype=np.float64,
+            )
+            state_similarity = float(
+                np.exp(
+                    np.mean(
+                        np.log(np.maximum(similarity_components, 1e-12))
+                    )
+                )
+            )
+            relevance = float(state_similarity * recency_affinity)
+            profiles.append(
+                {
+                    "member": member,
+                    "image_id": int(member["image_id"]),
+                    "step": int(member["step"]),
+                    "age": int(age),
+                    "lab_distance": lab_distance,
+                    "lab_similarity": float(lab_similarity),
+                    "dino_similarity": dino_similarity,
+                    "dino_affinity": dino_affinity,
+                    "channel_affinity": channel_affinity,
+                    "recency_affinity": recency_affinity,
+                    "state_similarity": state_similarity,
+                    "relevance": relevance,
+                }
+            )
+
+        relevances = np.asarray(
+            [profile["relevance"] for profile in profiles], dtype=np.float64
+        )
+        effective_size = float(relevances.sum())
+        keep = min(len(profiles), max(1, int(math.ceil(effective_size))))
+        selected_profiles = sorted(
+            profiles,
+            key=lambda profile: (
+                -profile["relevance"],
+                -profile["step"],
+                profile["image_id"],
+            ),
+        )[:keep]
+        selected_members = []
+        for profile in selected_profiles:
+            member = dict(profile["member"])
+            member["history_relevance"] = float(profile["relevance"])
+            selected_members.append(member)
+
+        return selected_members, {
+            "available_count": len(profiles),
+            "selected_count": len(selected_members),
+            "effective_history_size": effective_size,
+            "recency_scale": recency_scale,
+            "selected_image_ids": [
+                int(profile["image_id"]) for profile in selected_profiles
+            ],
+            "relevance_min": float(relevances.min()),
+            "relevance_max": float(relevances.max()),
+            "relevance_mean": float(relevances.mean()),
+            "member_profiles": [
+                {
+                    key: value
+                    for key, value in profile.items()
+                    if key != "member"
+                }
+                for profile in profiles
+            ],
+        }
+
     def _normalized_expert_supports(self, supports):
         normalized = {}
         for expert_id, support in (supports or {}).items():
@@ -2433,6 +3710,9 @@ class DynamicExpertManager:
         ms_threshold,
         support_threshold,
         current_expert_supports,
+        dino_patch_features=None,
+        memory_patch_ids=None,
+        lab_feature=None,
     ):
         if (
             ms_score is None
@@ -2449,8 +3729,23 @@ class DynamicExpertManager:
         self.coverage_history.append(
             {
                 "step": int(step),
+                "image_id": int(step),
                 "support_threshold": float(support_threshold),
                 "supports": supports,
+                "embedding": (
+                    self._image_embedding(dino_patch_features)
+                    if dino_patch_features is not None
+                    else None
+                ),
+                "patch_prototypes": (
+                    self._patch_coreset(
+                        dino_patch_features,
+                        patch_ids=memory_patch_ids,
+                    )
+                    if dino_patch_features is not None
+                    else None
+                ),
+                "lab_feature": self._lab_feature(lab_feature),
             }
         )
         del self.coverage_history[:-self.budget_coverage_window]
@@ -2496,28 +3791,359 @@ class DynamicExpertManager:
             return None
         return F.normalize(embedding_sum, dim=0).detach().cpu()
 
-    def _trim_historical_states(self):
-        if len(self.historical_states) <= self.photometric_history_max:
-            return
-        active = [
+    def _historical_member_records(self, members):
+        records = []
+        for member in members:
+            lab_feature = member.get("lab_feature")
+            embedding = member.get("embedding")
+            if lab_feature is None or embedding is None:
+                continue
+            records.append(
+                {
+                    "step": int(member.get("step", self.last_step)),
+                    "image_id": int(member["image_id"]),
+                    "lab_feature": np.asarray(
+                        lab_feature, dtype=np.float64
+                    ).copy(),
+                    "embedding": F.normalize(
+                        embedding.detach().cpu(), dim=0
+                    ),
+                    "memory_patch_ids": list(
+                        member.get("memory_patch_ids", [])
+                    ),
+                }
+            )
+        return records[-self.photometric_history_max:]
+
+    def _historical_state_distribution(self, member_records):
+        if not member_records:
+            return None
+        lab_features = np.stack(
+            [record["lab_feature"] for record in member_records], axis=0
+        )
+        lab_center = np.median(lab_features, axis=0)
+        profiles = [
+            self._lab_distances(feature, lab_center)
+            for feature in lab_features
+        ]
+
+        radii = {}
+        for channel, floor in (
+            ("l", self.photometric_l_ewma_floor),
+            ("ab", self.photometric_ab_ewma_floor),
+        ):
+            distances = np.asarray(
+                [profile[f"{channel}_distance"] for profile in profiles],
+                dtype=np.float64,
+            )
+            median = float(np.median(distances))
+            mad = float(np.median(np.abs(distances - median)))
+            radii[channel] = max(
+                median + self.lab_ewma_threshold_k * 1.4826 * mad,
+                float(floor),
+            )
+
+        dino_center = F.normalize(
+            torch.stack(
+                [record["embedding"] for record in member_records]
+            ).sum(dim=0),
+            dim=0,
+        ).detach().cpu()
+        return {
+            "lab_center": lab_center,
+            "l_radius": float(radii["l"]),
+            "ab_radius": float(radii["ab"]),
+            "dino_center": dino_center,
+            "member_image_ids": [
+                int(record["image_id"]) for record in member_records
+            ],
+        }
+
+    def _record_state_lifecycle_event(
+        self,
+        event_type,
+        step,
+        state,
+        *,
+        matched_or_merged_state_id=None,
+        source_type_before=None,
+        status_before=None,
+        reason=None,
+    ):
+        event = {
+            "event_type": str(event_type),
+            "step": int(step),
+            "state_id": int(state["state_id"]),
+            "matched_or_merged_state_id": (
+                int(matched_or_merged_state_id)
+                if matched_or_merged_state_id is not None
+                else None
+            ),
+            "source_type_before": source_type_before,
+            "source_type_after": state.get("source_type"),
+            "status_before": status_before,
+            "status_after": state.get("state_status", "stable"),
+            "active_expert_id": state.get("active_expert_id"),
+            "support_count": int(state.get("support_count", 0)),
+            "support_event_count": int(
+                state.get("support_event_count", 0)
+            ),
+            "member_count": len(state.get("member_records", [])),
+            "temporary_effective_support": (
+                float(state["temporary_effective_support"])
+                if state.get("temporary_effective_support") is not None
+                else None
+            ),
+            "temporary_support_increment": (
+                float(state["temporary_support_increment"])
+                if state.get("temporary_support_increment") is not None
+                else None
+            ),
+            "temporary_dino_evidence": (
+                float(state["temporary_dino_evidence"])
+                if state.get("temporary_dino_evidence") is not None
+                else None
+            ),
+            "temporary_channel_evidence": (
+                float(state["temporary_channel_evidence"])
+                if state.get("temporary_channel_evidence") is not None
+                else None
+            ),
+            "temporary_risk_evidence": (
+                float(state["temporary_risk_evidence"])
+                if state.get("temporary_risk_evidence") is not None
+                else None
+            ),
+            "reason": reason,
+        }
+        self.state_lifecycle_events.append(event)
+        return event
+
+    def _historical_states_match(self, left, right):
+        left_center = left.get("lab_center")
+        right_center = right.get("lab_center")
+        left_embedding = left.get("dino_center")
+        right_embedding = right.get("dino_center")
+        if (
+            left_center is None
+            or right_center is None
+            or left_embedding is None
+            or right_embedding is None
+        ):
+            return None
+        distances = self._lab_distances(
+            np.asarray(left_center, dtype=np.float64),
+            np.asarray(right_center, dtype=np.float64),
+        )
+        l_threshold = max(
+            float(left.get("l_radius") or left.get("l_threshold") or 0.0),
+            self.photometric_l_ewma_floor,
+        ) + max(
+            float(right.get("l_radius") or right.get("l_threshold") or 0.0),
+            self.photometric_l_ewma_floor,
+        )
+        ab_threshold = max(
+            float(left.get("ab_radius") or left.get("ab_threshold") or 0.0),
+            self.photometric_ab_ewma_floor,
+        ) + max(
+            float(right.get("ab_radius") or right.get("ab_threshold") or 0.0),
+            self.photometric_ab_ewma_floor,
+        )
+        similarity = float(left_embedding @ right_embedding)
+        l_relative = distances["l_distance"] / max(l_threshold, 1e-12)
+        ab_relative = distances["ab_distance"] / max(ab_threshold, 1e-12)
+        dino_strength = max(
+            0.0,
+            min(
+                1.0,
+                (
+                    similarity - self.photometric_dino_similarity_floor
+                )
+                / max(1.0 - self.photometric_dino_similarity_floor, 1e-12),
+            ),
+        )
+        lab_strength = max(0.0, 1.0 - max(l_relative, ab_relative))
+        return {
+            "matched": bool(
+                l_relative <= 1.0
+                and ab_relative <= 1.0
+                and similarity >= self.photometric_dino_similarity_floor
+            ),
+            "joint_match_strength": float(
+                (lab_strength + dino_strength) / 2.0
+            ),
+            "l_relative_distance": float(l_relative),
+            "ab_relative_distance": float(ab_relative),
+            "dino_similarity": similarity,
+        }
+
+    def _merge_historical_state_pair(self, keep, remove, step):
+        keep_records = list(keep.get("member_records", []))
+        remove_records = list(remove.get("member_records", []))
+        unique_records = {}
+        for record in keep_records + remove_records:
+            unique_records[(int(record["step"]), int(record["image_id"]))] = record
+        merged_records = list(unique_records.values())[
+            -self.photometric_history_max:
+        ]
+        distribution = self._historical_state_distribution(merged_records)
+        source_before = keep.get("source_type")
+        status_before = keep.get("state_status", "stable")
+        if distribution is not None:
+            keep["lab_center"] = distribution["lab_center"]
+            keep["dino_center"] = distribution["dino_center"]
+            keep["l_radius"] = distribution["l_radius"]
+            keep["ab_radius"] = distribution["ab_radius"]
+            keep["l_threshold"] = distribution["l_radius"]
+            keep["ab_threshold"] = distribution["ab_radius"]
+            keep["member_image_ids"] = distribution["member_image_ids"]
+        keep["member_records"] = merged_records
+        keep["support_count"] = int(keep.get("support_count", 0)) + int(
+            remove.get("support_count", 0)
+        )
+        keep["support_event_count"] = int(
+            keep.get("support_event_count", 0)
+        ) + int(remove.get("support_event_count", 0))
+        if self.photometric_denstream_support_enabled:
+            keep["temporary_effective_support"] = float(
+                keep.get("temporary_effective_support", 0.0)
+                + remove.get("temporary_effective_support", 0.0)
+            )
+            keep["temporary_support_last_step"] = max(
+                int(keep.get("temporary_support_last_step", -1)),
+                int(remove.get("temporary_support_last_step", -1)),
+            )
+        keep["last_seen_step"] = max(
+            int(keep.get("last_seen_step", -1)),
+            int(remove.get("last_seen_step", -1)),
+        )
+        if (
+            self.photometric_denstream_support_enabled
+            and keep.get("state_status", "stable") == "temporary"
+            and keep.get("temporary_effective_support", 0.0)
+            >= self.photometric_denstream_mature_support
+        ):
+            keep["state_status"] = "stable"
+            keep["source_type"] = "photometric_only"
+        keep["has_patch_memory"] = bool(
+            keep.get("has_patch_memory", False)
+            or remove.get("has_patch_memory", False)
+        )
+        if (
+            keep.get("state_status") != "stable"
+            and remove.get("state_status") == "stable"
+        ):
+            keep["state_status"] = "stable"
+            if keep.get("source_type") == "temporary":
+                keep["source_type"] = remove.get(
+                    "source_type", "photometric_only"
+                )
+        self.historical_states = [
             state
             for state in self.historical_states
-            if state.get("active_expert_id") is not None
+            if int(state["state_id"]) != int(remove["state_id"])
         ]
-        inactive = sorted(
-            (
+        self._record_state_lifecycle_event(
+            "merge",
+            step,
+            keep,
+            matched_or_merged_state_id=remove["state_id"],
+            source_type_before=source_before,
+            status_before=status_before,
+            reason="redundant_state_distribution",
+        )
+        if (
+            status_before == "temporary"
+            and keep.get("state_status") == "stable"
+        ):
+            self._record_state_lifecycle_event(
+                "mature",
+                step,
+                keep,
+                source_type_before=source_before,
+                status_before=status_before,
+                reason="denstream_merged_effective_support_matured",
+            )
+
+    def _merge_redundant_historical_states(self, step):
+        if not self.photometric_state_distribution_enabled:
+            return
+        while True:
+            candidates = []
+            for index, left in enumerate(self.historical_states):
+                for right in self.historical_states[index + 1:]:
+                    left_active = left.get("active_expert_id")
+                    right_active = right.get("active_expert_id")
+                    if (
+                        left_active is not None
+                        and right_active is not None
+                        and int(left_active) != int(right_active)
+                    ):
+                        continue
+                    profile = self._historical_states_match(left, right)
+                    if profile is None or not profile["matched"]:
+                        continue
+                    candidates.append(
+                        (profile["joint_match_strength"], left, right)
+                    )
+            if not candidates:
+                return
+            _, left, right = max(candidates, key=lambda item: item[0])
+            keep, remove = max(
+                ((left, right), (right, left)),
+                key=lambda pair: (
+                    pair[0].get("active_expert_id") is not None,
+                    bool(pair[0].get("has_patch_memory", False)),
+                    pair[0].get("state_status", "stable") == "stable",
+                    int(pair[0].get("support_event_count", 0)),
+                    int(pair[0].get("support_count", 0)),
+                    int(pair[0].get("last_seen_step", -1)),
+                    -int(pair[0]["state_id"]),
+                ),
+            )
+            self._merge_historical_state_pair(keep, remove, step)
+
+    def _historical_state_redundancy(self, state):
+        strengths = []
+        for other in self.historical_states:
+            if int(other["state_id"]) == int(state["state_id"]):
+                continue
+            profile = self._historical_states_match(state, other)
+            if profile is not None:
+                strengths.append(profile["joint_match_strength"])
+        return max(strengths, default=0.0)
+
+    def _trim_historical_states(self, step):
+        self._merge_redundant_historical_states(step)
+        while len(self.historical_states) > self.photometric_state_registry_cap:
+            inactive = [
                 state
                 for state in self.historical_states
                 if state.get("active_expert_id") is None
-            ),
-            key=lambda state: (
-                int(state.get("last_seen_step", -1)),
-                int(state.get("support_count", 0)),
-            ),
-            reverse=True,
-        )
-        remaining = max(self.photometric_history_max - len(active), 0)
-        self.historical_states = active + inactive[:remaining]
+            ]
+            if not inactive:
+                raise RuntimeError(
+                    "historical state registry is over capacity with only active states"
+                )
+            victim = min(
+                inactive,
+                key=lambda state: (
+                    state.get("state_status", "stable") != "temporary",
+                    -self._historical_state_redundancy(state),
+                    int(state.get("support_event_count", 0)),
+                    int(state.get("support_count", 0)),
+                    int(state.get("last_seen_step", -1)),
+                ),
+            )
+            self.historical_states.remove(victim)
+            self._record_state_lifecycle_event(
+                "evict",
+                step,
+                victim,
+                source_type_before=victim.get("source_type"),
+                status_before=victim.get("state_status", "stable"),
+                reason="state_registry_capacity",
+            )
 
     def _upsert_historical_state(
         self,
@@ -2535,6 +4161,10 @@ class DynamicExpertManager:
         has_patch_memory=False,
         state_id=None,
         accumulate_support=False,
+        member_records=None,
+        state_status="stable",
+        support_event_increment=0,
+        temporary_support_evidence=None,
     ):
         if lab_center is None or dino_center is None:
             return None
@@ -2561,7 +4191,11 @@ class DynamicExpertManager:
                 ),
                 None,
             )
-        if existing is None and source_type == "photometric_only":
+        if (
+            existing is None
+            and source_type == "photometric_only"
+            and not self.photometric_adaptive_candidate_evidence
+        ):
             for state in self.historical_states:
                 if state.get("source_type") != "photometric_only":
                     continue
@@ -2569,22 +4203,69 @@ class DynamicExpertManager:
                     lab_center,
                     np.asarray(state["lab_center"], dtype=np.float64),
                 )
-                state_l_threshold = max(
-                    float(state.get("l_threshold") or 0.0),
+                state_l_radius = max(
+                    float(
+                        state.get("l_radius")
+                        or state.get("l_threshold")
+                        or 0.0
+                    ),
                     self.photometric_l_ewma_floor,
                 )
-                state_ab_threshold = max(
-                    float(state.get("ab_threshold") or 0.0),
+                state_ab_radius = max(
+                    float(
+                        state.get("ab_radius")
+                        or state.get("ab_threshold")
+                        or 0.0
+                    ),
                     self.photometric_ab_ewma_floor,
                 )
                 similarity = float(dino_center @ state["dino_center"])
                 if (
-                    distances["l_distance"] <= state_l_threshold
-                    and distances["ab_distance"] <= state_ab_threshold
+                    distances["l_distance"] <= state_l_radius
+                    and distances["ab_distance"] <= state_ab_radius
                     and similarity >= self.photometric_dino_similarity_floor
                 ):
                     existing = state
                     break
+        previous_records = list(existing.get("member_records", [])) if existing else []
+        new_records = list(member_records or [])
+        combined_records = previous_records + new_records
+        unique_records = {}
+        for record in combined_records:
+            key = (int(record["step"]), int(record["image_id"]))
+            unique_records[key] = record
+        combined_records = list(unique_records.values())[
+            -self.photometric_history_max:
+        ]
+        distribution = (
+            self._historical_state_distribution(combined_records)
+            if self.photometric_state_distribution_enabled
+            else None
+        )
+        if distribution is not None:
+            lab_center = distribution["lab_center"]
+            dino_center = distribution["dino_center"]
+            l_threshold = distribution["l_radius"]
+            ab_threshold = distribution["ab_radius"]
+
+        previous_center = (
+            np.asarray(existing["lab_center"], dtype=np.float64)
+            if existing is not None
+            else None
+        )
+        previous_source_type = (
+            existing.get("source_type") if existing is not None else None
+        )
+        previous_status = (
+            existing.get("state_status", "stable")
+            if existing is not None
+            else None
+        )
+        previous_member_ids = (
+            list(existing.get("member_image_ids", []))
+            if existing is not None
+            else []
+        )
 
         values = {
             "source_type": str(source_type),
@@ -2609,26 +4290,174 @@ class DynamicExpertManager:
             "dino_center": dino_center,
             "has_patch_memory": bool(has_patch_memory),
             "last_seen_step": int(step),
+            "member_records": combined_records,
+            "member_image_ids": (
+                distribution["member_image_ids"]
+                if distribution is not None
+                else [int(record["image_id"]) for record in combined_records]
+            ),
+            "l_radius": max(
+                float(l_threshold or 0.0), self.photometric_l_ewma_floor
+            ),
+            "ab_radius": max(
+                float(ab_threshold or 0.0), self.photometric_ab_ewma_floor
+            ),
         }
+        if temporary_support_evidence is not None:
+            values.update(
+                {
+                    "temporary_support_increment": float(
+                        temporary_support_evidence.get("increment", 0.0)
+                    ),
+                    "temporary_dino_evidence": float(
+                        temporary_support_evidence.get(
+                            "dino_evidence", 0.0
+                        )
+                    ),
+                    "temporary_channel_evidence": float(
+                        temporary_support_evidence.get(
+                            "channel_evidence", 0.0
+                        )
+                    ),
+                    "temporary_risk_evidence": float(
+                        temporary_support_evidence.get(
+                            "risk_evidence", 0.0
+                        )
+                    ),
+                    "temporary_support_last_step": int(step),
+                }
+            )
         if existing is None:
             existing = {
                 "state_id": int(self.next_historical_state_id),
                 "created_step": int(step),
                 "support_count": int(support_count),
+                "support_event_count": max(
+                    1, int(support_event_increment)
+                ),
+                "state_status": str(state_status),
+                "last_center_shift": None,
                 **values,
             }
+            if (
+                self.photometric_denstream_support_enabled
+                and temporary_support_evidence is not None
+            ):
+                existing["temporary_effective_support"] = float(
+                    (temporary_support_evidence or {}).get("increment", 0.0)
+                )
             self.next_historical_state_id += 1
             self.historical_states.append(existing)
+            self._record_state_lifecycle_event(
+                "create",
+                step,
+                existing,
+                reason="new_historical_state",
+            )
+            if (
+                self.photometric_denstream_support_enabled
+                and temporary_support_evidence is not None
+                and state_status == "stable"
+            ):
+                self._record_state_lifecycle_event(
+                    "mature",
+                    step,
+                    existing,
+                    source_type_before="temporary",
+                    status_before="temporary",
+                    reason="denstream_effective_support_matured",
+                )
         else:
             previous_count = int(existing.get("support_count", 0))
+            previous_event_count = int(
+                existing.get("support_event_count", 1)
+            )
+            previous_status = existing.get("state_status", "stable")
+            previous_effective_support = float(
+                existing.get("temporary_effective_support", 0.0)
+            )
             existing.update(values)
             existing["support_count"] = (
                 previous_count + int(support_count)
                 if accumulate_support
                 else max(previous_count, int(support_count))
             )
-        self._trim_historical_states()
-        return existing
+            existing["support_event_count"] = (
+                previous_event_count + int(support_event_increment)
+            )
+            existing["state_status"] = (
+                "stable" if previous_status == "stable" else str(state_status)
+            )
+            if (
+                self.photometric_denstream_support_enabled
+                and previous_status == "temporary"
+            ):
+                existing["temporary_effective_support"] = float(
+                    previous_effective_support
+                    + (temporary_support_evidence or {}).get(
+                        "increment", 0.0
+                    )
+                )
+            if previous_center is not None:
+                existing["last_center_shift"] = self._lab_distances(
+                    lab_center, previous_center
+                )
+            if (
+                previous_source_type != existing.get("source_type")
+                or previous_status != existing.get("state_status", "stable")
+                or previous_member_ids != existing.get("member_image_ids", [])
+                or int(support_event_increment) > 0
+            ):
+                self._record_state_lifecycle_event(
+                    "update",
+                    step,
+                    existing,
+                    source_type_before=previous_source_type,
+                    status_before=previous_status,
+                    reason=(
+                        "denstream_effective_support"
+                        if self.photometric_denstream_support_enabled
+                        and previous_status == "temporary"
+                        else "historical_state_evidence"
+                    ),
+                )
+            if (
+                previous_status == "temporary"
+                and existing.get("state_status") == "stable"
+            ):
+                self._record_state_lifecycle_event(
+                    "mature",
+                    step,
+                    existing,
+                    source_type_before=previous_source_type,
+                    status_before=previous_status,
+                    reason=(
+                        "denstream_effective_support_matured"
+                        if self.photometric_denstream_support_enabled
+                        else "second_independent_support_event"
+                    ),
+                )
+        self._trim_historical_states(step)
+        registered = next(
+            (
+                state
+                for state in self.historical_states
+                if int(state["state_id"]) == int(existing["state_id"])
+            ),
+            None,
+        )
+        if registered is not None:
+            return registered
+        matching_states = []
+        for state in self.historical_states:
+            profile = self._historical_states_match(existing, state)
+            if profile is not None and profile["matched"]:
+                matching_states.append(
+                    (profile["joint_match_strength"], state)
+                )
+        if matching_states:
+            return max(matching_states, key=lambda item: item[0])[1]
+        return None
 
     def _register_expert_historical_state(
         self,
@@ -2654,6 +4483,12 @@ class DynamicExpertManager:
             if cluster_state is not None:
                 state_id = int(cluster_state["state_id"])
         dino_center = self._historical_state_dino_center(cluster_id)
+        cluster_members = (
+            self.clusters[int(cluster_id)].get("members", [])
+            if cluster_id is not None
+            and 0 <= int(cluster_id) < len(self.clusters)
+            else []
+        )
         return self._upsert_historical_state(
             source_type=source_type,
             step=step,
@@ -2669,6 +4504,8 @@ class DynamicExpertManager:
             ab_threshold=lab_state.get("ab_threshold"),
             has_patch_memory=(dino_center is not None),
             state_id=state_id,
+            member_records=self._historical_member_records(cluster_members),
+            state_status="stable",
         )
 
     def _sync_historical_states(self, step=None):
@@ -2707,6 +4544,35 @@ class DynamicExpertManager:
             "created_step": int(state.get("created_step", -1)),
             "last_seen_step": int(state.get("last_seen_step", -1)),
             "support_count": int(state.get("support_count", 0)),
+            "support_event_count": int(
+                state.get("support_event_count", 1)
+            ),
+            "temporary_effective_support": (
+                float(state["temporary_effective_support"])
+                if state.get("temporary_effective_support") is not None
+                else None
+            ),
+            "temporary_support_last_step": state.get(
+                "temporary_support_last_step"
+            ),
+            "temporary_support_increment": (
+                float(state["temporary_support_increment"])
+                if state.get("temporary_support_increment") is not None
+                else None
+            ),
+            "state_status": state.get("state_status", "stable"),
+            "member_image_ids": list(state.get("member_image_ids", [])),
+            "l_radius": float(
+                state.get("l_radius")
+                or state.get("l_threshold")
+                or 0.0
+            ),
+            "ab_radius": float(
+                state.get("ab_radius")
+                or state.get("ab_threshold")
+                or 0.0
+            ),
+            "last_center_shift": state.get("last_center_shift"),
             "lab_center": np.asarray(
                 state["lab_center"], dtype=np.float64
             ).tolist(),
@@ -2747,6 +4613,150 @@ class DynamicExpertManager:
             "extreme_risk_max": self.photometric_history_extreme_risk_max,
             "acceptable": acceptable,
         }
+
+    def _temporary_support_evidence(
+        self,
+        candidate_members,
+        risk_profile,
+    ):
+        embeddings = [
+            member.get("embedding") for member in candidate_members
+            if member.get("embedding") is not None
+        ]
+        if len(embeddings) >= 2:
+            stacked = torch.stack(embeddings)
+            similarities = stacked @ stacked.T
+            pair_indices = torch.triu_indices(
+                len(embeddings), len(embeddings), offset=1
+            )
+            mean_similarity = float(
+                similarities[pair_indices[0], pair_indices[1]].mean()
+            )
+            dino_evidence = max(
+                0.0,
+                min(
+                    1.0,
+                    (
+                        mean_similarity
+                        - self.photometric_dino_similarity_floor
+                    )
+                    / max(
+                        1.0 - self.photometric_dino_similarity_floor,
+                        1e-12,
+                    ),
+                ),
+            )
+        else:
+            mean_similarity = None
+            dino_evidence = 0.0
+
+        channel_values = []
+        for member in candidate_members:
+            support = member.get("channel_support")
+            if support is None:
+                support = member.get("provisional_channel_support")
+            if support is not None and math.isfinite(float(support)):
+                channel_values.append(float(support))
+        complete_channel_evidence = bool(
+            len(channel_values) == len(candidate_members)
+            and channel_values
+        )
+        channel_evidence = (
+            float(np.mean(np.clip(channel_values, 0.0, 1.0)))
+            if complete_channel_evidence
+            else 0.0
+        )
+
+        risk_ratios = risk_profile.get("risk_ratios", [])
+        complete_risk_evidence = bool(
+            len(risk_ratios) == len(candidate_members) and risk_ratios
+        )
+        risk_values = (
+            [
+                min(1.0, 1.0 / max(float(ratio), 1e-12))
+                for ratio in risk_ratios
+            ]
+            if complete_risk_evidence
+            else []
+        )
+        risk_evidence = (
+            float(np.mean(risk_values)) if risk_values else 0.0
+        )
+        member_evidence = (
+            [
+                float(
+                    dino_evidence
+                    * min(1.0, max(0.0, channel_value))
+                    * risk_value
+                )
+                for channel_value, risk_value in zip(
+                    channel_values,
+                    risk_values,
+                )
+            ]
+            if complete_channel_evidence and complete_risk_evidence
+            else []
+        )
+        increment = 0.0
+        for evidence in member_evidence:
+            increment = (
+                self.photometric_denstream_decay * increment + evidence
+            )
+        return {
+            "increment": float(increment),
+            "dino_evidence": float(dino_evidence),
+            "dino_similarity_mean": mean_similarity,
+            "channel_evidence": float(channel_evidence),
+            "risk_evidence": float(risk_evidence),
+            "member_evidence": member_evidence,
+        }
+
+    def _decay_temporary_states(self, step):
+        if not self.photometric_denstream_support_enabled:
+            return
+        for state in list(self.historical_states):
+            if state.get("state_status", "stable") != "temporary":
+                continue
+            last_step = int(
+                state.get(
+                    "temporary_support_last_step",
+                    state.get("last_seen_step", step),
+                )
+            )
+            elapsed = max(0, int(step) - last_step)
+            if elapsed == 0:
+                continue
+            previous_support = float(
+                state.get("temporary_effective_support", 0.0)
+            )
+            state["temporary_effective_support"] = float(
+                previous_support
+                * self.photometric_denstream_decay ** elapsed
+            )
+            state["temporary_support_last_step"] = int(step)
+            state["temporary_support_increment"] = 0.0
+            if (
+                state["temporary_effective_support"]
+                < self.photometric_denstream_discard_support
+            ):
+                self.historical_states.remove(state)
+                self._record_state_lifecycle_event(
+                    "evict",
+                    step,
+                    state,
+                    source_type_before=state.get("source_type"),
+                    status_before="temporary",
+                    reason="temporary_effective_support_decay",
+                )
+            else:
+                self._record_state_lifecycle_event(
+                    "decay",
+                    step,
+                    state,
+                    source_type_before=state.get("source_type"),
+                    status_before="temporary",
+                    reason="temporary_effective_support_decay",
+                )
 
     def _candidate_admission_evidence(
         self,
@@ -2796,6 +4806,10 @@ class DynamicExpertManager:
             for member in selected_members
         )
         risk_profile = self._candidate_risk_profile(selected_members)
+        temporary_support_evidence = self._temporary_support_evidence(
+            selected_members,
+            risk_profile,
+        )
         history_match_strength = float(
             history_match.get("joint_match_strength", 0.0)
         )
@@ -2804,25 +4818,81 @@ class DynamicExpertManager:
             if history_match_strength >= 0.5
             else self.photometric_history_reentry_members + 1
         )
+        matched_status = history_match.get("matched_profile", {}).get(
+            "state_status"
+        )
+        matched_source_type = history_match.get("matched_source_type")
         if (
             profile_consistent
             and history_match.get("matched", False)
+            and (
+                matched_status == "temporary"
+                or matched_source_type == "temporary"
+            )
+            and self.photometric_temporary_state_enabled
+            and risk_profile["acceptable"]
+        ):
+            decision = "update_temporary_state"
+        elif (
+            profile_consistent
+            and history_match.get("matched", False)
+            and matched_source_type == "active"
+            and self.photometric_state_distribution_enabled
+            and channel_novel
+            and has_reliable_patch_memory
+            and risk_profile["acceptable"]
+        ):
+            decision = "update_existing_state"
+        elif (
+            profile_consistent
+            and history_match.get("matched", False)
+            and matched_source_type == "active"
+            and self.photometric_state_distribution_enabled
+            and risk_profile["acceptable"]
+        ):
+            decision = "existing_state_supported"
+        elif (
+            profile_consistent
+            and history_match.get("matched", False)
+            and matched_source_type == "photometric_only"
+            and (
+                self.photometric_history_reentry_enabled
+                or self.photometric_state_distribution_enabled
+            )
+            and not (
+                channel_novel and has_reliable_patch_memory
+            )
+            and risk_profile["acceptable"]
+        ):
+            decision = "update_existing_state"
+        elif (
+            profile_consistent
+            and history_match.get("matched", False)
+            and matched_source_type in {"retired", "photometric_only"}
+            and (
+                matched_source_type == "retired"
+                or (channel_novel and has_reliable_patch_memory)
+            )
             and len(selected_members) >= history_required_count
             and risk_profile["acceptable"]
         ):
             decision = "history_reentry"
         elif (
             profile_consistent
-            and channel_novel
-            and has_reliable_patch_memory
+            and not history_match.get("matched", False)
+            and self.photometric_temporary_state_enabled
+            and risk_profile["acceptable"]
         ):
-            decision = "new_scoring_expert"
+            decision = "new_temporary_state"
         elif (
             profile_consistent
-            and new_coverage_fraction is not None
-            and not channel_novel
+            and not history_match.get("matched", False)
+            and self.photometric_adaptive_candidate_evidence
+            and channel_novel
+            and has_reliable_patch_memory
+            and risk_profile["acceptable"]
         ):
-            decision = "photometric_state_only"
+            decision = "new_scoring_expert"
         else:
             decision = "keep_collecting"
         return {
@@ -2838,12 +4908,31 @@ class DynamicExpertManager:
             "strict_low_risk_count": strict_low_risk_count,
             "history_required_count": int(history_required_count),
             "risk_profile": risk_profile,
+            "temporary_support_evidence": temporary_support_evidence,
         }
 
-    def _record_photometric_state(self, members, step):
+    def _record_photometric_state(
+        self,
+        members,
+        step,
+        *,
+        state_id=None,
+        state_status="stable",
+        source_type="photometric_only",
+        temporary_support_evidence=None,
+    ):
         lab_center = self._photometric_pool_lab_center(members)
         if lab_center is None:
             return None
+        existing_state = next(
+            (
+                state
+                for state in self.historical_states
+                if state_id is not None
+                and int(state["state_id"]) == int(state_id)
+            ),
+            None,
+        )
         embeddings = [
             member["embedding"]
             for member in members
@@ -2855,15 +4944,38 @@ class DynamicExpertManager:
             else None
         )
         historical_state = self._upsert_historical_state(
-            source_type="photometric_only",
+            source_type=source_type,
             step=step,
             lab_center=lab_center,
             dino_center=dino_center,
             support_count=len(members),
             l_threshold=self.photometric_l_ewma_floor,
             ab_threshold=self.photometric_ab_ewma_floor,
-            has_patch_memory=False,
+            source_expert_id=(
+                existing_state.get("source_expert_id")
+                if existing_state is not None
+                else None
+            ),
+            active_expert_id=(
+                existing_state.get("active_expert_id")
+                if existing_state is not None
+                else None
+            ),
+            cluster_id=(
+                existing_state.get("cluster_id")
+                if existing_state is not None
+                else None
+            ),
+            has_patch_memory=bool(
+                existing_state is not None
+                and existing_state.get("has_patch_memory", False)
+            ),
             accumulate_support=True,
+            state_id=state_id,
+            member_records=self._historical_member_records(members),
+            state_status=state_status,
+            support_event_increment=1,
+            temporary_support_evidence=temporary_support_evidence,
         )
         return (
             {
@@ -2873,6 +4985,139 @@ class DynamicExpertManager:
             if historical_state is not None
             else None
         )
+
+    def _update_matched_historical_state(
+        self,
+        history_match,
+        members,
+        step,
+        temporary_support_evidence=None,
+    ):
+        state_id = history_match.get("matched_state_id")
+        state = next(
+            (
+                item
+                for item in self.historical_states
+                if state_id is not None
+                and int(item["state_id"]) == int(state_id)
+            ),
+            None,
+        )
+        if state is None:
+            return None
+
+        status_before = state.get("state_status", "stable")
+        source_type = state.get("source_type", "photometric_only")
+        if status_before != "temporary":
+            temporary_support_evidence = None
+        if (
+            self.photometric_denstream_support_enabled
+            and status_before == "temporary"
+        ):
+            next_effective_support = float(
+                state.get("temporary_effective_support", 0.0)
+                + (temporary_support_evidence or {}).get("increment", 0.0)
+            )
+            next_status = (
+                "stable"
+                if next_effective_support
+                >= self.photometric_denstream_mature_support
+                else "temporary"
+            )
+        else:
+            next_status = (
+                "stable"
+                if status_before == "stable"
+                or int(state.get("support_event_count", 1)) + 1 >= 2
+                else "temporary"
+            )
+        updated = self._record_photometric_state(
+            members,
+            step,
+            state_id=state_id,
+            state_status=next_status,
+            source_type=(
+                "photometric_only"
+                if source_type == "temporary" and next_status == "stable"
+                else source_type
+            ),
+            temporary_support_evidence=temporary_support_evidence,
+        )
+        if updated is None:
+            return None
+        state_id = updated["historical_state_id"]
+        state = next(
+            item
+            for item in self.historical_states
+            if int(item["state_id"]) == int(state_id)
+        )
+
+        active_expert_id = state.get("active_expert_id")
+        members_added = 0
+        if active_expert_id is not None:
+            expert = next(
+                (
+                    item
+                    for item in self.active_experts
+                    if int(item["expert_id"]) == int(active_expert_id)
+                ),
+                None,
+            )
+            if expert is not None:
+                cluster = self.clusters[int(expert["cluster_id"])]
+                existing_keys = {
+                    (int(item.get("step", -1)), int(item["image_id"]))
+                    for item in cluster.get("members", [])
+                }
+                new_members = [
+                    member
+                    for member in members
+                    if (
+                        int(member.get("step", -1)),
+                        int(member["image_id"]),
+                    ) not in existing_keys
+                ]
+                if new_members:
+                    cluster["members"].extend(new_members)
+                    cluster["embedding_sum"] = (
+                        cluster["embedding_sum"]
+                        + torch.stack(
+                            [member["embedding"] for member in new_members]
+                        ).sum(dim=0)
+                    )
+                    members_added = len(new_members)
+                lab_members = [
+                    cluster_member
+                    for cluster_member in cluster["members"]
+                    if cluster_member.get("lab_feature") is not None
+                ]
+                if lab_members:
+                    expert["lab_state"] = self._build_lab_state(
+                        lab_members,
+                        existing_state=expert.get("lab_state"),
+                        freeze_anchor=True,
+                        step=step,
+                    )
+                    if next_status == "stable":
+                        self._rebase_lab_detector(
+                            expert,
+                            members,
+                            step,
+                        )
+                state = self._register_expert_historical_state(
+                    expert,
+                    "active",
+                    step,
+                    state_id=state_id,
+                )
+
+        return {
+            **(updated or {}),
+            "state_status_before": status_before,
+            "state_status_after": state.get("state_status", "stable"),
+            "active_expert_id": active_expert_id,
+            "members_added_to_active_cluster": int(members_added),
+        }
 
     def _expert_coverage_profiles(self):
         active_ids = {
@@ -3030,7 +5275,12 @@ class DynamicExpertManager:
             "retired_state_profiles": [],
         }
         if (
-            not self.photometric_history_reentry_enabled
+            (
+                not self.photometric_history_reentry_enabled
+                and not self.photometric_state_distribution_enabled
+                and not self.photometric_temporary_state_enabled
+                and not self.photometric_adaptive_candidate_evidence
+            )
             or len(candidate_members)
             < self.photometric_history_reentry_members
         ):
@@ -3042,12 +5292,14 @@ class DynamicExpertManager:
         if candidate_center is None:
             return audit
         self._sync_historical_states()
-        candidate_embedding = F.normalize(
-            torch.stack(
-                [member["embedding"] for member in candidate_members]
-            ).sum(dim=0),
-            dim=0,
+        candidate_records = self._historical_member_records(candidate_members)
+        candidate_distribution = self._historical_state_distribution(
+            candidate_records
         )
+        if candidate_distribution is None:
+            return audit
+        candidate_center = candidate_distribution["lab_center"]
+        candidate_embedding = candidate_distribution["dino_center"]
 
         matches = []
         for state in self.historical_states:
@@ -3062,13 +5314,27 @@ class DynamicExpertManager:
                 candidate_center,
                 np.asarray(lab_center, dtype=np.float64),
             )
-            l_threshold = max(
-                float(state.get("l_threshold") or 0.0),
+            state_l_radius = max(
+                float(
+                    state.get("l_radius")
+                    or state.get("l_threshold")
+                    or 0.0
+                ),
                 self.photometric_l_ewma_floor,
             )
-            ab_threshold = max(
-                float(state.get("ab_threshold") or 0.0),
+            state_ab_radius = max(
+                float(
+                    state.get("ab_radius")
+                    or state.get("ab_threshold")
+                    or 0.0
+                ),
                 self.photometric_ab_ewma_floor,
+            )
+            l_threshold = state_l_radius + float(
+                candidate_distribution["l_radius"]
+            )
+            ab_threshold = state_ab_radius + float(
+                candidate_distribution["ab_radius"]
             )
             l_relative = distances["l_distance"] / l_threshold
             ab_relative = distances["ab_distance"] / ab_threshold
@@ -3101,6 +5367,7 @@ class DynamicExpertManager:
                 "source_expert_id": state.get("source_expert_id"),
                 "active_expert_id": state.get("active_expert_id"),
                 "cluster_id": state.get("cluster_id"),
+                "state_status": state.get("state_status", "stable"),
                 "last_seen_step": state.get("last_seen_step"),
                 "has_patch_memory": bool(
                     state.get("has_patch_memory", False)
@@ -3108,6 +5375,14 @@ class DynamicExpertManager:
                 "dino_similarity": dino_similarity,
                 "l_threshold": l_threshold,
                 "ab_threshold": ab_threshold,
+                "state_l_radius": state_l_radius,
+                "state_ab_radius": state_ab_radius,
+                "candidate_l_radius": float(
+                    candidate_distribution["l_radius"]
+                ),
+                "candidate_ab_radius": float(
+                    candidate_distribution["ab_radius"]
+                ),
                 "l_relative_distance": float(l_relative),
                 "ab_relative_distance": float(ab_relative),
                 "lab_match_strength": float(lab_strength),
@@ -3126,15 +5401,12 @@ class DynamicExpertManager:
 
         if not matches:
             return audit
-        best = min(
+        best = max(
             matches,
             key=lambda item: (
-                max(
-                    item["l_relative_distance"],
-                    item["ab_relative_distance"],
-                ),
-                -item["dino_similarity"],
-                -int(item.get("last_seen_step") or -1),
+                item["joint_match_strength"],
+                item["dino_similarity"],
+                int(item.get("last_seen_step") or -1),
             ),
         )
         audit.update(
@@ -3160,6 +5432,24 @@ class DynamicExpertManager:
                 ),
                 "matched_profile": dict(best),
             }
+        )
+        matched_state = next(
+            state
+            for state in self.historical_states
+            if int(state["state_id"]) == int(best["state_id"])
+        )
+        self._record_state_lifecycle_event(
+            "match",
+            max(
+                [int(member.get("step", self.last_step + 1))
+                 for member in candidate_members],
+                default=self.last_step + 1,
+            ),
+            matched_state,
+            matched_or_merged_state_id=matched_state["state_id"],
+            source_type_before=matched_state.get("source_type"),
+            status_before=matched_state.get("state_status", "stable"),
+            reason="candidate_distribution_match",
         )
         return audit
 
@@ -3482,7 +5772,10 @@ class DynamicExpertManager:
             "representative_mode": self.representative_mode,
             "admission_ttl_mode": self.admission_ttl_mode,
             "admission_route": admission_route,
-            "lab_state": self._build_lab_state(candidate_members),
+            "lab_state": self._build_lab_state(
+                candidate_members,
+                step=step,
+            ),
             "admission_candidate_ms_score": representative["ms_score"],
             "admission_candidate_channel_support": representative[
                 "channel_support"
@@ -3608,6 +5901,402 @@ class DynamicExpertManager:
                     nearest is not None
                     and nearest["relative_distance"] <= 1.0
                 ),
+            }
+        return profiles
+
+    def _coverage_loss_expert_entity(self, expert):
+        cluster = self.clusters[int(expert["cluster_id"])]
+        embedding_sum = cluster.get("embedding_sum")
+        embedding = (
+            F.normalize(embedding_sum.detach().cpu(), dim=0)
+            if embedding_sum is not None
+            and float(embedding_sum.norm()) > 0.0
+            else None
+        )
+        lab_state = expert.get("lab_state") or {}
+        center = lab_state.get("center")
+        prototype_sets = [
+            member.get("patch_prototypes")
+            for member in cluster.get("members", [])
+            if member.get("patch_prototypes") is not None
+        ]
+        return {
+            "entity_id": int(expert["expert_id"]),
+            "expert_id": int(expert["expert_id"]),
+            "embedding": embedding,
+            "patch_prototypes": (
+                self._patch_coreset(torch.cat(prototype_sets, dim=0))
+                if prototype_sets
+                else None
+            ),
+            "lab_center": (
+                np.asarray(center, dtype=np.float64)
+                if center is not None
+                else None
+            ),
+            "lab_l_scale": max(
+                float(lab_state.get("l_threshold") or 0.0),
+                self.photometric_l_ewma_floor,
+            ),
+            "lab_ab_scale": max(
+                float(lab_state.get("ab_threshold") or 0.0),
+                self.photometric_ab_ewma_floor,
+            ),
+            "candidate_image_ids": set(),
+        }
+
+    def _coverage_loss_candidate_entity(self, candidate_members):
+        embeddings = [
+            member.get("embedding")
+            for member in candidate_members
+            if member.get("embedding") is not None
+        ]
+        embedding = (
+            F.normalize(torch.stack(embeddings).mean(dim=0), dim=0)
+            if embeddings
+            else None
+        )
+        prototype_sets = [
+            member.get("patch_prototypes")
+            for member in candidate_members
+            if member.get("patch_prototypes") is not None
+        ]
+        lab_features = [
+            np.asarray(member["lab_feature"], dtype=np.float64)
+            for member in candidate_members
+            if member.get("lab_feature") is not None
+        ]
+        lab_center = (
+            np.median(np.stack(lab_features, axis=0), axis=0)
+            if lab_features
+            else None
+        )
+        l_scale = self.photometric_l_ewma_floor
+        ab_scale = self.photometric_ab_ewma_floor
+        if lab_center is not None and len(lab_features) >= 2:
+            distances = [
+                self._lab_distances(feature, lab_center)
+                for feature in lab_features
+            ]
+            l_scale = max(
+                float(np.median([item["l_distance"] for item in distances])),
+                l_scale,
+            )
+            ab_scale = max(
+                float(np.median([item["ab_distance"] for item in distances])),
+                ab_scale,
+            )
+        return {
+            "entity_id": "candidate",
+            "expert_id": None,
+            "embedding": embedding,
+            "patch_prototypes": (
+                self._patch_coreset(torch.cat(prototype_sets, dim=0))
+                if prototype_sets
+                else None
+            ),
+            "lab_center": lab_center,
+            "lab_l_scale": float(l_scale),
+            "lab_ab_scale": float(ab_scale),
+            "candidate_image_ids": {
+                int(member["image_id"]) for member in candidate_members
+            },
+        }
+
+    def _coverage_loss_reference_records(
+        self, candidate_members, support_threshold
+    ):
+        records = {}
+        for record in self.coverage_history:
+            image_id = int(record.get("image_id", record["step"]))
+            records[image_id] = {
+                "image_id": image_id,
+                "step": int(record["step"]),
+                "support_threshold": float(record["support_threshold"]),
+                "supports": dict(record.get("supports", {})),
+                "embedding": record.get("embedding"),
+                "patch_prototypes": record.get("patch_prototypes"),
+                "lab_feature": record.get("lab_feature"),
+                "candidate_member": False,
+            }
+        for member in candidate_members:
+            image_id = int(member["image_id"])
+            existing = records.get(image_id, {})
+            records[image_id] = {
+                "image_id": image_id,
+                "step": int(member.get("step", existing.get("step", 0))),
+                "support_threshold": member.get(
+                    "support_threshold",
+                    existing.get("support_threshold", support_threshold),
+                ),
+                "supports": dict(
+                    member.get(
+                        "current_expert_supports",
+                        existing.get("supports", {}),
+                    )
+                ),
+                "embedding": member.get(
+                    "embedding", existing.get("embedding")
+                ),
+                "patch_prototypes": member.get(
+                    "patch_prototypes",
+                    existing.get("patch_prototypes"),
+                ),
+                "lab_feature": member.get(
+                    "lab_feature", existing.get("lab_feature")
+                ),
+                "candidate_member": True,
+            }
+        return sorted(records.values(), key=lambda item: item["step"])
+
+    def _coverage_loss_objective(self, records, entities):
+        channel_values = []
+        lab_values = []
+        dino_values = []
+        for record in records:
+            channel_scores = []
+            lab_scores = []
+            dino_scores = []
+            patch_dino_scores = []
+            record_prototypes = record.get("patch_prototypes")
+            for entity in entities:
+                expert_id = entity["expert_id"]
+                if expert_id is None:
+                    channel_score = float(
+                        int(record["image_id"])
+                        in entity["candidate_image_ids"]
+                    )
+                else:
+                    threshold = record.get("support_threshold")
+                    support = record.get("supports", {}).get(expert_id)
+                    channel_score = (
+                        min(max(float(support) / max(float(threshold), 1e-12), 0.0), 1.0)
+                        if support is not None and threshold is not None
+                        else 0.0
+                    )
+                channel_scores.append(channel_score)
+
+                lab_feature = record.get("lab_feature")
+                if lab_feature is None or entity["lab_center"] is None:
+                    lab_scores.append(0.0)
+                else:
+                    distances = self._lab_distances(
+                        np.asarray(lab_feature, dtype=np.float64),
+                        entity["lab_center"],
+                    )
+                    relative = max(
+                        distances["l_distance"] / entity["lab_l_scale"],
+                        distances["ab_distance"] / entity["lab_ab_scale"],
+                    )
+                    lab_scores.append(float(math.exp(-relative)))
+
+                embedding = record.get("embedding")
+                if (
+                    record_prototypes is not None
+                    and entity.get("patch_prototypes") is not None
+                ):
+                    similarities = (
+                        record_prototypes
+                        @ entity["patch_prototypes"].T
+                    )
+                    patch_dino_scores.append(
+                        ((similarities.max(dim=1).values + 1.0) / 2.0)
+                        .clamp(0.0, 1.0)
+                    )
+                elif embedding is None or entity["embedding"] is None:
+                    dino_scores.append(0.0)
+                    if record_prototypes is not None:
+                        patch_dino_scores.append(
+                            torch.zeros(
+                                int(record_prototypes.shape[0]),
+                                dtype=torch.float32,
+                            )
+                        )
+                else:
+                    similarity = float(
+                        F.normalize(embedding, dim=0)
+                        @ entity["embedding"]
+                    )
+                    score = min(
+                        max((similarity + 1.0) / 2.0, 0.0), 1.0
+                    )
+                    dino_scores.append(score)
+                    if record_prototypes is not None:
+                        patch_dino_scores.append(
+                            torch.full(
+                                (int(record_prototypes.shape[0]),),
+                                score,
+                                dtype=torch.float32,
+                            )
+                        )
+            channel_values.append(max(channel_scores, default=0.0))
+            lab_values.append(max(lab_scores, default=0.0))
+            if patch_dino_scores:
+                dino_values.append(
+                    float(
+                        torch.stack(patch_dino_scores)
+                        .max(dim=0)
+                        .values
+                        .mean()
+                    )
+                )
+            else:
+                dino_values.append(max(dino_scores, default=0.0))
+
+        modality_scores = {
+            "channel": float(np.mean(channel_values)) if channel_values else 0.0,
+            "lab": float(np.mean(lab_values)) if lab_values else 0.0,
+            "dino": float(np.mean(dino_values)) if dino_values else 0.0,
+        }
+        weights = {
+            "channel": self.budget_coverage_channel_weight,
+            "lab": self.budget_coverage_lab_weight,
+            "dino": self.budget_coverage_dino_weight,
+        }
+        weight_sum = sum(weights.values())
+        total = sum(
+            modality_scores[name] * weights[name] for name in weights
+        ) / weight_sum
+        return {
+            "total": float(total),
+            "channel": modality_scores["channel"],
+            "lab": modality_scores["lab"],
+            "dino": modality_scores["dino"],
+            "observation_count": int(len(records)),
+        }
+
+    def _coverage_loss_replacement_profiles(
+        self, candidate_members, support_threshold
+    ):
+        records = self._coverage_loss_reference_records(
+            candidate_members, support_threshold
+        )
+        expert_entities = {
+            int(expert["expert_id"]): self._coverage_loss_expert_entity(expert)
+            for expert in self.active_experts
+        }
+        candidate_entity = self._coverage_loss_candidate_entity(
+            candidate_members
+        )
+        current_entities = list(expert_entities.values())
+        current = self._coverage_loss_objective(records, current_entities)
+        profiles = {}
+        for expert_id in expert_entities:
+            retained = [
+                entity
+                for other_id, entity in expert_entities.items()
+                if other_id != expert_id
+            ]
+            without = self._coverage_loss_objective(records, retained)
+            with_candidate = self._coverage_loss_objective(
+                records, retained + [candidate_entity]
+            )
+            profiles[expert_id] = {
+                "current_coverage": dict(current),
+                "coverage_without_expert": dict(without),
+                "coverage_with_candidate": dict(with_candidate),
+                "removal_loss": float(current["total"] - without["total"]),
+                "swap_gain": float(with_candidate["total"] - current["total"]),
+            }
+        return profiles
+
+    def _coverage_loss_joint_eviction_profiles(
+        self, candidate_members, support_threshold
+    ):
+        records = self._coverage_loss_reference_records(
+            candidate_members, support_threshold
+        )
+        entities = {
+            int(expert["expert_id"]): self._coverage_loss_expert_entity(
+                expert
+            )
+            for expert in self.active_experts
+        }
+        entities["candidate"] = self._coverage_loss_candidate_entity(
+            candidate_members
+        )
+        joint = self._coverage_loss_objective(
+            records, list(entities.values())
+        )
+        profiles = {}
+        for entity_id in entities:
+            retained = [
+                entity
+                for other_id, entity in entities.items()
+                if other_id != entity_id
+            ]
+            retained_coverage = self._coverage_loss_objective(
+                records, retained
+            )
+            profiles[entity_id] = {
+                "joint_coverage": dict(joint),
+                "coverage_after_eviction": dict(retained_coverage),
+                "eviction_loss": float(
+                    joint["total"] - retained_coverage["total"]
+                ),
+            }
+        return profiles
+
+    def _patch_kcenter_eviction_profiles(
+        self, candidate_members, support_threshold
+    ):
+        records = self._coverage_loss_reference_records(
+            candidate_members, support_threshold
+        )
+        entities = {
+            int(expert["expert_id"]): self._coverage_loss_expert_entity(
+                expert
+            )
+            for expert in self.active_experts
+        }
+        entities["candidate"] = self._coverage_loss_candidate_entity(
+            candidate_members
+        )
+
+        def covering_radius(selected_entities):
+            distances = []
+            for record in records:
+                record_prototypes = record.get("patch_prototypes")
+                if record_prototypes is None:
+                    continue
+                similarities = []
+                for entity in selected_entities:
+                    prototypes = entity.get("patch_prototypes")
+                    if prototypes is None:
+                        continue
+                    similarities.append(
+                        record_prototypes @ prototypes.T
+                    )
+                if not similarities:
+                    continue
+                best_similarity = torch.stack(
+                    [values.max(dim=1).values for values in similarities]
+                ).max(dim=0).values
+                distances.append(
+                    (1.0 - best_similarity).clamp(0.0, 2.0)
+                )
+            if not distances:
+                return 0.0
+            return float(torch.cat(distances).max().item())
+
+        joint_radius = covering_radius(list(entities.values()))
+        profiles = {}
+        for entity_id in entities:
+            retained = [
+                entity
+                for other_id, entity in entities.items()
+                if other_id != entity_id
+            ]
+            radius_after_eviction = covering_radius(retained)
+            profiles[entity_id] = {
+                "joint_covering_radius": float(joint_radius),
+                "covering_radius_after_eviction": float(
+                    radius_after_eviction
+                ),
+                "eviction_loss": float(
+                    radius_after_eviction - joint_radius
+                ),
+                "coverage_objective": "patch_kcenter_max_cosine_distance",
             }
         return profiles
 
@@ -3811,6 +6500,207 @@ class DynamicExpertManager:
 
         coverage_profiles = self._expert_coverage_profiles()
         lab_uniqueness_profiles = self._expert_lab_uniqueness_profiles()
+        if self.budget_coverage_loss_enabled:
+            if self.budget_coverage_joint_eviction_enabled:
+                joint_profiles = self._coverage_loss_joint_eviction_profiles(
+                    candidate_members, support_threshold
+                )
+                active_by_id = {
+                    int(expert["expert_id"]): expert
+                    for expert in self.active_experts
+                }
+                ranked_entity_ids = sorted(
+                    joint_profiles,
+                    key=lambda entity_id: (
+                        joint_profiles[entity_id]["eviction_loss"],
+                        entity_id != "candidate",
+                        (
+                            active_by_id[entity_id].get(
+                                "lifecycle_state", "active"
+                            )
+                            != "dormant"
+                            if entity_id != "candidate"
+                            else False
+                        ),
+                        (
+                            int(active_by_id[entity_id]["last_supported_step"])
+                            if entity_id != "candidate"
+                            else -1
+                        ),
+                        str(entity_id),
+                    ),
+                )
+                evicted_entity_id = ranked_entity_ids[0]
+                eviction_profile = joint_profiles[evicted_entity_id]
+                evaluation.update(
+                    {
+                        "coverage_loss_enabled": True,
+                        "coverage_selection_mode": "joint_minimum_loss",
+                        "coverage_joint_eviction_profiles": joint_profiles,
+                        "evicted_entity_id": evicted_entity_id,
+                        "coverage_eviction_loss": float(
+                            eviction_profile["eviction_loss"]
+                        ),
+                    }
+                )
+                if evicted_entity_id == "candidate":
+                    evaluation["outcome"] = (
+                        "candidate_evicted_minimum_coverage_loss"
+                    )
+                    self.last_budget_replacement_evaluation = evaluation
+                    return None, None
+
+                victim_id = int(evicted_entity_id)
+                victim = active_by_id[victim_id]
+                evaluation.update(
+                    {
+                        "victim_expert_id": victim_id,
+                        "victim_coverage": dict(
+                            coverage_profiles[victim_id]
+                        ),
+                        "victim_lab_uniqueness": dict(
+                            lab_uniqueness_profiles[victim_id]
+                        ),
+                        "victim_lifecycle_state": victim.get(
+                            "lifecycle_state", "active"
+                        ),
+                        "outcome": "accepted",
+                    }
+                )
+                self.last_budget_replacement_evaluation = evaluation
+                return victim_id, {
+                    "admission_route": admission_route,
+                    "candidate_admission_evidence": evaluation[
+                        "candidate_admission_evidence"
+                    ],
+                    "replacement_reason": (
+                        "coreset_joint_minimum_loss_replacement"
+                    ),
+                    "new_coverage_fraction": (
+                        float(new_coverage_fraction)
+                        if new_coverage_fraction is not None
+                        else None
+                    ),
+                    "new_coverage_count": int(new_coverage_count),
+                    "candidate_observation_count": int(
+                        candidate_observation_count
+                    ),
+                    "victim_coverage": dict(coverage_profiles[victim_id]),
+                    "victim_lab_uniqueness": dict(
+                        lab_uniqueness_profiles[victim_id]
+                    ),
+                    "victim_lifecycle_state": victim.get(
+                        "lifecycle_state", "active"
+                    ),
+                    "coverage_eviction_loss": float(
+                        eviction_profile["eviction_loss"]
+                    ),
+                    "coverage_loss_profile": dict(eviction_profile),
+                }
+
+            coverage_loss_profiles = (
+                self._coverage_loss_replacement_profiles(
+                    candidate_members, support_threshold
+                )
+            )
+            if self.budget_coverage_min_loss_only:
+                ranked = sorted(
+                    self.active_experts,
+                    key=lambda expert: (
+                        coverage_loss_profiles[int(expert["expert_id"])][
+                            "removal_loss"
+                        ],
+                        expert.get("lifecycle_state", "active")
+                        != "dormant",
+                        int(expert["last_supported_step"]),
+                        int(expert["expert_id"]),
+                    ),
+                )
+            else:
+                ranked = sorted(
+                    self.active_experts,
+                    key=lambda expert: (
+                        -coverage_loss_profiles[int(expert["expert_id"])][
+                            "swap_gain"
+                        ],
+                        coverage_loss_profiles[int(expert["expert_id"])][
+                            "removal_loss"
+                        ],
+                        expert.get("lifecycle_state", "active")
+                        != "dormant",
+                        int(expert["last_supported_step"]),
+                        int(expert["expert_id"]),
+                    ),
+                )
+            victim = ranked[0]
+            victim_id = int(victim["expert_id"])
+            victim_loss = coverage_loss_profiles[victim_id]
+            evaluation.update(
+                {
+                    "coverage_loss_enabled": True,
+                    "coverage_selection_mode": (
+                        "minimum_removal_loss"
+                        if self.budget_coverage_min_loss_only
+                        else "positive_swap_gain"
+                    ),
+                    "coverage_loss_profiles": coverage_loss_profiles,
+                    "victim_expert_id": victim_id,
+                    "victim_coverage": dict(coverage_profiles[victim_id]),
+                    "victim_lab_uniqueness": dict(
+                        lab_uniqueness_profiles[victim_id]
+                    ),
+                    "victim_lifecycle_state": victim.get(
+                        "lifecycle_state", "active"
+                    ),
+                    "coverage_removal_loss": float(
+                        victim_loss["removal_loss"]
+                    ),
+                    "coverage_swap_gain": float(victim_loss["swap_gain"]),
+                }
+            )
+            if (
+                not self.budget_coverage_min_loss_only
+                and
+                victim_loss["swap_gain"]
+                <= self.budget_replacement_margin
+            ):
+                evaluation["outcome"] = "no_positive_coverage_gain"
+                self.last_budget_replacement_evaluation = evaluation
+                return None, None
+            evaluation["outcome"] = "accepted"
+            self.last_budget_replacement_evaluation = evaluation
+            return victim_id, {
+                "admission_route": admission_route,
+                "candidate_admission_evidence": evaluation[
+                    "candidate_admission_evidence"
+                ],
+                "replacement_reason": (
+                    "coreset_minimum_coverage_loss_replacement"
+                    if self.budget_coverage_min_loss_only
+                    else "coreset_coverage_replacement"
+                ),
+                "new_coverage_fraction": (
+                    float(new_coverage_fraction)
+                    if new_coverage_fraction is not None
+                    else None
+                ),
+                "new_coverage_count": int(new_coverage_count),
+                "candidate_observation_count": int(
+                    candidate_observation_count
+                ),
+                "victim_coverage": dict(coverage_profiles[victim_id]),
+                "victim_lab_uniqueness": dict(
+                    lab_uniqueness_profiles[victim_id]
+                ),
+                "victim_lifecycle_state": victim.get(
+                    "lifecycle_state", "active"
+                ),
+                "coverage_removal_loss": float(
+                    victim_loss["removal_loss"]
+                ),
+                "coverage_swap_gain": float(victim_loss["swap_gain"]),
+                "coverage_loss_profile": dict(victim_loss),
+            }
         reference_step = max(
             [int(member.get("step", self.last_step)) for member in candidate_members]
             or [self.last_step]
@@ -3855,7 +6745,41 @@ class DynamicExpertManager:
             photometric_route
             and self.photometric_budget_admission_mode == "channel_or_lab"
         )
-        if lab_aware_replacement:
+        patch_victim_profile = None
+        use_patch_victim_selection = bool(
+            self.budget_patch_victim_selection_enabled
+            and (channel_novel or history_novel)
+        )
+        if use_patch_victim_selection:
+            if self.budget_patch_kcenter_victim_selection_enabled:
+                joint_profiles = self._patch_kcenter_eviction_profiles(
+                    candidate_members, support_threshold
+                )
+            else:
+                joint_profiles = self._coverage_loss_joint_eviction_profiles(
+                    candidate_members, support_threshold
+                )
+            (
+                victim,
+                victim_profile,
+                victim_lab_profile,
+                victim_contribution,
+            ) = min(
+                eligible,
+                key=lambda item: (
+                    joint_profiles[int(item[0]["expert_id"])][
+                        "eviction_loss"
+                    ],
+                    item[0].get("lifecycle_state", "active")
+                    != "dormant",
+                    int(item[0]["last_supported_step"]),
+                    int(item[0]["expert_id"]),
+                ),
+            )
+            patch_victim_profile = joint_profiles[
+                int(victim["expert_id"])
+            ]
+        elif lab_aware_replacement:
             victim, victim_profile, victim_lab_profile, victim_contribution = min(
                 eligible,
                 key=lambda item: (
@@ -3892,6 +6816,26 @@ class DynamicExpertManager:
                 "expert_coverage_profiles": coverage_profiles,
                 "expert_lab_uniqueness_profiles": lab_uniqueness_profiles,
                 "expert_contribution_profiles": expert_contributions,
+                "coverage_selection_mode": (
+                    "patch_kcenter_minimum_victim_loss"
+                    if (
+                        self.budget_patch_kcenter_victim_selection_enabled
+                        and use_patch_victim_selection
+                    )
+                    else "patch_minimum_victim_loss"
+                    if use_patch_victim_selection
+                    else None
+                ),
+                "coverage_joint_eviction_profiles": (
+                    joint_profiles
+                    if use_patch_victim_selection
+                    else None
+                ),
+                "coverage_eviction_loss": (
+                    float(patch_victim_profile["eviction_loss"])
+                    if patch_victim_profile is not None
+                    else None
+                ),
             }
         )
         self.last_budget_replacement_evaluation = evaluation
@@ -3903,6 +6847,8 @@ class DynamicExpertManager:
             "replacement_reason": (
                 "history_reentry_swap"
                 if history_novel
+                else "coreset_patch_victim_replacement"
+                if use_patch_victim_selection
                 else "lab_or_coverage_budget_replacement"
                 if lab_novel
                 else "coverage_budget_replacement"
@@ -3920,6 +6866,16 @@ class DynamicExpertManager:
             "candidate_contribution": dict(candidate_contribution),
             "victim_lifecycle_state": victim.get(
                 "lifecycle_state", "active"
+            ),
+            "coverage_eviction_loss": (
+                float(patch_victim_profile["eviction_loss"])
+                if patch_victim_profile is not None
+                else None
+            ),
+            "coverage_loss_profile": (
+                dict(patch_victim_profile)
+                if patch_victim_profile is not None
+                else None
             ),
         }
 
@@ -3946,6 +6902,13 @@ class DynamicExpertManager:
         )
         if replacement_reason == "coverage_budget_replacement":
             expert["last_event"] = "replaced_coverage_budget"
+        elif replacement_reason in {
+            "coreset_coverage_replacement",
+            "coreset_minimum_coverage_loss_replacement",
+            "coreset_joint_minimum_loss_replacement",
+            "coreset_patch_victim_replacement",
+        }:
+            expert["last_event"] = "replaced_coreset_coverage"
         elif replacement_reason == "history_reentry_swap":
             expert["last_event"] = "replaced_history_reentry"
         else:
@@ -4026,7 +6989,7 @@ class DynamicExpertManager:
             "admission_ttl_mode": self.admission_ttl_mode,
             "admission_route": admission_route,
             "lab_state": (
-                self._build_lab_state(cluster_members)
+                self._build_lab_state(cluster_members, step=step)
                 if admission_route.startswith("photometric_drift")
                 else None
             ),
@@ -4040,6 +7003,11 @@ class DynamicExpertManager:
             expert,
             "active",
             step,
+            state_id=(
+                candidate_evidence.get("associated_state_id")
+                if candidate_evidence is not None
+                else None
+            ),
         )
         self.admitted_count += 1
         self.next_expert_id += 1
@@ -4248,13 +7216,21 @@ class DynamicExpertManager:
         provisional_profile = None
         history_reentry_match = None
         adaptive_admission_evidence = None
-        adaptive_photometric = bool(
+        state_aware_photometric = bool(
             self.novel_quarantine_route == "photometric_drift"
             and self.photometric_candidate_window_mode
             == "dynamic_low_risk"
+            and (
+                self.photometric_state_distribution_enabled
+                or self.photometric_temporary_state_enabled
+                or self.photometric_adaptive_candidate_evidence
+            )
+        )
+        adaptive_photometric = bool(
+            state_aware_photometric
             and self.photometric_adaptive_candidate_evidence
         )
-        if adaptive_photometric:
+        if state_aware_photometric:
             eligible_members = [
                 item
                 for item in self.novel_quarantine
@@ -4285,11 +7261,37 @@ class DynamicExpertManager:
                     )
                 elif decision == "new_scoring_expert":
                     photometric_required_count = 2
-                elif decision == "photometric_state_only":
+                elif decision == "new_temporary_state":
                     selected_members = adaptive_admission_evidence[
                         "selected_members"
                     ]
-                    self._record_photometric_state(selected_members, step)
+                    temporary_support_evidence = (
+                        adaptive_admission_evidence.get(
+                            "temporary_support_evidence"
+                        )
+                        if self.photometric_denstream_support_enabled
+                        else None
+                    )
+                    initial_state_status = (
+                        "stable"
+                        if temporary_support_evidence is not None
+                        and temporary_support_evidence.get("increment", 0.0)
+                        >= self.photometric_denstream_mature_support
+                        else "temporary"
+                    )
+                    recorded_state = self._record_photometric_state(
+                        selected_members,
+                        step,
+                        state_status=initial_state_status,
+                        source_type=(
+                            "photometric_only"
+                            if initial_state_status == "stable"
+                            else "temporary"
+                        ),
+                        temporary_support_evidence=(
+                            temporary_support_evidence
+                        ),
+                    )
                     pool = list(self.novel_quarantine)
                     self.novel_quarantine = None
                     self.novel_quarantine_route = None
@@ -4297,13 +7299,22 @@ class DynamicExpertManager:
                     self.photometric_trigger_lab_center = None
                     self.photometric_support_streak = 0
                     self.last_novel_quarantine_event = {
-                        "decision": "recorded_photometric_state_only",
-                        "confirmation_reason": "existing_channel_coverage",
+                        "decision": (
+                            "recorded_photometric_state_only"
+                            if initial_state_status == "stable"
+                            else "recorded_temporary_photometric_state"
+                        ),
+                        "confirmation_reason": (
+                            "denstream_effective_support_matured"
+                            if initial_state_status == "stable"
+                            else "first_consistent_state_event"
+                        ),
                         "start_step": int(pool[0]["step"]),
                         "end_step": int(step),
                         "size": len(pool),
                         "route": "photometric_drift",
                         "created_full_expert": False,
+                        "historical_state": recorded_state,
                         "photometric_profile": provisional_profile,
                         "candidate_evidence": {
                             key: value
@@ -4315,6 +7326,11 @@ class DynamicExpertManager:
                             for item in selected_members
                         ],
                     }
+                    if initial_state_status == "stable":
+                        self._rebase_photometric_trigger_detector(
+                            selected_members,
+                            step,
+                        )
                     self._finish_photometric_episode(
                         provisional_profile.get("selected_lab_center")
                         or self._photometric_pool_lab_center(
@@ -4322,8 +7338,109 @@ class DynamicExpertManager:
                         )
                     )
                     return None, None
+                elif decision in {
+                    "update_temporary_state",
+                    "update_existing_state",
+                    "existing_state_supported",
+                }:
+                    selected_members = adaptive_admission_evidence[
+                        "selected_members"
+                    ]
+                    state_update = (
+                        self._update_matched_historical_state(
+                            adaptive_admission_evidence["history_match"],
+                            selected_members,
+                            step,
+                            temporary_support_evidence=(
+                                adaptive_admission_evidence.get(
+                                    "temporary_support_evidence"
+                                )
+                                if self.photometric_denstream_support_enabled
+                                else None
+                            ),
+                        )
+                        if decision != "existing_state_supported"
+                        else adaptive_admission_evidence["history_match"].get(
+                            "matched_profile"
+                        )
+                    )
+                    state_is_stable = bool(
+                        state_update is not None
+                        and state_update.get("state_status_after") == "stable"
+                    )
+                    should_materialize = bool(
+                        decision == "update_temporary_state"
+                        and state_is_stable
+                        and adaptive_admission_evidence[
+                            "has_reliable_patch_memory"
+                        ]
+                        and adaptive_admission_evidence["channel_novel"]
+                    )
+                    if should_materialize:
+                        adaptive_admission_evidence[
+                            "decision"
+                        ] = "new_scoring_expert"
+                        adaptive_admission_evidence[
+                            "associated_state_id"
+                        ] = adaptive_admission_evidence[
+                            "history_match"
+                        ]["matched_state_id"]
+                        photometric_required_count = 2
+                    else:
+                        pool = list(self.novel_quarantine)
+                        self.novel_quarantine = None
+                        self.novel_quarantine_route = None
+                        self.photometric_trigger_expert_id = None
+                        self.photometric_trigger_lab_center = None
+                        self.photometric_support_streak = 0
+                        event_decision = (
+                            "existing_photometric_state_supported"
+                            if decision == "existing_state_supported"
+                            else
+                            "updated_existing_photometric_state"
+                            if decision == "update_existing_state"
+                            else "matured_photometric_state_only"
+                            if state_is_stable
+                            else "updated_temporary_photometric_state"
+                        )
+                        self.last_novel_quarantine_event = {
+                            "decision": event_decision,
+                            "confirmation_reason": decision,
+                            "start_step": int(pool[0]["step"]),
+                            "end_step": int(step),
+                            "size": len(pool),
+                            "route": "photometric_drift",
+                            "created_full_expert": False,
+                            "historical_state": state_update,
+                            "photometric_profile": provisional_profile,
+                            "candidate_evidence": {
+                                key: value
+                                for key, value in adaptive_admission_evidence.items()
+                                if key != "selected_members"
+                            },
+                            "selected_image_ids": [
+                                int(item["image_id"])
+                                for item in selected_members
+                            ],
+                        }
+                        if (
+                            state_is_stable
+                            and state_update is not None
+                            and state_update.get("active_expert_id") is None
+                        ):
+                            self._rebase_photometric_trigger_detector(
+                                selected_members,
+                                step,
+                            )
+                        self._finish_photometric_episode(
+                            provisional_profile.get("selected_lab_center")
+                            or self._photometric_pool_lab_center(
+                                selected_members
+                            )
+                        )
+                        return None, None
         if (
-            not adaptive_photometric
+            not state_aware_photometric
             and
             self.novel_quarantine_route == "photometric_drift"
             and self.photometric_candidate_window_mode == "dynamic_low_risk"
@@ -4391,6 +7508,13 @@ class DynamicExpertManager:
                         required_steps,
                         self.photometric_history_reentry_members,
                     )
+            elif self.photometric_fitness_history_enabled:
+                effective_size = float(
+                    (self.last_fitness_history_profile or {}).get(
+                        "effective_history_size", 0.0
+                    )
+                )
+                required_steps = max(2, int(math.ceil(effective_size)) + 1)
             elif self.photometric_relevant_history_enabled:
                 required_steps = max(
                     self.photometric_min_low_risk_members,
@@ -4835,6 +7959,7 @@ class DynamicExpertManager:
                         else None
                     ),
                     "created_full_expert": expert_id is not None,
+                    "historical_state": None,
                     "history_reentry": self.last_history_reentry_event,
                     "candidate_evidence": (
                         {
@@ -5006,6 +8131,7 @@ class DynamicExpertManager:
         current_expert_supports=None,
     ):
         current_expert_supports = current_expert_supports or {}
+        self.last_fitness_history_profile = None
         legacy_candidate = bool(
             ms_score is not None
             and channel_support is not None
@@ -5092,7 +8218,10 @@ class DynamicExpertManager:
             self.photometric_prebuffer.append(current_member)
             prebuffer_size = (
                 self.photometric_history_max
-                if self.photometric_relevant_history_enabled
+                if (
+                    self.photometric_relevant_history_enabled
+                    or self.photometric_fitness_history_enabled
+                )
                 else self.photometric_prebuffer_size
             )
             del self.photometric_prebuffer[:-prebuffer_size]
@@ -5103,7 +8232,15 @@ class DynamicExpertManager:
             and not photometric_pool_active
             and self.photometric_candidate_window_mode == "history"
         ):
-            if self.photometric_relevant_history_enabled:
+            if self.photometric_fitness_history_enabled:
+                (
+                    photometric_seed_members,
+                    self.last_fitness_history_profile,
+                ) = self._fitness_history_profile(
+                    self.photometric_prebuffer,
+                    current_member,
+                )
+            elif self.photometric_relevant_history_enabled:
                 relevant_ids = set(
                     int(image_id)
                     for image_id in lab_drift_profile.get(
@@ -5153,6 +8290,13 @@ class DynamicExpertManager:
             )
         )
         if (
+            self.last_fitness_history_profile is not None
+            and self.last_novel_quarantine_event is not None
+        ):
+            self.last_novel_quarantine_event["fitness_history"] = dict(
+                self.last_fitness_history_profile
+            )
+        if (
             self.photometric_episode_enabled
             and self.novel_quarantine is not None
             and self.novel_quarantine_route == "photometric_drift"
@@ -5161,7 +8305,10 @@ class DynamicExpertManager:
         self.photometric_prebuffer.append(current_member)
         prebuffer_size = (
             self.photometric_history_max
-            if self.photometric_relevant_history_enabled
+            if (
+                self.photometric_relevant_history_enabled
+                or self.photometric_fitness_history_enabled
+            )
             else self.photometric_prebuffer_size
         )
         del self.photometric_prebuffer[:-prebuffer_size]
@@ -5259,6 +8406,10 @@ class DynamicExpertManager:
                 "step": step,
                 "image_id": image_id,
                 "embedding": embedding,
+                "patch_prototypes": self._patch_coreset(
+                    dino_patch_features,
+                    patch_ids=memory_patch_ids,
+                ),
                 "quality": float(quality),
                 "ms_score": ms_score,
                 "channel_support":
@@ -5399,13 +8550,13 @@ class DynamicExpertManager:
         current_expert_supports=None,
     ):
     # 连续性
+        self.state_lifecycle_events = []
         if step != self.last_step + 1:
             raise ValueError(
                 f"step must be "
                 f"{self.last_step + 1}, "
                 f"got {step}"
             )
-
 # 是否是字典
         if not isinstance(
             expert_channel_supports,
@@ -5450,6 +8601,8 @@ class DynamicExpertManager:
             ):
                 raise ValueError("memory_patch_ids contains an invalid patch")
 
+        self._decay_temporary_states(step)
+
 # 计算历史限制
         (
             ms_threshold,
@@ -5468,6 +8621,9 @@ class DynamicExpertManager:
             ms_threshold,
             support_threshold,
             current_expert_supports,
+            dino_patch_features=dino_patch_features,
+            memory_patch_ids=memory_patch_ids,
+            lab_feature=lab_feature,
         )
 
         (
@@ -5484,7 +8640,117 @@ class DynamicExpertManager:
 
 # 专家的候选和准入
         self.last_bootstrap_event = None
-        if (
+        if self.cold_start_mode == "confidence":
+            bootstrap_expert_exists = any(
+                int(expert["expert_id"])
+                == int(self.bootstrap_confidence_expert_id)
+                for expert in self.active_experts
+                if self.bootstrap_confidence_expert_id is not None
+            )
+            if self.bootstrap_confidence_expert_id is None:
+                (
+                    is_candidate,
+                    cluster_id,
+                    admitted_expert_id,
+                    candidate_route,
+                ) = self._advance_confidence_cold_start(
+                    step,
+                    int(image_id),
+                    dino_patch_features,
+                    ms_score,
+                    channel_support,
+                    lab_feature,
+                )
+            elif not bootstrap_expert_exists:
+                (
+                    is_candidate,
+                    cluster_id,
+                    admitted_expert_id,
+                    candidate_route,
+                ) = self._consider_candidate(
+                    step,
+                    int(image_id),
+                    dino_patch_features,
+                    ms_score,
+                    channel_support,
+                    ms_threshold,
+                    support_threshold,
+                    provisional_channel_support,
+                    novel_ms_threshold,
+                    novel_support_threshold,
+                    ms_short_score,
+                    ms_short_ratio,
+                    memory_patch_ids,
+                    lab_feature,
+                    lab_drift_profile,
+                    current_expert_supports=(current_expert_supports or {}),
+                )
+            else:
+                (
+                    is_candidate,
+                    cluster_id,
+                    admitted_expert_id,
+                    candidate_route,
+                ) = self._consider_candidate(
+                    step,
+                    int(image_id),
+                    dino_patch_features,
+                    ms_score,
+                    channel_support,
+                    ms_threshold,
+                    support_threshold,
+                    provisional_channel_support,
+                    novel_ms_threshold,
+                    novel_support_threshold,
+                    ms_short_score,
+                    ms_short_ratio,
+                    memory_patch_ids,
+                    lab_feature,
+                    lab_drift_profile,
+                    current_expert_supports=(current_expert_supports or {}),
+                )
+                has_non_bootstrap_expert = any(
+                    expert.get("admission_route")
+                    != "bootstrap_confidence"
+                    and expert.get("lifecycle_state", "active") == "active"
+                    for expert in self.active_experts
+                )
+                bootstrap_update_deferred = bool(
+                    lab_drift_profile is not None
+                    and (
+                        lab_drift_profile.get("drift_confirmed", False)
+                        or self.photometric_episode_active
+                        or self.novel_quarantine_route
+                        == "photometric_drift"
+                    )
+                )
+                if not has_non_bootstrap_expert and not bootstrap_update_deferred:
+                    self._advance_confidence_cold_start(
+                        step,
+                        int(image_id),
+                        dino_patch_features,
+                        ms_score,
+                        channel_support,
+                        lab_feature,
+                    )
+                elif not has_non_bootstrap_expert:
+                    self.last_bootstrap_event = {
+                        "decision": "confidence_state_update_deferred",
+                        "reason": "photometric_state_hypothesis_active",
+                        "step": int(step),
+                        "image_id": int(image_id),
+                        "drift_confirmed": bool(
+                            lab_drift_profile.get("drift_confirmed", False)
+                        ),
+                        "photometric_episode_active": bool(
+                            self.photometric_episode_active
+                        ),
+                        "photometric_pool_active": bool(
+                            self.novel_quarantine_route
+                            == "photometric_drift"
+                        ),
+                    }
+        elif (
             self.cold_start_mode == "adaptive"
             and self.admitted_count == 0
             and not self.active_experts
@@ -5500,6 +8766,7 @@ class DynamicExpertManager:
                 dino_patch_features,
                 ms_score,
                 channel_support,
+                provisional_channel_support,
                 lab_feature,
             )
         else:
@@ -5539,6 +8806,13 @@ class DynamicExpertManager:
             replacement_decision = (
                 "replaced_history_reentry"
                 if replacement_reason == "history_reentry_swap"
+                else "replaced_coreset_coverage"
+                if replacement_reason in {
+                    "coreset_coverage_replacement",
+                    "coreset_minimum_coverage_loss_replacement",
+                    "coreset_joint_minimum_loss_replacement",
+                    "coreset_patch_victim_replacement",
+                }
                 else "replaced_coverage_budget"
             )
             expert_lifecycle_events.append(
@@ -5656,7 +8930,9 @@ class DynamicExpertManager:
                 self.last_budget_replacement_evaluation
             ),
             "history_reentry": self.last_history_reentry_event,
+            "fitness_history": self.last_fitness_history_profile,
             "historical_states": self._historical_state_audit(),
+            "state_lifecycle_events": list(self.state_lifecycle_events),
             "bootstrap": self.last_bootstrap_event,
             "cluster_id": cluster_id,
             "admitted_expert_id":

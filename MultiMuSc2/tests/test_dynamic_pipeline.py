@@ -63,6 +63,164 @@ def scoring_timeline(image_count=4):
 
 
 class DynamicPipelineTest(unittest.TestCase):
+    def test_confidence_expert_blends_with_strict_history(self):
+        dino = synthetic_features(3)
+        timeline = scoring_timeline(3)
+        timeline[2]["active_experts_before"][0]["scoring_weight"] = 0.25
+        scores, audits = score_dynamic_msm2_layer(
+            dino,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+        )
+        expert_score, _ = MSM2_online(
+            dino[2],
+            None,
+            dino[[0]],
+            None,
+            fusion_mode="dino_only",
+        )
+        history_score, _ = _strict_history_fallback(
+            dino[2],
+            dino[:2],
+            reason="test",
+        )
+
+        self.assertTrue(
+            torch.allclose(
+                scores[2],
+                history_score + 0.25 * (expert_score - history_score),
+            )
+        )
+        self.assertEqual(audits[2]["effective_mode"], "dino_confidence_blend")
+        self.assertEqual(audits[2]["active_committee_confidence"], 0.25)
+        self.assertEqual(audits[2]["expert_image_ids"], [0])
+
+    def test_confidence_state_is_strictly_historical_during_scoring(self):
+        dino = synthetic_features(4)
+        timeline = build_dynamic_committee_timeline(
+            dino,
+            device="cpu",
+            manager_kwargs={
+                "cold_start_mode": "confidence",
+                "cold_start_confidence_history": 16,
+                "min_cluster_support": 10,
+                "committee_cap": 2,
+            },
+        )
+        _, audits = score_dynamic_msm2_layer(
+            dino,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+        )
+
+        self.assertEqual(timeline[0]["active_experts_before"], [])
+        for step in range(1, len(timeline)):
+            active = timeline[step]["active_experts_before"]
+            self.assertTrue(active)
+            self.assertTrue(
+                all(
+                    image_id < step
+                    for image_id in active[0]["state_member_image_ids"]
+                )
+            )
+            self.assertNotIn(step, audits[step]["expert_image_ids"])
+            self.assertEqual(
+                audits[step]["effective_mode"],
+                "dino_confidence_blend",
+            )
+
+    def test_stable_lab_anchor_is_frozen_from_past_only(self):
+        dino = synthetic_features(5)
+        lab = torch.tensor(
+            [
+                [40.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [41.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [70.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [80.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+                [90.0, 2.0, 1.0, 3.0, 2.0, 4.0],
+            ],
+            dtype=torch.float64,
+        )
+        timeline = build_dynamic_committee_timeline(
+            dino,
+            device="cpu",
+            lab_features=lab,
+            manager_kwargs={
+                "cold_start_mode": "confidence",
+                "cold_start_reference_confidence_mode": "prequential",
+                "cold_start_lab_enabled": True,
+                "photometric_stable_lab_anchor_enabled": True,
+                "min_cluster_support": 10,
+                "committee_cap": 2,
+            },
+        )
+
+        frozen = [
+            record["active_experts_before"][0]["lab_state"]
+            for record in timeline
+            if record["active_experts_before"]
+            and record["active_experts_before"][0]["lab_state"].get(
+                "anchor_frozen", False
+            )
+        ]
+
+        self.assertTrue(frozen)
+        anchor = frozen[0]["anchor_center"]
+        self.assertTrue(
+            all(state["anchor_center"] == anchor for state in frozen)
+        )
+        for record in timeline:
+            if not record["active_experts_before"]:
+                continue
+            state = record["active_experts_before"][0]["lab_state"]
+            if state.get("anchor_frozen", False):
+                self.assertTrue(
+                    all(
+                        image_id < record["step"]
+                        for image_id in state["anchor_member_image_ids"]
+                    )
+                )
+
+    def test_confidence_weight_remains_individual_with_full_expert(self):
+        dino = synthetic_features(3)
+        timeline = scoring_timeline(3)
+        timeline[2]["active_experts_before"] = [
+            {
+                "expert_id": 0,
+                "image_id": 0,
+                "cluster_id": 0,
+                "admission_step": 0,
+            },
+            {
+                "expert_id": 1,
+                "image_id": 1,
+                "cluster_id": 1,
+                "admission_step": 1,
+                "scoring_weight": 0.25,
+            },
+        ]
+        scores, audits = score_dynamic_msm2_layer(
+            dino,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+        )
+        full_score, _ = MSM2_online(
+            dino[2], None, dino[[0]], None, fusion_mode="dino_only"
+        )
+        confidence_score, _ = MSM2_online(
+            dino[2], None, dino[[1]], None, fusion_mode="dino_only"
+        )
+        expected = full_score + 0.25 * (confidence_score - full_score)
+
+        self.assertTrue(torch.allclose(scores[2], expected))
+        self.assertEqual(audits[2]["effective_mode"], "dino_confidence_blend")
+        self.assertEqual(
+            audits[2]["active_expert_scoring_weights"], [1.0, 0.25]
+        )
+
     def test_photometric_drift_rejects_high_risk_pool_without_cross_category_route(
         self,
     ):

@@ -1,5 +1,6 @@
 import unittest
 
+import numpy as np
 import torch
 
 from MultiMuSc2.models.modules._DYNAMIC_EXPERT import DynamicExpertManager
@@ -22,6 +23,681 @@ def prepared_manager(committee_cap=1):
 
 
 class DynamicExpertManagerTest(unittest.TestCase):
+    @staticmethod
+    def denstream_member(step, image_id, channel_support=0.8):
+        return {
+            "step": int(step),
+            "image_id": int(image_id),
+            "embedding": torch.tensor([1.0, 0.0]),
+            "lab_feature": np.asarray(
+                [50.0, 5.0, 128.0, 8.0, 128.0, 8.0],
+                dtype=np.float64,
+            ),
+            "channel_support": float(channel_support),
+            "provisional_channel_support": float(channel_support),
+        }
+
+    def test_denstream_temporary_uses_effective_support_not_event_count(self):
+        manager = DynamicExpertManager(
+            photometric_state_distribution_enabled=True,
+            photometric_temporary_state_enabled=True,
+            photometric_denstream_support_enabled=True,
+            photometric_denstream_decay=0.9,
+            photometric_denstream_mature_support=0.5,
+            photometric_denstream_discard_support=0.05,
+        )
+        first_members = [
+            self.denstream_member(0, 0),
+            self.denstream_member(0, 1),
+        ]
+        evidence = {
+            "increment": 0.2,
+            "dino_evidence": 1.0,
+            "channel_evidence": 0.5,
+            "risk_evidence": 0.4,
+        }
+        created = manager._record_photometric_state(
+            first_members,
+            0,
+            state_status="temporary",
+            source_type="temporary",
+            temporary_support_evidence=evidence,
+        )
+        state_id = created["historical_state_id"]
+        manager._decay_temporary_states(1)
+        updated = manager._update_matched_historical_state(
+            {"matched_state_id": state_id},
+            [self.denstream_member(1, 2), self.denstream_member(1, 3)],
+            1,
+            temporary_support_evidence=evidence,
+        )
+
+        self.assertEqual(updated["state_status_after"], "temporary")
+        self.assertEqual(
+            manager.historical_states[0]["support_event_count"], 2
+        )
+        self.assertAlmostEqual(
+            manager.historical_states[0]["temporary_effective_support"],
+            0.38,
+        )
+
+        manager._decay_temporary_states(2)
+        updated = manager._update_matched_historical_state(
+            {"matched_state_id": state_id},
+            [self.denstream_member(2, 4), self.denstream_member(2, 5)],
+            2,
+            temporary_support_evidence=evidence,
+        )
+        self.assertEqual(updated["state_status_after"], "stable")
+        self.assertTrue(
+            any(
+                event["event_type"] == "mature"
+                and event["reason"]
+                == "denstream_effective_support_matured"
+                for event in manager.state_lifecycle_events
+            )
+        )
+
+    def test_fixed_temporary_maturation_is_unchanged_when_denstream_disabled(self):
+        manager = DynamicExpertManager(
+            photometric_state_distribution_enabled=True,
+            photometric_temporary_state_enabled=True,
+            photometric_denstream_support_enabled=False,
+        )
+        members = [
+            self.denstream_member(0, 0),
+            self.denstream_member(0, 1),
+        ]
+        created = manager._record_photometric_state(
+            members,
+            0,
+            state_status="temporary",
+            source_type="temporary",
+        )
+        updated = manager._update_matched_historical_state(
+            {"matched_state_id": created["historical_state_id"]},
+            [self.denstream_member(1, 2), self.denstream_member(1, 3)],
+            1,
+        )
+
+        self.assertEqual(updated["state_status_after"], "stable")
+        self.assertNotIn(
+            "temporary_effective_support", manager.historical_states[0]
+        )
+
+    def test_denstream_temporary_decays_and_is_evicted_without_support(self):
+        manager = DynamicExpertManager(
+            photometric_state_distribution_enabled=True,
+            photometric_temporary_state_enabled=True,
+            photometric_denstream_support_enabled=True,
+            photometric_denstream_decay=0.5,
+            photometric_denstream_mature_support=0.5,
+            photometric_denstream_discard_support=0.1,
+        )
+        manager._record_photometric_state(
+            [self.denstream_member(0, 0), self.denstream_member(0, 1)],
+            0,
+            state_status="temporary",
+            source_type="temporary",
+            temporary_support_evidence={
+                "increment": 0.2,
+                "dino_evidence": 1.0,
+                "channel_evidence": 0.5,
+                "risk_evidence": 0.4,
+            },
+        )
+        manager.state_lifecycle_events = []
+        manager._decay_temporary_states(2)
+
+        self.assertEqual(manager.historical_states, [])
+        self.assertEqual(
+            manager.state_lifecycle_events[-1]["reason"],
+            "temporary_effective_support_decay",
+        )
+
+    def test_denstream_support_increment_is_continuous_evidence_product(self):
+        manager = DynamicExpertManager(
+            photometric_denstream_support_enabled=True,
+        )
+        strong_members = [
+            self.denstream_member(0, 0, 0.9),
+            self.denstream_member(0, 1, 0.9),
+        ]
+        weak_members = [
+            self.denstream_member(0, 0, 0.2),
+            {
+                **self.denstream_member(0, 1, 0.2),
+                "embedding": torch.tensor([0.91, 0.41460824]),
+            },
+        ]
+        strong = manager._temporary_support_evidence(
+            strong_members,
+            {"risk_ratios": [0.5, 0.5]},
+        )
+        weak = manager._temporary_support_evidence(
+            weak_members,
+            {"risk_ratios": [1.2, 1.2]},
+        )
+
+        self.assertGreater(strong["increment"], weak["increment"])
+        expected_increment = 0.0
+        for evidence in strong["member_evidence"]:
+            expected_increment = (
+                manager.photometric_denstream_decay * expected_increment
+                + evidence
+            )
+        self.assertAlmostEqual(
+            strong["increment"],
+            expected_increment,
+        )
+        self.assertEqual(
+            len(strong["member_evidence"]),
+            len(strong_members),
+        )
+
+    def test_fitness_history_uses_joint_similarity_and_adaptive_size(self):
+        manager = DynamicExpertManager(
+            photometric_fitness_history_enabled=True,
+            photometric_history_max=16,
+        )
+        current = {
+            **self.denstream_member(10, 10, 0.9),
+            "current_expert_supports": {0: 0.9},
+        }
+        recent_similar = {
+            **self.denstream_member(9, 1, 0.88),
+            "current_expert_supports": {0: 0.88},
+        }
+        older_similar = {
+            **self.denstream_member(0, 0, 0.9),
+            "current_expert_supports": {0: 0.9},
+        }
+        recent_dissimilar = {
+            **self.denstream_member(8, 2, 0.0),
+            "embedding": torch.tensor([-1.0, 0.0]),
+            "lab_feature": np.asarray(
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64
+            ),
+            "current_expert_supports": {0: 0.0},
+        }
+        future = {
+            **self.denstream_member(11, 11, 0.9),
+            "current_expert_supports": {0: 0.9},
+        }
+
+        selected, profile = manager._fitness_history_profile(
+            [older_similar, recent_dissimilar, recent_similar, future],
+            current,
+        )
+
+        self.assertEqual(profile["available_count"], 3)
+        self.assertEqual(profile["selected_count"], 1)
+        self.assertEqual(profile["selected_image_ids"], [1])
+        self.assertEqual(
+            [member["image_id"] for member in selected], [1]
+        )
+        self.assertTrue(
+            all(member["step"] < current["step"] for member in selected)
+        )
+        self.assertNotIn("history_relevance", recent_similar)
+        self.assertGreater(selected[0]["history_relevance"], 0.0)
+
+    def test_confidence_cold_start_updates_continuously_after_scoring(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="confidence",
+            cold_start_confidence_history=16,
+            min_cluster_support=10,
+            committee_cap=2,
+        )
+        features = patch_features(1.0, 0.0)
+        events = []
+        confidences = []
+        for step in range(3):
+            events.append(
+                manager.advance(
+                    step=step,
+                    image_id=step,
+                    dino_patch_features=features,
+                    ms_score=0.1 + 0.1 * step,
+                    channel_support=1.0,
+                    expert_channel_supports=(
+                        {} if step == 0 else {0: 1.0}
+                    ),
+                )
+            )
+            confidences.append(
+                manager.active_experts[0]["state_confidence"]
+            )
+
+        self.assertEqual(events[0]["admitted_expert_id"], 0)
+        self.assertEqual(
+            events[0]["bootstrap"]["decision"],
+            "confidence_state_created",
+        )
+        self.assertEqual(confidences[0], 0.0)
+        self.assertGreater(confidences[1], confidences[0])
+        self.assertGreater(confidences[2], confidences[1])
+        self.assertEqual(
+            manager.active_experts[0]["state_member_image_ids"],
+            [0, 1, 2],
+        )
+        self.assertNotIn(
+            events[2]["bootstrap"]["decision"],
+            {"provisional_created", "admitted"},
+        )
+
+    def test_confidence_cold_start_downweights_structural_risk_outlier(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="confidence",
+            cold_start_confidence_history=16,
+            min_cluster_support=10,
+            committee_cap=2,
+        )
+        feature_rows = [
+            patch_features(1.0, 0.0),
+            patch_features(1.0, 0.0),
+            patch_features(1.0, 0.0),
+            patch_features(0.0, 1.0),
+        ]
+        for step, features in enumerate(feature_rows):
+            manager.advance(
+                step=step,
+                image_id=step,
+                dino_patch_features=features,
+                ms_score=0.1 if step < 3 else 10.0,
+                channel_support=1.0 if step < 3 else 0.0,
+                expert_channel_supports=(
+                    {} if step == 0 else {0: 1.0}
+                ),
+            )
+
+        event = manager.last_bootstrap_event
+        self.assertLess(
+            event["member_weights"][3],
+            min(event["member_weights"][:3]),
+        )
+        self.assertIn(event["representative_image_id"], {0, 1, 2})
+
+    def test_prequential_confidence_separates_state_and_reference_trust(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="confidence",
+            cold_start_confidence_history=16,
+            cold_start_reference_confidence_mode="prequential",
+            min_cluster_support=10,
+            committee_cap=2,
+        )
+        for step in range(2):
+            manager.advance(
+                step=step,
+                image_id=step,
+                dino_patch_features=patch_features(1.0, 0.0),
+                ms_score=0.1,
+                channel_support=1.0,
+                expert_channel_supports=(
+                    {} if step == 0 else {0: 1.0}
+                ),
+            )
+
+        trusted = manager.last_bootstrap_event
+        self.assertGreater(trusted["state_confidence"], 0.0)
+        self.assertEqual(trusted["normality_confidence"], 1.0)
+        self.assertEqual(
+            trusted["reference_confidence"],
+            trusted["state_confidence"],
+        )
+
+        manager.advance(
+            step=2,
+            image_id=2,
+            dino_patch_features=patch_features(0.0, 1.0),
+            ms_score=10.0,
+            channel_support=0.0,
+            expert_channel_supports={0: 1.0},
+        )
+
+        challenged = manager.last_bootstrap_event
+        self.assertEqual(challenged["prequential_support_count"], 2)
+        self.assertLess(challenged["prequential_support"], 0.5)
+        self.assertLess(
+            challenged["normality_confidence"],
+            trusted["normality_confidence"],
+        )
+        self.assertLess(
+            challenged["reference_confidence"],
+            trusted["reference_confidence"],
+        )
+        expert = manager.active_experts[0]
+        self.assertEqual(
+            expert["scoring_weight"],
+            expert["reference_confidence"],
+        )
+        self.assertNotEqual(
+            expert["state_confidence"],
+            expert["reference_confidence"],
+        )
+
+    def test_prequential_support_uses_only_prior_members(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="confidence",
+            cold_start_reference_confidence_mode="prequential",
+            min_cluster_support=10,
+            committee_cap=2,
+        )
+        manager.advance(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            channel_support=1.0,
+            expert_channel_supports={},
+        )
+        manager.advance(
+            step=1,
+            image_id=1,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.2,
+            channel_support=0.8,
+            expert_channel_supports={0: 1.0},
+        )
+
+        event = manager.last_bootstrap_event
+        self.assertEqual(event["prequential_profile"]["evidence_count"], 2)
+        self.assertIsNone(
+            event["prequential_profile"]["structural_support"]
+        )
+        self.assertEqual(
+            manager.active_experts[0]["state_member_image_ids"], [0, 1]
+        )
+
+    def test_stable_lab_anchor_freezes_after_reference_becomes_trusted(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="confidence",
+            cold_start_reference_confidence_mode="prequential",
+            cold_start_lab_enabled=True,
+            photometric_stable_lab_anchor_enabled=True,
+            min_cluster_support=10,
+            committee_cap=2,
+        )
+        features = patch_features(1.0, 0.0)
+        for step, lightness in enumerate((40.0, 41.0)):
+            manager.advance(
+                step=step,
+                image_id=step,
+                dino_patch_features=features,
+                ms_score=0.1,
+                channel_support=1.0,
+                expert_channel_supports=(
+                    {} if step == 0 else {0: 1.0}
+                ),
+                lab_feature=torch.tensor(
+                    [lightness, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+            )
+
+        state = manager.active_experts[0]["lab_state"]
+        frozen_anchor = list(state["anchor_center"])
+        self.assertTrue(state["anchor_frozen"])
+
+        manager.advance(
+            step=2,
+            image_id=2,
+            dino_patch_features=features,
+            ms_score=0.1,
+            channel_support=1.0,
+            expert_channel_supports={0: 1.0},
+            lab_feature=torch.tensor(
+                [80.0, 2.0, 1.0, 3.0, 2.0, 4.0]
+            ),
+        )
+
+        state = manager.active_experts[0]["lab_state"]
+        self.assertEqual(state["anchor_center"], frozen_anchor)
+        self.assertNotEqual(state["coverage_center"], frozen_anchor)
+
+    def test_stable_lab_anchor_accumulates_separate_drift_candidate(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="confidence",
+            cold_start_reference_confidence_mode="prequential",
+            cold_start_lab_enabled=True,
+            photometric_stable_lab_anchor_enabled=True,
+            min_cluster_support=10,
+            committee_cap=2,
+        )
+        features = patch_features(1.0, 0.0)
+        for step, lightness in enumerate((40.0, 41.0)):
+            manager.advance(
+                step=step,
+                image_id=step,
+                dino_patch_features=features,
+                ms_score=0.1,
+                channel_support=1.0,
+                expert_channel_supports=(
+                    {} if step == 0 else {0: 1.0}
+                ),
+                lab_feature=torch.tensor(
+                    [lightness, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+            )
+
+        anchor = list(
+            manager.active_experts[0]["lab_state"]["anchor_center"]
+        )
+        first = manager.advance_lab_state(
+            torch.tensor([80.0, 2.0, 1.0, 3.0, 2.0, 4.0]),
+            step=2,
+            image_id=2,
+        )
+        second = manager.advance_lab_state(
+            torch.tensor([82.0, 2.0, 1.0, 3.0, 2.0, 4.0]),
+            step=3,
+            image_id=3,
+        )
+
+        self.assertEqual(first["candidate_lab_count"], 1)
+        self.assertEqual(second["candidate_lab_count"], 2)
+        self.assertEqual(second["lab_anchor_center"], anchor)
+        self.assertGreater(
+            second["anchor_to_candidate_total_distance"], 0.0
+        )
+        self.assertTrue(second["drift_confirmed"])
+
+    def test_legacy_lab_center_still_updates_when_anchor_is_disabled(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="confidence",
+            cold_start_reference_confidence_mode="prequential",
+            cold_start_lab_enabled=True,
+            photometric_stable_lab_anchor_enabled=False,
+            min_cluster_support=10,
+            committee_cap=2,
+        )
+        features = patch_features(1.0, 0.0)
+        centers = []
+        for step, lightness in enumerate((40.0, 41.0, 80.0)):
+            manager.advance(
+                step=step,
+                image_id=step,
+                dino_patch_features=features,
+                ms_score=0.1,
+                channel_support=1.0,
+                expert_channel_supports=(
+                    {} if step == 0 else {0: 1.0}
+                ),
+                lab_feature=torch.tensor(
+                    [lightness, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+            )
+            centers.append(
+                manager.active_experts[0]["lab_state"]["center"][0]
+            )
+
+        self.assertNotEqual(centers[1], centers[2])
+        self.assertNotIn(
+            "anchor_center", manager.active_experts[0]["lab_state"]
+        )
+
+    def test_confidence_update_preserves_lab_detector_continuity(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="confidence",
+            cold_start_reference_confidence_mode="prequential",
+            cold_start_lab_enabled=True,
+            photometric_stable_lab_anchor_enabled=False,
+            lab_ewma_confirm_steps=2,
+            min_cluster_support=10,
+            committee_cap=2,
+        )
+        features = patch_features(1.0, 0.0)
+        for step, lightness in enumerate((40.0, 41.0)):
+            manager.advance(
+                step=step,
+                image_id=step,
+                dino_patch_features=features,
+                ms_score=0.1,
+                channel_support=1.0,
+                expert_channel_supports=(
+                    {} if step == 0 else {0: 1.0}
+                ),
+                lab_feature=torch.tensor(
+                    [lightness, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+            )
+
+        initial_state = manager.active_experts[0]["lab_state"]
+        detector_center = list(initial_state["detector_center"])
+        first = manager.advance_lab_state(
+            torch.tensor([80.0, 2.0, 1.0, 3.0, 2.0, 4.0]),
+            step=2,
+            image_id=2,
+        )
+        self.assertEqual(first["l_streak"], 1)
+        manager.advance(
+            step=2,
+            image_id=2,
+            dino_patch_features=features,
+            ms_score=0.1,
+            channel_support=1.0,
+            expert_channel_supports={0: 1.0},
+            lab_feature=torch.tensor(
+                [80.0, 2.0, 1.0, 3.0, 2.0, 4.0]
+            ),
+            lab_drift_profile=first,
+        )
+
+        updated_state = manager.active_experts[0]["lab_state"]
+        self.assertEqual(updated_state["detector_center"], detector_center)
+        self.assertEqual(updated_state["l_streak"], 1)
+        self.assertNotEqual(updated_state["coverage_center"], detector_center)
+        second = manager.advance_lab_state(
+            torch.tensor([82.0, 2.0, 1.0, 3.0, 2.0, 4.0]),
+            step=3,
+            image_id=3,
+        )
+        self.assertEqual(second["l_streak"], 2)
+        self.assertTrue(second["drift_confirmed"])
+
+    def test_confidence_state_defers_update_during_drift_hypothesis(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="confidence",
+            cold_start_reference_confidence_mode="prequential",
+            cold_start_lab_enabled=True,
+            min_cluster_support=10,
+            committee_cap=2,
+        )
+        features = patch_features(1.0, 0.0)
+        for step, lightness in enumerate((40.0, 41.0)):
+            manager.advance(
+                step=step,
+                image_id=step,
+                dino_patch_features=features,
+                ms_score=0.1,
+                channel_support=1.0,
+                expert_channel_supports=(
+                    {} if step == 0 else {0: 1.0}
+                ),
+                lab_feature=torch.tensor(
+                    [lightness, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+            )
+
+        member_ids_before = list(
+            manager.active_experts[0]["state_member_image_ids"]
+        )
+        manager.advance(
+            step=2,
+            image_id=2,
+            dino_patch_features=features,
+            ms_score=0.1,
+            channel_support=1.0,
+            expert_channel_supports={0: 1.0},
+            lab_feature=torch.tensor(
+                [80.0, 2.0, 1.0, 3.0, 2.0, 4.0]
+            ),
+            lab_drift_profile={"drift_confirmed": True},
+        )
+
+        self.assertEqual(
+            manager.active_experts[0]["state_member_image_ids"],
+            member_ids_before,
+        )
+        self.assertEqual(
+            manager.last_bootstrap_event["decision"],
+            "confidence_state_update_deferred",
+        )
+
+    def test_confidence_cold_start_respects_history_budget(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="confidence",
+            cold_start_confidence_history=3,
+            min_cluster_support=10,
+            committee_cap=2,
+        )
+        for step in range(5):
+            manager.advance(
+                step=step,
+                image_id=step,
+                dino_patch_features=patch_features(1.0, 0.0),
+                ms_score=0.1 + step,
+                channel_support=1.0,
+                expert_channel_supports=(
+                    {} if step == 0 else {0: 1.0}
+                ),
+            )
+
+        self.assertEqual(
+            manager.active_experts[0]["state_member_image_ids"],
+            [2, 3, 4],
+        )
+
+    def test_retired_confidence_state_is_not_recreated(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="confidence",
+            cold_start_confidence_history=3,
+            min_cluster_support=10,
+            committee_cap=2,
+        )
+        manager.advance(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            channel_support=1.0,
+            expert_channel_supports={},
+        )
+        manager.active_experts.clear()
+        manager.clusters[0]["active_expert_id"] = None
+
+        event = manager.advance(
+            step=1,
+            image_id=1,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=1.0,
+            channel_support=0.0,
+            expert_channel_supports={},
+        )
+
+        self.assertIsNone(event["admitted_expert_id"])
+        self.assertEqual(manager.active_experts, [])
+        self.assertIsNone(event["bootstrap"])
+
     def test_adaptive_cold_start_admits_consistent_medoid(self):
         manager = DynamicExpertManager(
             cold_start_mode="adaptive",
@@ -76,6 +752,138 @@ class DynamicExpertManagerTest(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertEqual(len(state["member_image_ids"]), 3)
         self.assertEqual(len(state["center"]), 6)
+
+    def test_bootstrap_provisional_requires_future_confirmation(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="adaptive",
+            cold_start_min_samples=4,
+            cold_start_max_samples=6,
+            cold_start_required_members=3,
+            cold_start_lab_enabled=True,
+            cold_start_provisional_enabled=True,
+            cold_start_provisional_confirm_steps=2,
+            cold_start_provisional_max_wait_steps=4,
+        )
+        features = patch_features(1.0, 0.0)
+        events = []
+        for step in range(6):
+            events.append(
+                manager.advance(
+                    step=step,
+                    image_id=step,
+                    dino_patch_features=features,
+                    ms_score=None if step == 0 else 0.1,
+                    channel_support=None if step == 0 else 1.0,
+                    provisional_channel_support=(
+                        None if step == 0 else 0.0
+                    ),
+                    expert_channel_supports={},
+                    lab_feature=torch.tensor(
+                        [40.0 + step, 2.0, 1.0, 3.0, 2.0, 4.0]
+                    ),
+                )
+            )
+            if step == 3:
+                snapshot = manager.provisional_expert_before_step()
+                self.assertIsNotNone(snapshot)
+                self.assertEqual(snapshot["state"], "bootstrap_provisional")
+                self.assertTrue(
+                    all(image_id <= step for image_id in snapshot["image_ids"])
+                )
+                self.assertEqual(manager.active_experts, [])
+                self.assertEqual(manager.historical_states, [])
+
+        self.assertEqual(events[3]["bootstrap"]["decision"], "provisional_created")
+        self.assertEqual(
+            events[4]["bootstrap"]["decision"], "provisional_confirming"
+        )
+        self.assertEqual(events[5]["bootstrap"]["decision"], "admitted")
+        self.assertEqual(events[5]["admitted_expert_id"], 0)
+        self.assertEqual(len(manager.active_experts), 1)
+        self.assertEqual(len(manager.historical_states), 1)
+        self.assertIsNone(manager.provisional_expert_before_step())
+
+    def test_bootstrap_provisional_rolls_back_without_forced_admission(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="adaptive",
+            cold_start_min_samples=4,
+            cold_start_max_samples=4,
+            cold_start_required_members=3,
+            cold_start_provisional_enabled=True,
+            cold_start_provisional_confirm_steps=2,
+            cold_start_provisional_max_wait_steps=2,
+        )
+        initial = patch_features(1.0, 0.0)
+        changed = patch_features(0.0, 1.0)
+        events = []
+        for step in range(6):
+            events.append(
+                manager.advance(
+                    step=step,
+                    image_id=step,
+                    dino_patch_features=initial if step < 4 else changed,
+                    ms_score=None if step == 0 else 0.1,
+                    channel_support=None if step == 0 else 1.0,
+                    provisional_channel_support=(
+                        None if step == 0 else 0.5
+                    ),
+                    expert_channel_supports={},
+                )
+            )
+
+        self.assertEqual(events[3]["bootstrap"]["decision"], "provisional_created")
+        self.assertEqual(events[5]["bootstrap"]["decision"], "rolled_back")
+        self.assertTrue(
+            all(event["admitted_expert_id"] is None for event in events)
+        )
+        self.assertEqual(manager.active_experts, [])
+        self.assertEqual(manager.historical_states, [])
+        self.assertIsNone(manager.provisional_expert_before_step())
+        self.assertEqual(
+            events[5]["bootstrap"]["selected_image_ids"], []
+        )
+
+    def test_bootstrap_provisional_rejects_high_risk_future_support(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="adaptive",
+            cold_start_min_samples=4,
+            cold_start_max_samples=4,
+            cold_start_required_members=3,
+            cold_start_provisional_enabled=True,
+            cold_start_provisional_confirm_steps=2,
+            cold_start_provisional_max_wait_steps=2,
+        )
+        features = patch_features(1.0, 0.0)
+        events = []
+        for step in range(6):
+            events.append(
+                manager.advance(
+                    step=step,
+                    image_id=step,
+                    dino_patch_features=features,
+                    ms_score=(
+                        None
+                        if step == 0
+                        else 0.1
+                        if step < 4
+                        else 1.0
+                    ),
+                    channel_support=None if step == 0 else 1.0,
+                    provisional_channel_support=(
+                        None if step == 0 else 1.0
+                    ),
+                    expert_channel_supports={},
+                )
+            )
+
+        self.assertEqual(events[3]["bootstrap"]["decision"], "provisional_created")
+        self.assertEqual(events[5]["bootstrap"]["decision"], "rolled_back")
+        self.assertEqual(events[5]["bootstrap"]["confirmation_steps"], 0)
+        self.assertEqual(
+            events[5]["bootstrap"]["confirmation_risk_ceiling"], 0.1
+        )
+        self.assertEqual(manager.active_experts, [])
+        self.assertEqual(manager.historical_states, [])
 
     def test_drift_candidate_audit_selects_low_ms_without_admission(self):
         manager = DynamicExpertManager(
@@ -1129,7 +1937,7 @@ class DynamicExpertManagerTest(unittest.TestCase):
             [2, 1],
         )
 
-    def test_adaptive_evidence_admits_joint_channel_novel_state(self):
+    def test_adaptive_evidence_stages_first_joint_state_as_temporary(self):
         manager = DynamicExpertManager(
             photometric_adaptive_candidate_evidence=True,
             budget_min_new_coverage_fraction=0.5,
@@ -1140,7 +1948,12 @@ class DynamicExpertManagerTest(unittest.TestCase):
                 "image_id": image_id,
                 "embedding": torch.tensor([1.0, 0.0]),
                 "memory_patch_ids": [image_id],
-                "historical_low_risk": False,
+                "historical_low_risk": True,
+                "historical_ms_threshold": 0.5,
+                "ms_score": 0.1,
+                "lab_feature": torch.tensor(
+                    [80.0, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
                 "current_expert_supports": {4: 0.1},
             }
             for image_id in (10, 11)
@@ -1156,11 +1969,11 @@ class DynamicExpertManagerTest(unittest.TestCase):
             support_threshold=0.5,
         )
 
-        self.assertEqual(evidence["decision"], "new_scoring_expert")
+        self.assertEqual(evidence["decision"], "new_temporary_state")
         self.assertEqual(evidence["new_coverage_fraction"], 1.0)
-        self.assertEqual(evidence["strict_low_risk_count"], 0)
+        self.assertEqual(evidence["strict_low_risk_count"], 2)
 
-    def test_adaptive_evidence_records_covered_lab_state_only(self):
+    def test_adaptive_evidence_stages_first_covered_state_as_temporary(self):
         manager = DynamicExpertManager(
             photometric_adaptive_candidate_evidence=True,
             budget_min_new_coverage_fraction=0.5,
@@ -1172,6 +1985,11 @@ class DynamicExpertManagerTest(unittest.TestCase):
                 "embedding": torch.tensor([1.0, 0.0]),
                 "memory_patch_ids": [image_id],
                 "historical_low_risk": True,
+                "historical_ms_threshold": 0.5,
+                "ms_score": 0.1,
+                "lab_feature": torch.tensor(
+                    [80.0, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
                 "current_expert_supports": {4: 0.9},
             }
             for image_id in (10, 11)
@@ -1187,10 +2005,10 @@ class DynamicExpertManagerTest(unittest.TestCase):
             support_threshold=0.5,
         )
 
-        self.assertEqual(evidence["decision"], "photometric_state_only")
+        self.assertEqual(evidence["decision"], "new_temporary_state")
         self.assertEqual(evidence["new_coverage_fraction"], 0.0)
 
-    def test_adaptive_pool_admits_channel_novel_state_after_two_images(self):
+    def test_adaptive_pool_materializes_channel_novel_state_after_two_events(self):
         manager = DynamicExpertManager(
             novel_admission_mode="channel_gate",
             photometric_candidate_enabled=True,
@@ -1207,17 +2025,19 @@ class DynamicExpertManagerTest(unittest.TestCase):
         features = patch_features(1.0, 0.0)
 
         admitted_id = None
-        for step in range(2):
+        for step in range(4):
             _, admitted_id = manager._advance_novel_quarantine(
                 step=step,
                 image_id=step,
                 dino_patch_features=features,
-                ms_score=0.8,
-                ms_short_score=0.8,
+                ms_score=0.1,
+                ms_short_score=0.1,
                 ms_short_ratio=1.2,
                 channel_support=0.1,
                 provisional_channel_support=0.5,
-                trigger_route=("photometric_drift" if step == 0 else None),
+                trigger_route=(
+                    "photometric_drift" if step in {0, 2} else None
+                ),
                 memory_patch_ids=[0],
                 lab_feature=torch.tensor(
                     [80.0, 2.0, 1.0, 3.0, 2.0, 4.0]
@@ -1236,9 +2056,9 @@ class DynamicExpertManagerTest(unittest.TestCase):
             manager.last_novel_quarantine_event["confirmation_reason"],
             "new_scoring_expert",
         )
+        self.assertEqual(len(manager.historical_states), 1)
         self.assertEqual(
-            manager.last_novel_quarantine_event["low_risk_count"],
-            0,
+            manager.historical_states[0]["state_status"], "stable"
         )
 
     def test_adaptive_pool_records_covered_state_without_expert(self):
@@ -1258,13 +2078,73 @@ class DynamicExpertManagerTest(unittest.TestCase):
         features = patch_features(1.0, 0.0)
 
         admitted_id = None
+        for step in range(4):
+            _, admitted_id = manager._advance_novel_quarantine(
+                step=step,
+                image_id=step,
+                dino_patch_features=features,
+                ms_score=0.1,
+                ms_short_score=0.1,
+                ms_short_ratio=1.2,
+                channel_support=0.9,
+                provisional_channel_support=0.5,
+                trigger_route=(
+                    "photometric_drift" if step in {0, 2} else None
+                ),
+                memory_patch_ids=[0],
+                lab_feature=torch.tensor(
+                    [80.0, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+                photometric_trigger_expert_id=0,
+                photometric_trigger_lab_center=[
+                    40.0, 2.0, 1.0, 3.0, 2.0, 4.0
+                ],
+                historical_ms_threshold=0.5,
+                current_expert_supports={0: 0.9},
+                support_threshold=0.5,
+            )
+
+        self.assertIsNone(admitted_id)
+        self.assertEqual(
+            manager.last_novel_quarantine_event["decision"],
+            "matured_photometric_state_only",
+        )
+        self.assertEqual(len(manager.historical_states), 1)
+        self.assertEqual(
+            manager.historical_states[-1]["source_type"],
+            "photometric_only",
+        )
+        self.assertEqual(len(manager.active_experts), 1)
+
+    def test_denstream_maturity_does_not_bypass_formal_admission(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            novel_admission_mode="channel_gate",
+            cold_start_lab_enabled=True,
+            photometric_candidate_enabled=True,
+            photometric_candidate_window_mode="dynamic_low_risk",
+            photometric_dynamic_min_low_risk_members=3,
+            photometric_dynamic_max_low_risk_members=6,
+            photometric_min_low_risk_members=3,
+            photometric_adaptive_candidate_evidence=True,
+            photometric_denstream_support_enabled=True,
+            photometric_denstream_decay=0.9,
+            photometric_denstream_mature_support=0.5,
+            photometric_episode_enabled=True,
+        )
+        manager.active_experts = [{"expert_id": 0}]
+        manager.next_expert_id = 1
+        manager.photometric_episode_active = True
+        features = patch_features(1.0, 0.0)
+
+        admitted_id = None
         for step in range(2):
             _, admitted_id = manager._advance_novel_quarantine(
                 step=step,
                 image_id=step,
                 dino_patch_features=features,
-                ms_score=0.8,
-                ms_short_score=0.8,
+                ms_score=0.1,
+                ms_short_score=0.1,
                 ms_short_ratio=1.2,
                 channel_support=0.9,
                 provisional_channel_support=0.5,
@@ -1283,16 +2163,169 @@ class DynamicExpertManagerTest(unittest.TestCase):
             )
 
         self.assertIsNone(admitted_id)
-        self.assertEqual(
-            manager.last_novel_quarantine_event["decision"],
-            "recorded_photometric_state_only",
-        )
+        self.assertEqual(len(manager.active_experts), 1)
         self.assertEqual(len(manager.historical_states), 1)
         self.assertEqual(
-            manager.historical_states[-1]["source_type"],
-            "photometric_only",
+            manager.historical_states[0]["state_status"], "stable"
         )
+        self.assertFalse(
+            manager.last_novel_quarantine_event["created_full_expert"]
+        )
+        self.assertTrue(
+            any(
+                event["event_type"] == "mature"
+                and event["reason"]
+                == "denstream_effective_support_matured"
+                for event in manager.state_lifecycle_events
+            )
+        )
+
+    def test_historical_state_uses_robust_distribution(self):
+        manager = DynamicExpertManager(
+            cold_start_lab_enabled=True,
+            photometric_history_reentry_members=2,
+            photometric_adaptive_candidate_evidence=True,
+        )
+
+        def member(step, value):
+            return manager._quarantine_member(
+                step=step,
+                image_id=step,
+                dino_patch_features=patch_features(1.0, 0.0),
+                ms_score=0.1,
+                ms_short_score=0.1,
+                ms_short_ratio=0.8,
+                channel_support=0.2,
+                provisional_channel_support=0.5,
+                memory_patch_ids=[0],
+                lab_feature=torch.tensor(
+                    [value, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+                historical_ms_threshold=0.5,
+                current_expert_supports={},
+            )
+
+        manager._record_photometric_state(
+            [member(0, 60.0), member(1, 61.0), member(2, 80.0)],
+            step=2,
+            state_status="temporary",
+            source_type="temporary",
+        )
+        state = manager.historical_states[0]
+        match = manager._historical_state_match(
+            [member(3, 64.0), member(4, 65.0)]
+        )
+
+        self.assertEqual(state["lab_center"][0], 61.0)
+        self.assertGreater(state["l_radius"], manager.photometric_l_ewma_floor)
+        self.assertEqual(state["member_image_ids"], [0, 1, 2])
+        self.assertTrue(match["matched"])
+        self.assertEqual(match["matched_source_type"], "temporary")
+
+    def test_historical_state_match_is_unified_across_source_types(self):
+        source_types = ("active", "retired", "photometric_only", "temporary")
+        for index, source_type in enumerate(source_types):
+            manager = DynamicExpertManager(
+                cold_start_lab_enabled=True,
+                photometric_history_reentry_members=2,
+                photometric_adaptive_candidate_evidence=True,
+            )
+            members = []
+            for offset in range(2):
+                members.append(
+                    manager._quarantine_member(
+                        step=offset,
+                        image_id=offset,
+                        dino_patch_features=patch_features(1.0, 0.0),
+                        ms_score=0.1,
+                        ms_short_score=0.1,
+                        ms_short_ratio=0.8,
+                        channel_support=0.2,
+                        provisional_channel_support=0.5,
+                        memory_patch_ids=[0],
+                        lab_feature=torch.tensor(
+                            [70.0 + offset, 2.0, 1.0, 3.0, 2.0, 4.0]
+                        ),
+                        historical_ms_threshold=0.5,
+                        current_expert_supports={},
+                    )
+                )
+            manager._record_photometric_state(
+                members,
+                step=1,
+                state_status=(
+                    "temporary" if source_type == "temporary" else "stable"
+                ),
+                source_type=source_type,
+            )
+            match = manager._historical_state_match(members)
+            self.assertTrue(match["matched"], msg=source_type)
+            self.assertEqual(match["matched_source_type"], source_type)
+
+    def test_matching_active_state_enriches_cluster_without_new_expert(self):
+        manager = DynamicExpertManager(
+            cold_start_lab_enabled=True,
+            photometric_history_reentry_members=2,
+            photometric_adaptive_candidate_evidence=True,
+        )
+
+        def member(step, value, support):
+            return manager._quarantine_member(
+                step=step,
+                image_id=step,
+                dino_patch_features=patch_features(1.0, 0.0),
+                ms_score=0.1,
+                ms_short_score=0.1,
+                ms_short_ratio=0.8,
+                channel_support=support,
+                provisional_channel_support=0.5,
+                memory_patch_ids=[0],
+                lab_feature=torch.tensor(
+                    [value, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+                historical_ms_threshold=0.5,
+                current_expert_supports={0: support},
+            )
+
+        initial = [member(0, 70.0, 0.1), member(1, 71.0, 0.1)]
+        manager._admit_quarantined_member(
+            initial[0],
+            step=1,
+            cluster_members=initial,
+            admission_route="photometric_drift_channel_gate",
+        )
+        support_count_before = manager.active_experts[0]["support_count"]
+        last_supported_before = manager.active_experts[0][
+            "last_supported_step"
+        ]
+        del manager.clusters[0]["members"][0]["lab_feature"]
+        candidates = [member(2, 72.0, 0.1), member(3, 73.0, 0.1)]
+        evidence = manager._candidate_admission_evidence(
+            candidates,
+            {
+                "consistent": True,
+                "selected_inlier_image_ids": [2, 3],
+            },
+            support_threshold=0.5,
+        )
+        update = manager._update_matched_historical_state(
+            evidence["history_match"], candidates, step=3
+        )
+
+        self.assertEqual(evidence["decision"], "update_existing_state")
         self.assertEqual(len(manager.active_experts), 1)
+        self.assertEqual(len(manager.clusters[0]["members"]), 4)
+        self.assertEqual(update["members_added_to_active_cluster"], 2)
+        self.assertEqual(
+            manager.active_experts[0]["support_count"], support_count_before
+        )
+        self.assertEqual(
+            manager.active_experts[0]["last_supported_step"],
+            last_supported_before,
+        )
+        self.assertEqual(
+            manager.active_experts[0]["lab_state"]["center"][0], 72.0
+        )
 
     def test_relevant_lab_history_returns_limited_robust_suffix(self):
         manager = DynamicExpertManager(
@@ -1457,6 +2490,537 @@ class DynamicExpertManagerTest(unittest.TestCase):
         self.assertEqual(
             manager.last_budget_replacement_evaluation["outcome"],
             "accepted",
+        )
+
+    def test_coreset_replacement_minimizes_recent_coverage_loss(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            budget_coverage_loss_enabled=True,
+            budget_coverage_channel_weight=1.0,
+            budget_coverage_lab_weight=0.0,
+            budget_coverage_dino_weight=0.0,
+        )
+        first = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        second = {
+            **first,
+            "step": 1,
+            "image_id": 1,
+            "embedding": manager._image_embedding(
+                patch_features(0.0, 1.0)
+            ),
+        }
+        manager._admit_quarantined_member(first, 0, admission_route="legacy")
+        manager._admit_quarantined_member(second, 1, admission_route="legacy")
+        manager.coverage_history = [
+            {
+                "step": 2,
+                "image_id": 2,
+                "support_threshold": 0.5,
+                "supports": {0: 0.9, 1: 0.9},
+                "embedding": None,
+                "lab_feature": None,
+            },
+            {
+                "step": 3,
+                "image_id": 3,
+                "support_threshold": 0.5,
+                "supports": {0: 0.9, 1: 0.1},
+                "embedding": None,
+                "lab_feature": None,
+            },
+        ]
+        candidates = [
+            {
+                **first,
+                "step": step,
+                "image_id": step,
+                "current_expert_supports": {0: 0.1, 1: 0.1},
+            }
+            for step in (4, 5)
+        ]
+
+        victim_id, audit = manager._select_budget_replacement(
+            candidates,
+            support_threshold=0.5,
+            admission_route="legacy",
+        )
+
+        self.assertEqual(victim_id, 1)
+        self.assertEqual(
+            audit["replacement_reason"],
+            "coreset_coverage_replacement",
+        )
+        evaluation = manager.last_budget_replacement_evaluation
+        self.assertEqual(evaluation["outcome"], "accepted")
+        self.assertGreater(evaluation["coverage_swap_gain"], 0.0)
+        self.assertLessEqual(
+            evaluation["coverage_loss_profiles"][1]["removal_loss"],
+            evaluation["coverage_loss_profiles"][0]["removal_loss"],
+        )
+        self.assertEqual(
+            set(evaluation["coverage_loss_profiles"][0]),
+            {
+                "current_coverage",
+                "coverage_without_expert",
+                "coverage_with_candidate",
+                "removal_loss",
+                "swap_gain",
+            },
+        )
+
+    def test_min_loss_coreset_does_not_reject_an_admitted_candidate(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            budget_coverage_loss_enabled=True,
+            budget_coverage_min_loss_only=True,
+            budget_coverage_channel_weight=1.0,
+            budget_coverage_lab_weight=0.0,
+            budget_coverage_dino_weight=0.0,
+        )
+        first = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        second = {
+            **first,
+            "step": 1,
+            "image_id": 1,
+            "embedding": manager._image_embedding(
+                patch_features(0.0, 1.0)
+            ),
+        }
+        manager._admit_quarantined_member(first, 0, admission_route="legacy")
+        manager._admit_quarantined_member(second, 1, admission_route="legacy")
+        manager.coverage_history = [
+            {
+                "step": step,
+                "image_id": step,
+                "support_threshold": 0.5,
+                "supports": (
+                    {0: 0.9, 1: 0.1}
+                    if step < 6
+                    else {0: 0.1, 1: 0.9}
+                ),
+                "embedding": None,
+                "lab_feature": None,
+            }
+            for step in range(2, 10)
+        ]
+        candidates = [
+            {
+                **first,
+                "step": step,
+                "image_id": step,
+                "current_expert_supports": {0: 0.1, 1: 0.1},
+            }
+            for step in (10, 11)
+        ]
+
+        victim_id, audit = manager._select_budget_replacement(
+            candidates,
+            support_threshold=0.5,
+            admission_route="legacy",
+        )
+
+        self.assertIsNotNone(victim_id)
+        self.assertEqual(
+            audit["replacement_reason"],
+            "coreset_minimum_coverage_loss_replacement",
+        )
+        evaluation = manager.last_budget_replacement_evaluation
+        self.assertEqual(evaluation["outcome"], "accepted")
+        self.assertEqual(
+            evaluation["coverage_selection_mode"],
+            "minimum_removal_loss",
+        )
+        profile = evaluation["coverage_loss_profiles"][victim_id]
+        self.assertLess(profile["swap_gain"], 0.0)
+        self.assertEqual(
+            profile["removal_loss"],
+            min(
+                item["removal_loss"]
+                for item in evaluation["coverage_loss_profiles"].values()
+            ),
+        )
+        manager._replace_budgeted_expert(victim_id, 12, audit)
+        self.assertEqual(
+            manager.retired_experts[-1]["last_event"],
+            "replaced_coreset_coverage",
+        )
+
+    def test_joint_coreset_can_evict_candidate_at_capacity(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            budget_coverage_loss_enabled=True,
+            budget_coverage_joint_eviction_enabled=True,
+            budget_coverage_channel_weight=1.0,
+            budget_coverage_lab_weight=0.0,
+            budget_coverage_dino_weight=0.0,
+        )
+        first = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        second = {
+            **first,
+            "step": 1,
+            "image_id": 1,
+            "embedding": manager._image_embedding(
+                patch_features(0.0, 1.0)
+            ),
+        }
+        manager._admit_quarantined_member(first, 0, admission_route="legacy")
+        manager._admit_quarantined_member(second, 1, admission_route="legacy")
+        manager.coverage_history = [
+            {
+                "step": step,
+                "image_id": step,
+                "support_threshold": 0.5,
+                "supports": (
+                    {0: 0.9, 1: 0.1}
+                    if step < 6
+                    else {0: 0.1, 1: 0.9}
+                ),
+                "embedding": None,
+                "lab_feature": None,
+            }
+            for step in range(2, 10)
+        ]
+        candidates = [
+            {
+                **first,
+                "step": step,
+                "image_id": step,
+                "current_expert_supports": {0: 0.9, 1: 0.1},
+            }
+            for step in (10, 11)
+        ]
+
+        victim_id, audit = manager._select_budget_replacement(
+            candidates,
+            support_threshold=0.5,
+            admission_route="legacy",
+            candidate_evidence={
+                "new_coverage_fraction": 0.5,
+                "new_coverage_count": 1,
+                "candidate_observation_count": 2,
+            },
+        )
+
+        self.assertIsNone(victim_id)
+        self.assertIsNone(audit)
+        evaluation = manager.last_budget_replacement_evaluation
+        self.assertEqual(
+            evaluation["outcome"],
+            "candidate_evicted_minimum_coverage_loss",
+        )
+        self.assertEqual(evaluation["evicted_entity_id"], "candidate")
+        self.assertEqual(
+            evaluation["coverage_selection_mode"],
+            "joint_minimum_loss",
+        )
+
+    def test_joint_coreset_can_evict_existing_expert(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            budget_coverage_loss_enabled=True,
+            budget_coverage_joint_eviction_enabled=True,
+            budget_coverage_channel_weight=1.0,
+            budget_coverage_lab_weight=0.0,
+            budget_coverage_dino_weight=0.0,
+        )
+        first = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        second = {
+            **first,
+            "step": 1,
+            "image_id": 1,
+            "embedding": manager._image_embedding(
+                patch_features(0.0, 1.0)
+            ),
+        }
+        manager._admit_quarantined_member(first, 0, admission_route="legacy")
+        manager._admit_quarantined_member(second, 1, admission_route="legacy")
+        manager.coverage_history = [
+            {
+                "step": step,
+                "image_id": step,
+                "support_threshold": 0.5,
+                "supports": {0: 0.9, 1: 0.1},
+                "embedding": None,
+                "lab_feature": None,
+            }
+            for step in range(2, 10)
+        ]
+        candidates = [
+            {
+                **second,
+                "step": step,
+                "image_id": step,
+                "current_expert_supports": {0: 0.1, 1: 0.1},
+            }
+            for step in (10, 11, 12, 13)
+        ]
+
+        victim_id, audit = manager._select_budget_replacement(
+            candidates,
+            support_threshold=0.5,
+            admission_route="legacy",
+        )
+
+        self.assertEqual(victim_id, 1)
+        self.assertEqual(
+            audit["replacement_reason"],
+            "coreset_joint_minimum_loss_replacement",
+        )
+        evaluation = manager.last_budget_replacement_evaluation
+        self.assertEqual(evaluation["outcome"], "accepted")
+        self.assertEqual(evaluation["evicted_entity_id"], 1)
+        manager._replace_budgeted_expert(victim_id, 14, audit)
+        self.assertEqual(
+            manager.retired_experts[-1]["last_event"],
+            "replaced_coreset_coverage",
+        )
+
+    def test_patch_coreset_is_bounded_and_deterministic(self):
+        manager = DynamicExpertManager(
+            budget_patch_coverage_enabled=True,
+            budget_patch_prototype_count=2,
+        )
+        features = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.9, 0.1],
+                [0.0, 1.0],
+                [0.1, 0.9],
+            ],
+            dtype=torch.float32,
+        )
+
+        first = manager._patch_coreset(features)
+        second = manager._patch_coreset(features)
+
+        self.assertEqual(tuple(first.shape), (2, 2))
+        self.assertTrue(torch.equal(first, second))
+        self.assertTrue(
+            torch.allclose(first.norm(dim=1), torch.ones(2))
+        )
+
+    def test_patch_coverage_preserves_complementary_patch_modes(self):
+        manager = DynamicExpertManager(
+            budget_patch_coverage_enabled=True,
+            budget_patch_prototype_count=2,
+            budget_coverage_channel_weight=0.0,
+            budget_coverage_lab_weight=0.0,
+            budget_coverage_dino_weight=1.0,
+        )
+        records = [
+            {
+                "image_id": 0,
+                "support_threshold": 0.5,
+                "supports": {},
+                "embedding": None,
+                "patch_prototypes": torch.tensor(
+                    [[1.0, 0.0], [0.0, 1.0]],
+                    dtype=torch.float32,
+                ),
+                "lab_feature": None,
+            }
+        ]
+
+        def entity(expert_id, prototype):
+            return {
+                "expert_id": expert_id,
+                "embedding": None,
+                "patch_prototypes": torch.tensor(
+                    [prototype], dtype=torch.float32
+                ),
+                "lab_center": None,
+                "lab_l_scale": 1.0,
+                "lab_ab_scale": 1.0,
+                "candidate_image_ids": set(),
+            }
+
+        horizontal = entity(0, [1.0, 0.0])
+        vertical = entity(1, [0.0, 1.0])
+
+        one_mode = manager._coverage_loss_objective(
+            records, [horizontal]
+        )
+        both_modes = manager._coverage_loss_objective(
+            records, [horizontal, vertical]
+        )
+
+        self.assertGreater(both_modes["dino"], one_mode["dino"])
+        self.assertAlmostEqual(both_modes["dino"], 1.0)
+
+    def test_patch_victim_selection_ranks_only_replaceable_experts(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            budget_patch_coverage_enabled=True,
+            budget_patch_victim_selection_enabled=True,
+        )
+        first = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        second = manager._quarantine_member(
+            step=1,
+            image_id=1,
+            dino_patch_features=patch_features(0.0, 1.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        manager._admit_quarantined_member(first, 0, admission_route="legacy")
+        manager._admit_quarantined_member(second, 1, admission_route="legacy")
+        manager.coverage_history = [
+            {
+                "step": 2,
+                "image_id": 2,
+                "support_threshold": 0.5,
+                "supports": {0: 0.9, 1: 0.9},
+                "embedding": first["embedding"],
+                "patch_prototypes": first["patch_prototypes"],
+                "lab_feature": None,
+            }
+        ]
+        manager._coverage_loss_joint_eviction_profiles = (
+            lambda candidate_members, support_threshold: {
+                0: {"eviction_loss": 0.8},
+                1: {"eviction_loss": 0.1},
+                "candidate": {"eviction_loss": 0.2},
+            }
+        )
+        candidates = [
+            {
+                **first,
+                "step": 3,
+                "image_id": 3,
+                "current_expert_supports": {0: 0.1, 1: 0.1},
+            }
+        ]
+
+        victim_id, audit = manager._select_budget_replacement(
+            candidates,
+            support_threshold=0.5,
+            admission_route="legacy",
+            candidate_evidence={
+                "new_coverage_fraction": 1.0,
+                "new_coverage_count": 1,
+                "candidate_observation_count": 1,
+            },
+        )
+
+        self.assertEqual(victim_id, 1)
+        self.assertEqual(
+            audit["replacement_reason"],
+            "coreset_patch_victim_replacement",
+        )
+        self.assertEqual(
+            manager.last_budget_replacement_evaluation[
+                "coverage_selection_mode"
+            ],
+            "patch_minimum_victim_loss",
+        )
+
+    def test_patch_kcenter_profiles_use_worst_patch_distance(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            budget_patch_coverage_enabled=True,
+            budget_patch_victim_selection_enabled=True,
+            budget_patch_kcenter_victim_selection_enabled=True,
+        )
+        first = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        second = manager._quarantine_member(
+            step=1,
+            image_id=1,
+            dino_patch_features=patch_features(0.0, 1.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        manager._admit_quarantined_member(first, 0, admission_route="legacy")
+        manager._admit_quarantined_member(second, 1, admission_route="legacy")
+        manager.coverage_history = [
+            {
+                "step": 2,
+                "image_id": 2,
+                "support_threshold": 0.5,
+                "supports": {0: 0.9, 1: 0.9},
+                "embedding": first["embedding"],
+                "patch_prototypes": torch.tensor(
+                    [[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32
+                ),
+                "lab_feature": None,
+            }
+        ]
+        profiles = manager._patch_kcenter_eviction_profiles(
+            [first], 0.5
+        )
+        self.assertIn(0, profiles)
+        self.assertIn(1, profiles)
+        self.assertGreaterEqual(profiles[0]["eviction_loss"], 0.0)
+        self.assertGreaterEqual(profiles[1]["eviction_loss"], 0.0)
+        self.assertEqual(
+            profiles[0]["coverage_objective"],
+            "patch_kcenter_max_cosine_distance",
         )
 
     def test_legacy_admission_replaces_redundant_expert_at_cap(self):
@@ -2613,7 +4177,7 @@ class DynamicExpertManagerTest(unittest.TestCase):
 
         self.assertEqual(evidence["strict_low_risk_count"], 1)
         self.assertTrue(evidence["risk_profile"]["acceptable"])
-        self.assertEqual(evidence["decision"], "history_reentry")
+        self.assertEqual(evidence["decision"], "update_existing_state")
 
     def test_history_joint_risk_rejects_extreme_member(self):
         manager = DynamicExpertManager(
@@ -2659,6 +4223,7 @@ class DynamicExpertManagerTest(unittest.TestCase):
             committee_cap=2,
             photometric_history_max=4,
             photometric_history_min=2,
+            photometric_state_registry_cap=4,
         )
         for step in range(6):
             member = manager._quarantine_member(
@@ -2682,8 +4247,147 @@ class DynamicExpertManagerTest(unittest.TestCase):
         self.assertEqual(len(manager.historical_states), 4)
         self.assertEqual(
             [state["last_seen_step"] for state in manager.historical_states],
-            [5, 4, 3, 2],
+            [2, 3, 4, 5],
         )
+
+    def test_state_registry_defaults_to_twice_committee_cap(self):
+        manager = DynamicExpertManager(committee_cap=2)
+
+        self.assertEqual(manager.photometric_state_registry_cap, 4)
+
+        with self.assertRaises(ValueError):
+            DynamicExpertManager(
+                committee_cap=2,
+                photometric_state_registry_cap=1,
+            )
+
+    def test_state_lifecycle_records_create_match_update_mature_and_merge(self):
+        manager = DynamicExpertManager(
+            committee_cap=1,
+            photometric_state_registry_cap=2,
+            cold_start_lab_enabled=True,
+            photometric_state_distribution_enabled=True,
+            photometric_temporary_state_enabled=True,
+            photometric_history_reentry_enabled=True,
+        )
+
+        def member(step, value):
+            return manager._quarantine_member(
+                step=step,
+                image_id=step,
+                dino_patch_features=patch_features(1.0, 0.0),
+                ms_score=0.1,
+                ms_short_score=0.1,
+                ms_short_ratio=0.8,
+                channel_support=0.2,
+                provisional_channel_support=0.5,
+                memory_patch_ids=[0],
+                lab_feature=torch.tensor(
+                    [value, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+                historical_ms_threshold=0.5,
+                current_expert_supports={},
+            )
+
+        first = manager._record_photometric_state(
+            [member(0, 60.0)],
+            step=0,
+            state_status="temporary",
+            source_type="temporary",
+        )
+        match = manager._historical_state_match(
+            [member(1, 60.5), member(2, 60.8)]
+        )
+        updated = manager._update_matched_historical_state(
+            match,
+            [member(1, 60.5), member(2, 60.8)],
+            step=2,
+        )
+        manager._record_photometric_state(
+            [member(3, 61.0)],
+            step=3,
+            state_status="temporary",
+            source_type="temporary",
+        )
+
+        event_types = {
+            event["event_type"] for event in manager.state_lifecycle_events
+        }
+        self.assertEqual(first["state_status"], "temporary")
+        self.assertEqual(updated["state_status_after"], "stable")
+        self.assertTrue(
+            {"create", "match", "update", "mature", "merge"}
+            <= event_types
+        )
+        required_fields = {
+            "event_type",
+            "step",
+            "state_id",
+            "matched_or_merged_state_id",
+            "source_type_before",
+            "source_type_after",
+            "status_before",
+            "status_after",
+            "active_expert_id",
+            "support_count",
+            "support_event_count",
+            "member_count",
+            "reason",
+        }
+        self.assertTrue(
+            all(
+                required_fields <= set(event)
+                for event in manager.state_lifecycle_events
+            )
+        )
+        self.assertEqual(len(manager.historical_states), 1)
+
+    def test_registry_evicts_temporary_before_active_state(self):
+        manager = DynamicExpertManager(
+            committee_cap=1,
+            photometric_state_registry_cap=2,
+            photometric_state_distribution_enabled=True,
+        )
+
+        def add_state(step, center, embedding, status, active_expert_id=None):
+            return manager._upsert_historical_state(
+                source_type=(
+                    "active"
+                    if active_expert_id is not None
+                    else "temporary"
+                ),
+                step=step,
+                lab_center=np.asarray(
+                    [center, 2.0, 1.0, 3.0, 2.0, 4.0]
+                ),
+                dino_center=torch.tensor(embedding, dtype=torch.float32),
+                support_count=1,
+                active_expert_id=active_expert_id,
+                state_status=status,
+            )
+
+        active = add_state(0, 20.0, [1.0, 0.0], "stable", 7)
+        first_temporary = add_state(1, 60.0, [0.0, 1.0], "temporary")
+        add_state(2, 90.0, [-1.0, 0.0], "temporary")
+
+        remaining_ids = {
+            state["state_id"] for state in manager.historical_states
+        }
+        evicted = [
+            event
+            for event in manager.state_lifecycle_events
+            if event["event_type"] == "evict"
+        ]
+        self.assertEqual(len(manager.historical_states), 2)
+        self.assertIn(active["state_id"], remaining_ids)
+        self.assertNotIn(first_temporary["state_id"], remaining_ids)
+        self.assertEqual(evicted[-1]["state_id"], first_temporary["state_id"])
+
+    def test_build_lab_state_accepts_legacy_member_without_lab_feature(self):
+        manager = DynamicExpertManager(cold_start_lab_enabled=True)
+        members = [{"step": 0, "image_id": 0}]
+
+        self.assertIsNone(manager._build_lab_state(members))
 
     def test_photometric_handled_state_blocks_repeat_then_rearms(self):
         manager = DynamicExpertManager(

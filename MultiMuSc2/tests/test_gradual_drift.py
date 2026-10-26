@@ -18,6 +18,7 @@ from MultiMuSc2.examples.ablate_gradual_drift import (
     build_lab_audit_profiles,
     build_lab_ewma_profiles,
     drift_candidate_audit_metrics,
+    expert_lab_metrics,
     expert_metrics,
     lab_metrics,
     select_stream_source_records,
@@ -57,6 +58,95 @@ class GradualDriftLabAuditTest(unittest.TestCase):
         self.assertEqual(
             history_reentry["photometric_history_reentry_members"], 2
         )
+
+    def test_state_ablation_variants_enable_mechanisms_incrementally(self):
+        history = VARIANTS[
+            "photometric_multistage_cap2_dual_replace_history_reentry"
+        ]
+        distribution = VARIANTS[
+            "photometric_multistage_cap2_state_distribution_only"
+        ]
+        temporary = VARIANTS[
+            "photometric_multistage_cap2_state_distribution_temporary"
+        ]
+        adaptive = VARIANTS[
+            "photometric_multistage_cap2_adaptive_evidence"
+        ]
+
+        self.assertFalse(
+            history.get("photometric_state_distribution_enabled", False)
+        )
+        self.assertFalse(
+            history.get("photometric_temporary_state_enabled", False)
+        )
+        self.assertFalse(
+            history.get("photometric_adaptive_candidate_evidence", False)
+        )
+        self.assertTrue(distribution["photometric_state_distribution_enabled"])
+        self.assertFalse(distribution["photometric_temporary_state_enabled"])
+        self.assertFalse(
+            distribution["photometric_adaptive_candidate_evidence"]
+        )
+        self.assertTrue(temporary["photometric_state_distribution_enabled"])
+        self.assertTrue(temporary["photometric_temporary_state_enabled"])
+        self.assertFalse(temporary["photometric_adaptive_candidate_evidence"])
+        self.assertTrue(adaptive["photometric_state_distribution_enabled"])
+        self.assertTrue(adaptive["photometric_temporary_state_enabled"])
+        self.assertTrue(adaptive["photometric_adaptive_candidate_evidence"])
+
+        confidence = VARIANTS[
+            "photometric_multistage_cap2_adaptive_evidence_bootstrap_confidence"
+        ]
+        self.assertEqual(confidence["cold_start_mode"], "confidence")
+        self.assertEqual(confidence["cold_start_confidence_history"], 16)
+        self.assertFalse(confidence["cold_start_provisional_enabled"])
+        prequential = VARIANTS[
+            "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential"
+        ]
+        self.assertEqual(
+            prequential["cold_start_reference_confidence_mode"],
+            "prequential",
+        )
+        stable_anchor = VARIANTS[
+            "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential_stable_anchor"
+        ]
+        self.assertEqual(
+            stable_anchor["cold_start_reference_confidence_mode"],
+            "prequential",
+        )
+        self.assertTrue(
+            stable_anchor["photometric_stable_lab_anchor_enabled"]
+        )
+
+    def test_expert_lab_metrics_audits_frozen_anchor_and_candidate_state(self):
+        anchor = [40.0, 2.0, 1.0, 3.0, 2.0, 4.0]
+        timeline = [
+            {
+                "step": step,
+                "lab_drift_profile": {
+                    "expert_id": 0,
+                    "drift_confirmed": step == 1,
+                    "l_ewma": 0.1 + step,
+                    "ab_ewma": 0.0,
+                    "stable_lab_anchor_enabled": True,
+                    "anchor_frozen": True,
+                    "lab_anchor_center": anchor,
+                    "candidate_lab_count": step + 1,
+                    "anchor_to_candidate_total_distance": 0.2 + step,
+                    "anchor_to_coverage_total_distance": 0.1 + step,
+                },
+            }
+            for step in range(2)
+        ]
+        schedule = [{"phase": "ramp_up"} for _ in timeline]
+
+        metrics = expert_lab_metrics(timeline, schedule)
+
+        self.assertEqual(metrics["stable_lab_anchor_observed_steps"], 2)
+        self.assertEqual(metrics["stable_lab_anchor_frozen_steps"], 2)
+        self.assertEqual(metrics["stable_lab_anchor_change_count"], 0)
+        self.assertEqual(metrics["lab_candidate_state_observed_steps"], 2)
+        self.assertEqual(metrics["lab_candidate_anchor_distance_max"], 1.2)
 
     def test_stream_source_can_add_train_good_without_reusing_test_good(self):
         test_temp_root = Path(__file__).resolve().parents[2] / ".smoke"
@@ -148,6 +238,68 @@ class GradualDriftLabAuditTest(unittest.TestCase):
             0.0,
         )
 
+    def test_expert_metrics_reports_coverage_loss_replacement_audit(self):
+        timeline = [
+            {
+                "active_experts_after": [],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": None,
+                "budget_replacement": None,
+                "budget_replacement_evaluation": {
+                    "outcome": "no_positive_coverage_gain",
+                    "new_coverage_fraction": 1.0,
+                    "coverage_removal_loss": 0.2,
+                    "coverage_swap_gain": -0.1,
+                },
+            }
+        ]
+
+        metrics = expert_metrics(timeline, labels=np.asarray([0]))
+
+        self.assertEqual(
+            metrics[
+                "budget_replacement_no_positive_coverage_gain_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            metrics["budget_replacement_coverage_removal_loss_median"],
+            0.2,
+        )
+        self.assertEqual(
+            metrics["budget_replacement_coverage_swap_gain_median"],
+            -0.1,
+        )
+
+    def test_expert_metrics_counts_candidate_eviction(self):
+        timeline = [
+            {
+                "active_experts_after": [],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": None,
+                "budget_replacement": None,
+                "budget_replacement_evaluation": {
+                    "outcome": "candidate_evicted_minimum_coverage_loss",
+                    "new_coverage_fraction": 0.5,
+                    "coverage_eviction_loss": 0.0,
+                },
+            }
+        ]
+
+        metrics = expert_metrics(timeline, labels=np.asarray([0]))
+
+        self.assertEqual(
+            metrics["budget_replacement_candidate_evicted_count"],
+            1,
+        )
+        self.assertEqual(metrics["budget_replacement_accepted_count"], 0)
+        self.assertEqual(
+            metrics[
+                "budget_replacement_coverage_eviction_loss_median"
+            ],
+            0.0,
+        )
+
     def test_expert_metrics_counts_photometric_state_only_from_timeline(self):
         timeline = [
             {
@@ -163,6 +315,201 @@ class GradualDriftLabAuditTest(unittest.TestCase):
         metrics = expert_metrics(timeline, labels=np.asarray([0]))
 
         self.assertEqual(metrics["photometric_state_only_count"], 1)
+
+    def test_expert_metrics_counts_bootstrap_provisional_lifecycle(self):
+        timeline = [
+            {
+                "step": 5,
+                "active_experts_after": [],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": None,
+                "bootstrap": {"decision": "provisional_created"},
+            },
+            {
+                "step": 6,
+                "active_experts_after": [],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": None,
+                "bootstrap": {"decision": "provisional_confirming"},
+            },
+            {
+                "step": 7,
+                "active_experts_after": [],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": None,
+                "bootstrap": {"decision": "rolled_back"},
+            },
+            {
+                "step": 8,
+                "active_experts_after": [],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": None,
+                "bootstrap": {"decision": "provisional_created"},
+            },
+            {
+                "step": 10,
+                "active_experts_after": [
+                    {
+                        "expert_id": 0,
+                        "image_id": 0,
+                        "admission_route": "bootstrap",
+                    }
+                ],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": 0,
+                "bootstrap": {
+                    "decision": "admitted",
+                    "confirmation_steps": 2,
+                    "selected_image_ids": [0, 1],
+                },
+            },
+        ]
+        scoring = [
+            {"step": 5, "provisional_state": None},
+            {"step": 6, "provisional_state": "bootstrap_provisional"},
+            {"step": 7, "provisional_state": "bootstrap_provisional"},
+            {"step": 8, "provisional_state": None},
+            {"step": 9, "provisional_state": "bootstrap_provisional"},
+        ]
+
+        metrics = expert_metrics(
+            timeline,
+            labels=np.asarray([0, 0]),
+            scoring=scoring,
+        )
+
+        self.assertEqual(metrics["bootstrap_provisional_created_count"], 2)
+        self.assertEqual(
+            metrics["bootstrap_provisional_confirming_step_count"], 1
+        )
+        self.assertEqual(metrics["bootstrap_provisional_rolled_back_count"], 1)
+        self.assertEqual(metrics["bootstrap_provisional_admitted_count"], 1)
+        self.assertEqual(metrics["bootstrap_provisional_scoring_step_count"], 3)
+        self.assertEqual(
+            metrics["bootstrap_provisional_confirmation_delay_mean"], 2.0
+        )
+
+    def test_expert_metrics_counts_continuous_bootstrap_confidence(self):
+        bootstrap_expert = {
+            "expert_id": 0,
+            "image_id": 1,
+            "admission_route": "bootstrap_confidence",
+        }
+        timeline = [
+            {
+                "step": 0,
+                "active_experts_after": [bootstrap_expert],
+                "expert_slots_after": [bootstrap_expert],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": 0,
+                "bootstrap": {
+                    "decision": "confidence_state_created",
+                    "state_confidence": 0.0,
+                    "normality_confidence": 0.0,
+                    "reference_confidence": 0.0,
+                    "selected_image_ids": [0],
+                },
+            },
+            {
+                "step": 1,
+                "active_experts_after": [bootstrap_expert],
+                "expert_slots_after": [bootstrap_expert],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": None,
+                "bootstrap": {
+                    "decision": "confidence_state_updated",
+                    "state_confidence": 0.5,
+                    "normality_confidence": 0.8,
+                    "reference_confidence": 0.4,
+                    "prequential_support": 0.8,
+                },
+            },
+        ]
+        scoring = [
+            {"step": 0, "active_expert_ids": [], "expert_image_ids": []},
+            {
+                "step": 1,
+                "active_expert_ids": [0],
+                "expert_image_ids": [1],
+                "active_expert_scoring_weights": [0.25],
+            },
+        ]
+
+        metrics = expert_metrics(
+            timeline,
+            labels=np.asarray([0, 1]),
+            scoring=scoring,
+        )
+
+        self.assertEqual(metrics["bootstrap_confidence_created_count"], 1)
+        self.assertEqual(metrics["bootstrap_confidence_update_count"], 1)
+        self.assertEqual(metrics["bootstrap_confidence_first_positive_step"], 1)
+        self.assertEqual(metrics["bootstrap_confidence_final"], 0.5)
+        self.assertEqual(metrics["bootstrap_confidence_max"], 0.5)
+        self.assertEqual(
+            metrics["bootstrap_reference_confidence_first_positive_step"], 1
+        )
+        self.assertEqual(
+            metrics["bootstrap_reference_confidence_final"], 0.4
+        )
+        self.assertEqual(
+            metrics["bootstrap_normality_confidence_final"], 0.8
+        )
+        self.assertEqual(
+            metrics["bootstrap_prequential_support_mean"], 0.8
+        )
+        self.assertEqual(
+            metrics["bootstrap_confidence_anomaly_exposure"], 0.25
+        )
+        self.assertEqual(
+            metrics["bootstrap_confidence_member_anomaly_exposure"], 0.25
+        )
+        self.assertEqual(
+            metrics[
+                "bootstrap_confidence_member_anomaly_scoring_step_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            metrics["bootstrap_reference_first_weighted_scoring_step"], 1
+        )
+
+    def test_expert_metrics_uses_state_lifecycle_events_as_source_of_truth(self):
+        timeline = [
+            {
+                "active_experts_after": [],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": None,
+                "novel_quarantine": {
+                    "decision": "matured_photometric_state_only"
+                },
+                "historical_states": [
+                    {"state_id": 0},
+                    {"state_id": 1},
+                ],
+                "state_lifecycle_events": [
+                    {"event_type": "create", "status_after": "temporary"},
+                    {"event_type": "match", "status_after": "temporary"},
+                    {"event_type": "update", "status_after": "stable"},
+                    {"event_type": "merge", "status_after": "stable"},
+                    {"event_type": "mature", "status_after": "stable"},
+                    {"event_type": "evict", "status_after": "temporary"},
+                ],
+            }
+        ]
+
+        metrics = expert_metrics(timeline, labels=np.asarray([0]))
+
+        self.assertEqual(metrics["photometric_state_only_count"], 1)
+        self.assertEqual(metrics["historical_state_created_count"], 1)
+        self.assertEqual(metrics["historical_state_matched_count"], 1)
+        self.assertEqual(metrics["historical_state_updated_count"], 1)
+        self.assertEqual(metrics["historical_state_merged_count"], 1)
+        self.assertEqual(metrics["historical_state_matured_count"], 1)
+        self.assertEqual(metrics["historical_state_evicted_count"], 1)
+        self.assertEqual(metrics["temporary_state_created_count"], 1)
+        self.assertEqual(metrics["max_historical_state_count"], 2)
+        self.assertEqual(metrics["final_historical_state_count"], 2)
 
     def test_expert_metrics_counts_history_reentry_outcomes(self):
         decisions = (

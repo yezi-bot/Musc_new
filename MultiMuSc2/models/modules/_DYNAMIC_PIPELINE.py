@@ -683,7 +683,11 @@ def build_dynamic_committee_timeline(
                     "budget_replacement_evaluation"
                 ],
                 "history_reentry": event.get("history_reentry"),
+                "fitness_history": event.get("fitness_history"),
                 "historical_states": event.get("historical_states", []),
+                "state_lifecycle_events": event.get(
+                    "state_lifecycle_events", []
+                ),
                 "bootstrap": event["bootstrap"],
                 "lab_drift_profile": lab_drift_profile,
                 "drift_candidate_audit": drift_candidate_audit,
@@ -951,6 +955,15 @@ def score_dynamic_msm2_layer(
         current_dino = dino_features[step]
         active = record["active_experts_before"]
         expert_image_ids = [expert["image_id"] for expert in active]
+        active_expert_scoring_weights = [
+            float(expert.get("scoring_weight", 1.0))
+            for expert in active
+        ]
+        active_committee_confidence = (
+            max(active_expert_scoring_weights)
+            if active_expert_scoring_weights
+            else 0.0
+        )
         active_signature = tuple(expert_image_ids)
         active_stable_count = (
             active_stable_count + 1
@@ -996,15 +1009,53 @@ def score_dynamic_msm2_layer(
                 )
                 effective_mode = "dino_fallback"
         elif fusion_mode == "dino_only":
-            patch_score, score_audit = MSM2_online(
-                current_dino,
-                None,
-                dino_features[expert_image_ids],
-                None,
-                fusion_mode="dino_only",
-                topmin_min=topmin_min,
-                topmin_max=topmin_max,
-            )
+            full_expert_image_ids = [
+                image_id
+                for image_id, weight in zip(
+                    expert_image_ids, active_expert_scoring_weights
+                )
+                if weight >= 1.0
+            ]
+            confidence_experts = [
+                (image_id, weight)
+                for image_id, weight in zip(
+                    expert_image_ids, active_expert_scoring_weights
+                )
+                if weight < 1.0
+            ]
+            if full_expert_image_ids:
+                patch_score, score_audit = MSM2_online(
+                    current_dino,
+                    None,
+                    dino_features[full_expert_image_ids],
+                    None,
+                    fusion_mode="dino_only",
+                    topmin_min=topmin_min,
+                    topmin_max=topmin_max,
+                )
+            else:
+                patch_score, fallback_reason = (
+                    _strict_history_dino_fallback(
+                        current_dino,
+                        dino_features[history_start:step],
+                    )
+                )
+            for confidence_image_id, confidence_weight in confidence_experts:
+                confidence_score, _ = MSM2_online(
+                    current_dino,
+                    None,
+                    dino_features[[confidence_image_id]],
+                    None,
+                    fusion_mode="dino_only",
+                    topmin_min=topmin_min,
+                    topmin_max=topmin_max,
+                )
+                patch_score = (
+                    patch_score
+                    + confidence_weight * (confidence_score - patch_score)
+                )
+            if confidence_experts:
+                effective_mode = "dino_confidence_blend"
         elif fusion_mode == "clip_only":
             patch_score, score_audit = MSM2_online(
                 current_dino,
@@ -1363,6 +1414,8 @@ def score_dynamic_msm2_layer(
             "effective_mode": effective_mode,
             "active_expert_ids": [expert["expert_id"] for expert in active],
             "expert_image_ids": expert_image_ids,
+            "active_expert_scoring_weights": active_expert_scoring_weights,
+            "active_committee_confidence": active_committee_confidence,
             "provisional_expert_image_id": (
                 int(provisional["image_id"])
                 if provisional is not None

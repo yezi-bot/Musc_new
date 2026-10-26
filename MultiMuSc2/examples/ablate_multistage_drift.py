@@ -31,7 +31,21 @@ PRESSURE_VARIANTS = (
     "photometric_multistage_cap2_dual_replace",
     "photometric_multistage_cap2_dual_replace_fast_reentry",
     "photometric_multistage_cap2_dual_replace_history_reentry",
+    "photometric_multistage_cap2_state_distribution_only",
+    "photometric_multistage_cap2_state_distribution_temporary",
     "photometric_multistage_cap2_adaptive_evidence",
+    "photometric_multistage_cap2_adaptive_evidence_bootstrap_provisional",
+    "photometric_multistage_cap2_adaptive_evidence_bootstrap_confidence",
+    "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential",
+    "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential_stable_anchor",
+    "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential_denstream",
+    "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential_denstream_fitness",
+    "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential_denstream_fitness_coreset",
+    "priority4_min_loss_coreset",
+    "priority4_joint_coreset",
+    "priority4_patch_coreset",
+    "priority4_patch_victim",
+    "priority4_patch_kcenter_victim",
 )
 
 

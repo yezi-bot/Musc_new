@@ -25,6 +25,8 @@ models:
     support_quantile: 0.7
     duplicate_similarity: 0.98
     min_cluster_support: 2
+    cold_start_confidence_history: 16
+    cold_start_reference_confidence_mode: state
     committee_cap: 5
     photometric_budget_replacement: true
     photometric_budget_admission_mode: channel_only
@@ -32,11 +34,30 @@ models:
     photometric_history_reentry_members: 2
     photometric_history_median_risk_max: 1.25
     photometric_history_extreme_risk_max: 2.0
+    photometric_state_registry_cap: null
+    photometric_state_distribution_enabled: false
+    photometric_temporary_state_enabled: false
     photometric_adaptive_candidate_evidence: false
+    photometric_stable_lab_anchor_enabled: false
+    photometric_fitness_history_enabled: false
+    photometric_denstream_support_enabled: false
+    photometric_denstream_decay: 0.9
+    photometric_denstream_mature_support: 0.5
+    photometric_denstream_discard_support: 0.05
     legacy_budget_replacement: true
     budget_coverage_window: 32
     budget_min_new_coverage_fraction: 0.5
     budget_replacement_margin: 0.0
+    budget_coverage_loss_enabled: false
+    budget_coverage_min_loss_only: false
+    budget_coverage_joint_eviction_enabled: false
+    budget_patch_coverage_enabled: false
+    budget_patch_prototype_count: 32
+    budget_patch_victim_selection_enabled: false
+    budget_patch_kcenter_victim_selection_enabled: false
+    budget_coverage_channel_weight: 1.0
+    budget_coverage_lab_weight: 1.0
+    budget_coverage_dino_weight: 1.0
     base_ttl: 5
     max_ttl: 20
     ttl_gap_multiplier: 2.0

@@ -282,7 +282,106 @@ VARIANTS["photometric_multistage_cap2_adaptive_evidence"] = {
     **VARIANTS["photometric_multistage_cap2_dual_replace"],
     "photometric_history_reentry_enabled": True,
     "photometric_history_reentry_members": 2,
+    "photometric_state_distribution_enabled": True,
+    "photometric_temporary_state_enabled": True,
     "photometric_adaptive_candidate_evidence": True,
+}
+VARIANTS["photometric_multistage_cap2_adaptive_evidence_bootstrap_provisional"] = {
+    **VARIANTS["photometric_multistage_cap2_adaptive_evidence"],
+    "cold_start_provisional_enabled": True,
+    "cold_start_provisional_confirm_steps": 2,
+    "cold_start_provisional_max_wait_steps": 4,
+    "cold_start_provisional_weight": 0.25,
+    "cold_start_provisional_min_channel_support": 0.05,
+}
+VARIANTS["photometric_multistage_cap2_adaptive_evidence_bootstrap_confidence"] = {
+    **VARIANTS["photometric_multistage_cap2_adaptive_evidence"],
+    "cold_start_mode": "confidence",
+    "cold_start_confidence_history": 16,
+    "cold_start_provisional_enabled": False,
+}
+VARIANTS[
+    "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential"
+] = {
+    **VARIANTS[
+        "photometric_multistage_cap2_adaptive_evidence_bootstrap_confidence"
+    ],
+    "cold_start_reference_confidence_mode": "prequential",
+}
+VARIANTS[
+    "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential_stable_anchor"
+] = {
+    **VARIANTS[
+        "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential"
+    ],
+    "photometric_stable_lab_anchor_enabled": True,
+}
+VARIANTS[
+    "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential_denstream"
+] = {
+    **VARIANTS[
+        "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential"
+    ],
+    "photometric_denstream_support_enabled": True,
+    "photometric_denstream_decay": 0.9,
+    "photometric_denstream_mature_support": 0.5,
+    "photometric_denstream_discard_support": 0.05,
+}
+VARIANTS[
+    "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential_denstream_fitness"
+] = {
+    **VARIANTS[
+        "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential_denstream"
+    ],
+    "photometric_fitness_history_enabled": True,
+    "photometric_candidate_window_mode": "history",
+}
+VARIANTS[
+    "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential_denstream_fitness_coreset"
+] = {
+    **VARIANTS[
+        "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential_denstream_fitness"
+    ],
+    "budget_coverage_loss_enabled": True,
+}
+VARIANTS["priority4_min_loss_coreset"] = {
+    **VARIANTS[
+        "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential_denstream_fitness_coreset"
+    ],
+    "budget_coverage_min_loss_only": True,
+}
+VARIANTS["priority4_joint_coreset"] = {
+    **VARIANTS[
+        "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential_denstream_fitness_coreset"
+    ],
+    "budget_coverage_joint_eviction_enabled": True,
+}
+VARIANTS["priority4_patch_coreset"] = {
+    **VARIANTS["priority4_joint_coreset"],
+    "budget_patch_coverage_enabled": True,
+    "budget_patch_prototype_count": 32,
+}
+VARIANTS["priority4_patch_victim"] = {
+    **VARIANTS[
+        "photometric_multistage_cap2_adaptive_evidence_bootstrap_prequential_denstream_fitness"
+    ],
+    "budget_patch_coverage_enabled": True,
+    "budget_patch_prototype_count": 32,
+    "budget_patch_victim_selection_enabled": True,
+}
+VARIANTS["priority4_patch_kcenter_victim"] = {
+    **VARIANTS["priority4_patch_victim"],
+    "budget_patch_kcenter_victim_selection_enabled": True,
+}
+VARIANTS["photometric_multistage_cap2_state_distribution_only"] = {
+    **VARIANTS["photometric_multistage_cap2_dual_replace_history_reentry"],
+    "photometric_state_distribution_enabled": True,
+    "photometric_temporary_state_enabled": False,
+    "photometric_adaptive_candidate_evidence": False,
+}
+VARIANTS["photometric_multistage_cap2_state_distribution_temporary"] = {
+    **VARIANTS["photometric_multistage_cap2_state_distribution_only"],
+    "photometric_temporary_state_enabled": True,
 }
 
 PRIMARY_VARIANTS = [
@@ -536,8 +635,29 @@ def configure_variant(
     committee["cold_start_min_samples"] = 4
     committee["cold_start_max_samples"] = 6
     committee["cold_start_required_members"] = 3
+    committee["cold_start_confidence_history"] = int(
+        variant.get("cold_start_confidence_history", 16)
+    )
+    committee["cold_start_reference_confidence_mode"] = variant.get(
+        "cold_start_reference_confidence_mode", "state"
+    )
     committee["cold_start_lab_enabled"] = bool(
         variant.get("cold_start_lab_enabled", False)
+    )
+    committee["cold_start_provisional_enabled"] = bool(
+        variant.get("cold_start_provisional_enabled", False)
+    )
+    committee["cold_start_provisional_confirm_steps"] = int(
+        variant.get("cold_start_provisional_confirm_steps", 2)
+    )
+    committee["cold_start_provisional_max_wait_steps"] = int(
+        variant.get("cold_start_provisional_max_wait_steps", 4)
+    )
+    committee["cold_start_provisional_weight"] = float(
+        variant.get("cold_start_provisional_weight", 0.25)
+    )
+    committee["cold_start_provisional_min_channel_support"] = float(
+        variant.get("cold_start_provisional_min_channel_support", 0.05)
     )
     committee["lab_ewma_alpha"] = args.lab_ewma_alpha
     committee["lab_ewma_threshold_k"] = args.lab_ewma_threshold_k
@@ -588,8 +708,17 @@ def configure_variant(
     committee["photometric_relevant_history_enabled"] = bool(
         variant.get("photometric_relevant_history_enabled", False)
     )
+    committee["photometric_fitness_history_enabled"] = bool(
+        variant.get("photometric_fitness_history_enabled", False)
+    )
     committee["photometric_history_min"] = 3
     committee["photometric_history_max"] = 16
+    state_registry_cap = variant.get("photometric_state_registry_cap")
+    committee["photometric_state_registry_cap"] = (
+        int(state_registry_cap)
+        if state_registry_cap is not None
+        else 2 * int(committee["committee_cap"])
+    )
     committee["photometric_history_distance_threshold"] = 3.0
     committee["photometric_dino_similarity_floor"] = 0.9
     committee["photometric_history_reentry_enabled"] = bool(
@@ -607,6 +736,27 @@ def configure_variant(
     committee["photometric_adaptive_candidate_evidence"] = bool(
         variant.get("photometric_adaptive_candidate_evidence", False)
     )
+    committee["photometric_stable_lab_anchor_enabled"] = bool(
+        variant.get("photometric_stable_lab_anchor_enabled", False)
+    )
+    committee["photometric_denstream_support_enabled"] = bool(
+        variant.get("photometric_denstream_support_enabled", False)
+    )
+    committee["photometric_denstream_decay"] = float(
+        variant.get("photometric_denstream_decay", 0.9)
+    )
+    committee["photometric_denstream_mature_support"] = float(
+        variant.get("photometric_denstream_mature_support", 0.5)
+    )
+    committee["photometric_denstream_discard_support"] = float(
+        variant.get("photometric_denstream_discard_support", 0.05)
+    )
+    committee["photometric_state_distribution_enabled"] = bool(
+        variant.get("photometric_state_distribution_enabled", False)
+    )
+    committee["photometric_temporary_state_enabled"] = bool(
+        variant.get("photometric_temporary_state_enabled", False)
+    )
     committee["photometric_budget_replacement"] = bool(
         variant.get("photometric_budget_replacement", True)
     )
@@ -618,6 +768,27 @@ def configure_variant(
             "legacy_budget_replacement",
             committee.get("legacy_budget_replacement", True),
         )
+    )
+    committee["budget_coverage_loss_enabled"] = bool(
+        variant.get("budget_coverage_loss_enabled", False)
+    )
+    committee["budget_coverage_min_loss_only"] = bool(
+        variant.get("budget_coverage_min_loss_only", False)
+    )
+    committee["budget_coverage_joint_eviction_enabled"] = bool(
+        variant.get("budget_coverage_joint_eviction_enabled", False)
+    )
+    committee["budget_patch_coverage_enabled"] = bool(
+        variant.get("budget_patch_coverage_enabled", False)
+    )
+    committee["budget_patch_prototype_count"] = int(
+        variant.get("budget_patch_prototype_count", 32)
+    )
+    committee["budget_patch_victim_selection_enabled"] = bool(
+        variant.get("budget_patch_victim_selection_enabled", False)
+    )
+    committee["budget_patch_kcenter_victim_selection_enabled"] = bool(
+        variant.get("budget_patch_kcenter_victim_selection_enabled", False)
     )
     committee["minimum_active_experts"] = int(
         variant.get("minimum_active_experts", 0)
@@ -1195,6 +1366,13 @@ def expert_lab_metrics(timeline, schedule):
     first_confirmed_step = None
     confirmed_step_count = 0
     observed_steps = 0
+    stable_anchor_observed_steps = 0
+    stable_anchor_frozen_steps = 0
+    stable_anchor_change_count = 0
+    candidate_state_observed_steps = 0
+    candidate_anchor_distances = []
+    coverage_anchor_distances = []
+    previous_anchors = {}
 
     for phase in PHASES:
         phase_profiles = [
@@ -1219,13 +1397,63 @@ def expert_lab_metrics(timeline, schedule):
 
     for record in timeline:
         profile = record.get("lab_drift_profile")
-        if profile is not None and profile["drift_confirmed"]:
+        if profile is None:
+            continue
+        if profile["drift_confirmed"] and first_confirmed_step is None:
             first_confirmed_step = int(record["step"])
-            break
+        if profile.get("stable_lab_anchor_enabled", False):
+            stable_anchor_observed_steps += 1
+            stable_anchor_frozen_steps += int(
+                bool(profile.get("anchor_frozen", False))
+            )
+            expert_id = int(profile["expert_id"])
+            anchor = np.asarray(
+                profile["lab_anchor_center"], dtype=np.float64
+            )
+            previous = previous_anchors.get(expert_id)
+            if previous is not None and not np.allclose(
+                anchor,
+                previous,
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                stable_anchor_change_count += 1
+            previous_anchors[expert_id] = anchor
+            candidate_state_observed_steps += int(
+                int(profile.get("candidate_lab_count", 0)) > 0
+            )
+            candidate_distance = profile.get(
+                "anchor_to_candidate_total_distance"
+            )
+            if candidate_distance is not None:
+                candidate_anchor_distances.append(float(candidate_distance))
+            coverage_distance = profile.get(
+                "anchor_to_coverage_total_distance"
+            )
+            if coverage_distance is not None:
+                coverage_anchor_distances.append(float(coverage_distance))
 
     result["expert_lab_observed_steps"] = observed_steps
     result["expert_lab_first_confirmed_step"] = first_confirmed_step
     result["expert_lab_confirmed_step_count"] = confirmed_step_count
+    result["stable_lab_anchor_observed_steps"] = (
+        stable_anchor_observed_steps
+    )
+    result["stable_lab_anchor_frozen_steps"] = stable_anchor_frozen_steps
+    result["stable_lab_anchor_change_count"] = stable_anchor_change_count
+    result["lab_candidate_state_observed_steps"] = (
+        candidate_state_observed_steps
+    )
+    result["lab_candidate_anchor_distance_max"] = (
+        max(candidate_anchor_distances)
+        if candidate_anchor_distances
+        else None
+    )
+    result["lab_coverage_anchor_distance_max"] = (
+        max(coverage_anchor_distances)
+        if coverage_anchor_distances
+        else None
+    )
     return result
 
 
@@ -1501,6 +1729,21 @@ def expert_metrics(timeline, labels, scoring=None):
     first_expert_is_anomaly = None
     bootstrap_selected_image_ids = []
     bootstrap_selected_anomaly_count = None
+    bootstrap_provisional_created_count = 0
+    bootstrap_provisional_confirming_step_count = 0
+    bootstrap_provisional_rolled_back_count = 0
+    bootstrap_provisional_admitted_count = 0
+    bootstrap_provisional_confirmation_delays = []
+    bootstrap_provisional_created_step = None
+    bootstrap_confidence_created_count = 0
+    bootstrap_confidence_update_count = 0
+    bootstrap_confidence_first_positive_step = None
+    bootstrap_confidence_values = []
+    bootstrap_reference_confidence_first_positive_step = None
+    bootstrap_reference_confidence_values = []
+    bootstrap_normality_confidence_values = []
+    bootstrap_prequential_support_values = []
+    bootstrap_confidence_expert_ids = set()
     budget_replacement_count = 0
     legacy_budget_replacement_count = 0
     photometric_budget_replacement_count = 0
@@ -1513,6 +1756,9 @@ def expert_metrics(timeline, labels, scoring=None):
     budget_replacement_attempt_count = 0
     budget_replacement_evaluation_outcomes = {}
     evaluated_new_coverage_fractions = []
+    evaluated_coverage_removal_losses = []
+    evaluated_coverage_swap_gains = []
+    evaluated_coverage_eviction_losses = []
     max_expert_slots = 0
     final_expert_slots = 0
     dormant_transition_count = 0
@@ -1525,8 +1771,30 @@ def expert_metrics(timeline, labels, scoring=None):
     history_materialized_by_replacement_count = 0
     history_reentry_rejected_count = 0
     max_historical_state_count = 0
+    final_historical_state_count = 0
     adaptive_coverage_admission_count = 0
     photometric_state_only_count = 0
+    state_lifecycle_counts = {
+        event_type: 0
+        for event_type in (
+            "create",
+            "match",
+            "update",
+            "merge",
+            "mature",
+            "evict",
+        )
+    }
+    temporary_state_created_count = 0
+    temporary_support_update_count = 0
+    temporary_support_decay_count = 0
+    temporary_decay_eviction_count = 0
+    temporary_effective_support_values = []
+    temporary_effective_support_final = None
+    temporary_denstream_matured_count = 0
+    fitness_history_available_counts = []
+    fitness_history_selected_counts = []
+    fitness_history_effective_sizes = []
 
     for record in timeline:
         active_after = record.get(
@@ -1565,10 +1833,54 @@ def expert_metrics(timeline, labels, scoring=None):
             or record.get("novel_quarantine_event")
             or {}
         )
+        fitness_profile = record.get("fitness_history") or {}
+        if fitness_profile:
+            fitness_history_available_counts.append(
+                int(fitness_profile.get("available_count", 0))
+            )
+            fitness_history_selected_counts.append(
+                int(fitness_profile.get("selected_count", 0))
+            )
+            fitness_history_effective_sizes.append(
+                float(fitness_profile.get("effective_history_size", 0.0))
+            )
         photometric_state_only_count += int(
-            quarantine_event.get("decision")
-            == "recorded_photometric_state_only"
+            quarantine_event.get("decision") in {
+                "recorded_photometric_state_only",
+                "matured_photometric_state_only",
+            }
         )
+        for state_event in record.get("state_lifecycle_events", []):
+            event_type = str(state_event.get("event_type", ""))
+            if event_type in state_lifecycle_counts:
+                state_lifecycle_counts[event_type] += 1
+            temporary_state_created_count += int(
+                event_type == "create"
+                and state_event.get("status_after") == "temporary"
+            )
+            if state_event.get("temporary_effective_support") is not None:
+                temporary_effective_support_values.append(
+                    float(state_event["temporary_effective_support"])
+                )
+            temporary_support_update_count += int(
+                state_event.get("reason") == "denstream_effective_support"
+            )
+            temporary_support_decay_count += int(
+                event_type == "decay"
+                and state_event.get("reason")
+                == "temporary_effective_support_decay"
+            )
+            temporary_decay_eviction_count += int(
+                event_type == "evict"
+                and state_event.get("reason")
+                == "temporary_effective_support_decay"
+            )
+            temporary_denstream_matured_count += int(
+                event_type == "mature"
+                and str(state_event.get("reason", "")).startswith(
+                    "denstream_"
+                )
+            )
         history_event = (
             record.get("history_reentry")
             or quarantine_event.get("history_reentry")
@@ -1597,6 +1909,77 @@ def expert_metrics(timeline, labels, scoring=None):
             max_historical_state_count,
             len(record.get("historical_states", [])),
         )
+        final_historical_state_count = len(
+            record.get("historical_states", [])
+        )
+        final_temporary_supports = [
+            float(state["temporary_effective_support"])
+            for state in record.get("historical_states", [])
+            if state.get("state_status") == "temporary"
+            and state.get("temporary_effective_support") is not None
+        ]
+        temporary_effective_support_final = (
+            max(final_temporary_supports)
+            if final_temporary_supports
+            else None
+        )
+        bootstrap_event = record.get("bootstrap") or {}
+        bootstrap_decision = bootstrap_event.get("decision")
+        if bootstrap_decision == "confidence_state_created":
+            bootstrap_confidence_created_count += 1
+        elif bootstrap_decision == "confidence_state_updated":
+            bootstrap_confidence_update_count += 1
+        if bootstrap_event.get("state_confidence") is not None:
+            confidence = float(bootstrap_event["state_confidence"])
+            bootstrap_confidence_values.append(confidence)
+            if (
+                confidence > 0.0
+                and bootstrap_confidence_first_positive_step is None
+            ):
+                bootstrap_confidence_first_positive_step = record_step
+        if bootstrap_event.get("reference_confidence") is not None:
+            reference_confidence = float(
+                bootstrap_event["reference_confidence"]
+            )
+            bootstrap_reference_confidence_values.append(
+                reference_confidence
+            )
+            if (
+                reference_confidence > 0.0
+                and bootstrap_reference_confidence_first_positive_step is None
+            ):
+                bootstrap_reference_confidence_first_positive_step = (
+                    record_step
+                )
+        if bootstrap_event.get("normality_confidence") is not None:
+            bootstrap_normality_confidence_values.append(
+                float(bootstrap_event["normality_confidence"])
+            )
+        if bootstrap_event.get("prequential_support") is not None:
+            bootstrap_prequential_support_values.append(
+                float(bootstrap_event["prequential_support"])
+            )
+        for expert in expert_slots_after:
+            if expert.get("admission_route") == "bootstrap_confidence":
+                bootstrap_confidence_expert_ids.add(int(expert["expert_id"]))
+        if bootstrap_decision == "provisional_created":
+            bootstrap_provisional_created_count += 1
+            bootstrap_provisional_created_step = record_step
+        elif bootstrap_decision == "provisional_confirming":
+            bootstrap_provisional_confirming_step_count += 1
+        elif bootstrap_decision == "rolled_back":
+            bootstrap_provisional_rolled_back_count += 1
+            bootstrap_provisional_created_step = None
+        elif (
+            bootstrap_decision == "admitted"
+            and int(bootstrap_event.get("confirmation_steps", 0)) > 0
+        ):
+            bootstrap_provisional_admitted_count += 1
+            if bootstrap_provisional_created_step is not None:
+                bootstrap_provisional_confirmation_delays.append(
+                    record_step - bootstrap_provisional_created_step
+                )
+            bootstrap_provisional_created_step = None
 
         deleted_ids = record.get(
             "deleted_expert_ids",
@@ -1650,6 +2033,23 @@ def expert_metrics(timeline, labels, scoring=None):
             if evaluated_fraction is not None:
                 evaluated_new_coverage_fractions.append(
                     float(evaluated_fraction)
+                )
+            removal_loss = replacement_evaluation.get(
+                "coverage_removal_loss"
+            )
+            if removal_loss is not None:
+                evaluated_coverage_removal_losses.append(
+                    float(removal_loss)
+                )
+            swap_gain = replacement_evaluation.get("coverage_swap_gain")
+            if swap_gain is not None:
+                evaluated_coverage_swap_gains.append(float(swap_gain))
+            eviction_loss = replacement_evaluation.get(
+                "coverage_eviction_loss"
+            )
+            if eviction_loss is not None:
+                evaluated_coverage_eviction_losses.append(
+                    float(eviction_loss)
                 )
 
         admitted_expert_id = record.get(
@@ -1727,6 +2127,11 @@ def expert_metrics(timeline, labels, scoring=None):
     )
     polluted_expert_scoring_step_count = None
     polluted_expert_future_anomaly_scoring_count = None
+    bootstrap_provisional_scoring_step_count = None
+    bootstrap_confidence_anomaly_exposure = None
+    bootstrap_confidence_member_anomaly_exposure = None
+    bootstrap_confidence_member_anomaly_scoring_step_count = None
+    bootstrap_reference_first_weighted_scoring_step = None
     if scoring is not None:
         polluted_scoring_steps = set()
         polluted_anomaly_steps = set()
@@ -1763,6 +2168,75 @@ def expert_metrics(timeline, labels, scoring=None):
         polluted_expert_future_anomaly_scoring_count = len(
             polluted_anomaly_steps
         )
+        bootstrap_provisional_scoring_step_count = sum(
+            str(record.get("provisional_state", ""))
+            == "bootstrap_provisional"
+            for record in scoring
+        )
+        bootstrap_confidence_anomaly_exposure = 0.0
+        bootstrap_confidence_member_anomaly_exposure = 0.0
+        member_anomaly_scoring_steps = 0
+        for scoring_record in scoring:
+            expert_ids = scoring_record.get("active_expert_ids", [])
+            image_ids = scoring_record.get("expert_image_ids", [])
+            weights = scoring_record.get(
+                "active_expert_scoring_weights",
+                [1.0] * len(expert_ids),
+            )
+            member_image_ids = scoring_record.get(
+                "active_expert_member_image_ids",
+                [[image_id] for image_id in image_ids],
+            )
+            member_weights = scoring_record.get(
+                "active_expert_member_weights",
+                [[] for _ in expert_ids],
+            )
+            if bootstrap_reference_first_weighted_scoring_step is None:
+                if any(
+                    int(expert_id) in bootstrap_confidence_expert_ids
+                    and float(weight) > 0.0
+                    for expert_id, weight in zip(expert_ids, weights)
+                ):
+                    bootstrap_reference_first_weighted_scoring_step = int(
+                        scoring_record.get("step", 0)
+                    )
+            step_has_member_anomaly = False
+            for expert_id, image_id, weight, ids, internal_weights in zip(
+                expert_ids,
+                image_ids,
+                weights,
+                member_image_ids,
+                member_weights,
+            ):
+                if (
+                    int(expert_id) in bootstrap_confidence_expert_ids
+                    and 0 <= int(image_id) < len(labels)
+                    and bool(labels[int(image_id)])
+                ):
+                    bootstrap_confidence_anomaly_exposure += float(weight)
+                if int(expert_id) not in bootstrap_confidence_expert_ids:
+                    continue
+                if not internal_weights or len(internal_weights) != len(ids):
+                    internal_weights = [1.0 / len(ids)] * len(ids) if ids else []
+                anomaly_mass = sum(
+                    float(member_weight)
+                    for member_image_id, member_weight in zip(
+                        ids, internal_weights
+                    )
+                    if (
+                        0 <= int(member_image_id) < len(labels)
+                        and bool(labels[int(member_image_id)])
+                    )
+                )
+                if anomaly_mass > 0.0:
+                    step_has_member_anomaly = True
+                    bootstrap_confidence_member_anomaly_exposure += (
+                        float(weight) * anomaly_mass
+                    )
+            member_anomaly_scoring_steps += int(step_has_member_anomaly)
+        bootstrap_confidence_member_anomaly_scoring_step_count = (
+            member_anomaly_scoring_steps
+        )
 
     return {
         "max_active_experts": (
@@ -1793,6 +2267,46 @@ def expert_metrics(timeline, labels, scoring=None):
         ),
         "history_reentry_rejected_count": history_reentry_rejected_count,
         "max_historical_state_count": max_historical_state_count,
+        "final_historical_state_count": final_historical_state_count,
+        "historical_state_created_count": state_lifecycle_counts["create"],
+        "historical_state_matched_count": state_lifecycle_counts["match"],
+        "historical_state_updated_count": state_lifecycle_counts["update"],
+        "historical_state_merged_count": state_lifecycle_counts["merge"],
+        "historical_state_matured_count": state_lifecycle_counts["mature"],
+        "historical_state_evicted_count": state_lifecycle_counts["evict"],
+        "temporary_state_created_count": temporary_state_created_count,
+        "temporary_support_update_count": temporary_support_update_count,
+        "temporary_support_decay_count": temporary_support_decay_count,
+        "temporary_decay_eviction_count": temporary_decay_eviction_count,
+        "temporary_denstream_matured_count": (
+            temporary_denstream_matured_count
+        ),
+        "temporary_effective_support_max": (
+            max(temporary_effective_support_values)
+            if temporary_effective_support_values
+            else None
+        ),
+        "temporary_effective_support_final": (
+            temporary_effective_support_final
+        ),
+        "fitness_history_event_count": len(
+            fitness_history_effective_sizes
+        ),
+        "fitness_history_available_mean": (
+            float(np.mean(fitness_history_available_counts))
+            if fitness_history_available_counts
+            else None
+        ),
+        "fitness_history_selected_mean": (
+            float(np.mean(fitness_history_selected_counts))
+            if fitness_history_selected_counts
+            else None
+        ),
+        "fitness_history_effective_size_mean": (
+            float(np.mean(fitness_history_effective_sizes))
+            if fitness_history_effective_sizes
+            else None
+        ),
         "adaptive_coverage_admission_count": (
             adaptive_coverage_admission_count
         ),
@@ -1852,6 +2366,31 @@ def expert_metrics(timeline, labels, scoring=None):
                 "no_redundant_victim", 0
             )
         ),
+        "budget_replacement_no_positive_coverage_gain_count": (
+            budget_replacement_evaluation_outcomes.get(
+                "no_positive_coverage_gain", 0
+            )
+        ),
+        "budget_replacement_candidate_evicted_count": (
+            budget_replacement_evaluation_outcomes.get(
+                "candidate_evicted_minimum_coverage_loss", 0
+            )
+        ),
+        "budget_replacement_coverage_removal_loss_median": (
+            float(np.median(evaluated_coverage_removal_losses))
+            if evaluated_coverage_removal_losses
+            else None
+        ),
+        "budget_replacement_coverage_swap_gain_median": (
+            float(np.median(evaluated_coverage_swap_gains))
+            if evaluated_coverage_swap_gains
+            else None
+        ),
+        "budget_replacement_coverage_eviction_loss_median": (
+            float(np.median(evaluated_coverage_eviction_losses))
+            if evaluated_coverage_eviction_losses
+            else None
+        ),
         "budget_replacement_evaluated_new_coverage_fraction_median": (
             float(np.median(evaluated_new_coverage_fractions))
             if evaluated_new_coverage_fractions
@@ -1882,6 +2421,100 @@ def expert_metrics(timeline, labels, scoring=None):
         ),
         "bootstrap_selected_anomaly_count": (
             bootstrap_selected_anomaly_count
+        ),
+        "bootstrap_provisional_created_count": (
+            bootstrap_provisional_created_count
+        ),
+        "bootstrap_provisional_confirming_step_count": (
+            bootstrap_provisional_confirming_step_count
+        ),
+        "bootstrap_provisional_rolled_back_count": (
+            bootstrap_provisional_rolled_back_count
+        ),
+        "bootstrap_provisional_admitted_count": (
+            bootstrap_provisional_admitted_count
+        ),
+        "bootstrap_provisional_scoring_step_count": (
+            bootstrap_provisional_scoring_step_count
+        ),
+        "bootstrap_provisional_confirmation_delay_mean": (
+            float(np.mean(bootstrap_provisional_confirmation_delays))
+            if bootstrap_provisional_confirmation_delays
+            else None
+        ),
+        "bootstrap_confidence_created_count": (
+            bootstrap_confidence_created_count
+        ),
+        "bootstrap_confidence_update_count": (
+            bootstrap_confidence_update_count
+        ),
+        "bootstrap_confidence_first_positive_step": (
+            bootstrap_confidence_first_positive_step
+        ),
+        "bootstrap_confidence_final": (
+            bootstrap_confidence_values[-1]
+            if bootstrap_confidence_values
+            else None
+        ),
+        "bootstrap_confidence_max": (
+            max(bootstrap_confidence_values)
+            if bootstrap_confidence_values
+            else None
+        ),
+        "bootstrap_confidence_mean": (
+            float(np.mean(bootstrap_confidence_values))
+            if bootstrap_confidence_values
+            else None
+        ),
+        "bootstrap_confidence_anomaly_exposure": (
+            bootstrap_confidence_anomaly_exposure
+        ),
+        "bootstrap_confidence_member_anomaly_exposure": (
+            bootstrap_confidence_member_anomaly_exposure
+        ),
+        "bootstrap_confidence_member_anomaly_scoring_step_count": (
+            bootstrap_confidence_member_anomaly_scoring_step_count
+        ),
+        "bootstrap_reference_first_weighted_scoring_step": (
+            bootstrap_reference_first_weighted_scoring_step
+        ),
+        "bootstrap_reference_confidence_first_positive_step": (
+            bootstrap_reference_confidence_first_positive_step
+        ),
+        "bootstrap_reference_confidence_final": (
+            bootstrap_reference_confidence_values[-1]
+            if bootstrap_reference_confidence_values
+            else None
+        ),
+        "bootstrap_reference_confidence_max": (
+            max(bootstrap_reference_confidence_values)
+            if bootstrap_reference_confidence_values
+            else None
+        ),
+        "bootstrap_reference_confidence_mean": (
+            float(np.mean(bootstrap_reference_confidence_values))
+            if bootstrap_reference_confidence_values
+            else None
+        ),
+        "bootstrap_normality_confidence_final": (
+            bootstrap_normality_confidence_values[-1]
+            if bootstrap_normality_confidence_values
+            else None
+        ),
+        "bootstrap_normality_confidence_mean": (
+            float(np.mean(bootstrap_normality_confidence_values))
+            if bootstrap_normality_confidence_values
+            else None
+        ),
+        "bootstrap_prequential_support_mean": (
+            float(np.mean(bootstrap_prequential_support_values))
+            if bootstrap_prequential_support_values
+            else None
+        ),
+        "bootstrap_prequential_support_min": (
+            min(bootstrap_prequential_support_values)
+            if bootstrap_prequential_support_values
+            else None
         ),
     }
 
@@ -2235,6 +2868,10 @@ def write_step_diagnostics(
                     audit_record.get("novel_quarantine"),
                     ensure_ascii=False,
                 ),
+                "fitness_history_event": json.dumps(
+                    audit_record.get("fitness_history"),
+                    ensure_ascii=False,
+                ),
                 "photometric_gate_event": json.dumps(
                     audit_record.get("photometric_gate"),
                     ensure_ascii=False,
@@ -2269,6 +2906,37 @@ def write_step_diagnostics(
                 ),
                 "expert_lab_just_confirmed": expert_lab_profile.get(
                     "just_confirmed"
+                ),
+                "stable_lab_anchor_enabled": expert_lab_profile.get(
+                    "stable_lab_anchor_enabled"
+                ),
+                "stable_lab_anchor_frozen": expert_lab_profile.get(
+                    "anchor_frozen"
+                ),
+                "expert_lab_anchor_center": json.dumps(
+                    expert_lab_profile.get("lab_anchor_center"),
+                    ensure_ascii=False,
+                ),
+                "expert_lab_coverage_center": json.dumps(
+                    expert_lab_profile.get("lab_coverage_center"),
+                    ensure_ascii=False,
+                ),
+                "expert_lab_candidate_center": json.dumps(
+                    expert_lab_profile.get("candidate_lab_center"),
+                    ensure_ascii=False,
+                ),
+                "expert_lab_candidate_count": expert_lab_profile.get(
+                    "candidate_lab_count"
+                ),
+                "expert_lab_anchor_to_coverage_distance": (
+                    expert_lab_profile.get(
+                        "anchor_to_coverage_total_distance"
+                    )
+                ),
+                "expert_lab_anchor_to_candidate_distance": (
+                    expert_lab_profile.get(
+                        "anchor_to_candidate_total_distance"
+                    )
                 ),
                 "ms_score": (
                     audit_record.get(
@@ -2717,6 +3385,29 @@ def run_variant(
         "cold_start_required_members": cfg["models"][
             "dynamic_committee"
         ].get("cold_start_required_members"),
+        "cold_start_confidence_history": cfg["models"][
+            "dynamic_committee"
+        ].get("cold_start_confidence_history", 16),
+        "cold_start_reference_confidence_mode": cfg["models"][
+            "dynamic_committee"
+        ].get("cold_start_reference_confidence_mode", "state"),
+        "cold_start_provisional_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "cold_start_provisional_enabled", False
+            )
+        ),
+        "cold_start_provisional_confirm_steps": cfg["models"][
+            "dynamic_committee"
+        ].get("cold_start_provisional_confirm_steps", 2),
+        "cold_start_provisional_max_wait_steps": cfg["models"][
+            "dynamic_committee"
+        ].get("cold_start_provisional_max_wait_steps", 4),
+        "cold_start_provisional_weight": cfg["models"][
+            "dynamic_committee"
+        ].get("cold_start_provisional_weight", 0.25),
+        "cold_start_provisional_min_channel_support": cfg["models"][
+            "dynamic_committee"
+        ].get("cold_start_provisional_min_channel_support", 0.05),
         "photometric_candidate_enabled": bool(
             cfg["models"]["dynamic_committee"].get(
                 "photometric_candidate_enabled",
@@ -2799,12 +3490,73 @@ def run_variant(
                 "photometric_relevant_history_enabled", False
             )
         ),
+        "photometric_fitness_history_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "photometric_fitness_history_enabled", False
+            )
+        ),
+        "budget_coverage_loss_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "budget_coverage_loss_enabled", False
+            )
+        ),
+        "budget_coverage_min_loss_only": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "budget_coverage_min_loss_only", False
+            )
+        ),
+        "budget_coverage_joint_eviction_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "budget_coverage_joint_eviction_enabled", False
+            )
+        ),
+        "budget_patch_coverage_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "budget_patch_coverage_enabled", False
+            )
+        ),
+        "budget_patch_prototype_count": int(
+            cfg["models"]["dynamic_committee"].get(
+                "budget_patch_prototype_count", 32
+            )
+        ),
+        "budget_patch_victim_selection_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "budget_patch_victim_selection_enabled", False
+            )
+        ),
+        "budget_patch_kcenter_victim_selection_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "budget_patch_kcenter_victim_selection_enabled", False
+            )
+        ),
         "photometric_history_min": cfg["models"][
             "dynamic_committee"
         ].get("photometric_history_min"),
         "photometric_history_max": cfg["models"][
             "dynamic_committee"
         ].get("photometric_history_max"),
+        "photometric_state_registry_cap": cfg["models"][
+            "dynamic_committee"
+        ].get("photometric_state_registry_cap"),
+        "photometric_state_distribution_enabled": cfg["models"][
+            "dynamic_committee"
+        ].get("photometric_state_distribution_enabled", False),
+        "photometric_temporary_state_enabled": cfg["models"][
+            "dynamic_committee"
+        ].get("photometric_temporary_state_enabled", False),
+        "photometric_denstream_support_enabled": cfg["models"][
+            "dynamic_committee"
+        ].get("photometric_denstream_support_enabled", False),
+        "photometric_denstream_decay": cfg["models"][
+            "dynamic_committee"
+        ].get("photometric_denstream_decay", 0.9),
+        "photometric_denstream_mature_support": cfg["models"][
+            "dynamic_committee"
+        ].get("photometric_denstream_mature_support", 0.5),
+        "photometric_denstream_discard_support": cfg["models"][
+            "dynamic_committee"
+        ].get("photometric_denstream_discard_support", 0.05),
         "photometric_history_distance_threshold": cfg["models"][
             "dynamic_committee"
         ].get("photometric_history_distance_threshold"),
@@ -2822,6 +3574,11 @@ def run_variant(
         "photometric_adaptive_candidate_evidence": bool(
             cfg["models"]["dynamic_committee"].get(
                 "photometric_adaptive_candidate_evidence", False
+            )
+        ),
+        "photometric_stable_lab_anchor_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "photometric_stable_lab_anchor_enabled", False
             )
         ),
         "photometric_budget_replacement": bool(
