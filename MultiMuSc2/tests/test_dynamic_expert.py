@@ -112,6 +112,71 @@ class DynamicExpertManagerTest(unittest.TestCase):
         self.assertGreater(audit["mutual_fraction"], 0.0)
         self.assertLess(audit["mutual_fraction"], 1.0)
 
+    def test_cross_patch_reliability_preserves_uniform_low_support(self):
+        manager = DynamicExpertManager(
+            candidate_reliability_enabled=True,
+            candidate_patch_reliability_mode="cross_patch_robust",
+        )
+
+        reliability = manager._cross_patch_scoring_reliability(
+            torch.full((16,), 0.35)
+        )
+
+        self.assertTrue(torch.equal(reliability, torch.ones(16)))
+
+    def test_cross_patch_reliability_suppresses_only_low_outlier(self):
+        manager = DynamicExpertManager(
+            candidate_reliability_enabled=True,
+            candidate_patch_reliability_mode="cross_patch_robust",
+        )
+        support = torch.full((16,), 0.9)
+        support[-1] = 0.2
+
+        reliability = manager._cross_patch_scoring_reliability(support)
+
+        self.assertTrue(torch.equal(reliability[:-1], torch.ones(15)))
+        self.assertLess(float(reliability[-1]), 1.0)
+
+    def test_cross_patch_mode_separates_member_and_scoring_reliability(self):
+        manager = DynamicExpertManager(
+            candidate_reliability_enabled=True,
+            candidate_patch_reliability_mode="cross_patch_robust",
+            candidate_reliability_position_radius=0,
+        )
+        features = torch.eye(4)
+        members = [
+            self.reliability_member(manager, 0, features),
+            self.reliability_member(manager, 1, features.clone()),
+        ]
+        members[0]["channel_support"] = 0.2
+        members[1]["channel_support"] = 0.8
+
+        manager._refresh_candidate_reliabilities(members)
+
+        self.assertLess(
+            members[0]["member_reliability"],
+            members[1]["member_reliability"],
+        )
+        self.assertTrue(
+            torch.equal(
+                members[0]["scoring_patch_reliabilities"],
+                torch.ones(4),
+            )
+        )
+        self.assertEqual(
+            members[0]["reliability_audit"]["channel_evidence"],
+            0.2,
+        )
+
+    def test_rejects_unknown_patch_reliability_mode(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "candidate_patch_reliability_mode",
+        ):
+            DynamicExpertManager(
+                candidate_patch_reliability_mode="unknown",
+            )
+
     def test_soft_candidate_keeps_members_without_memory_patch_ids(self):
         manager = DynamicExpertManager(
             candidate_reliability_enabled=True,
@@ -412,6 +477,73 @@ class DynamicExpertManagerTest(unittest.TestCase):
         self.assertNotIn(
             events[2]["bootstrap"]["decision"],
             {"provisional_created", "admitted"},
+        )
+
+    def test_confidence_bootstrap_materializes_scoring_patch_reliability(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="confidence",
+            candidate_reliability_enabled=True,
+            candidate_patch_reliability_mode="cross_patch_robust",
+            min_cluster_support=10,
+            committee_cap=2,
+        )
+        reliability = torch.tensor([0.6, 0.9])
+        for step in range(2):
+            manager.advance(
+                step=step,
+                image_id=step,
+                dino_patch_features=patch_features(1.0, 0.0),
+                ms_score=0.1,
+                channel_support=1.0,
+                expert_channel_supports=(
+                    {} if step == 0 else {0: 1.0}
+                ),
+                patch_reliabilities=reliability,
+            )
+
+        expert = manager.active_experts[0]
+        self.assertEqual(
+            expert["scoring_patch_reliabilities"],
+            [1.0, 1.0],
+        )
+        training_members = manager.fuser_training_members(2)
+        self.assertEqual(len(training_members), 2)
+        self.assertTrue(
+            all(
+                member["scoring_patch_reliabilities"] == [1.0, 1.0]
+                for member in training_members
+            )
+        )
+        self.assertTrue(
+            any(
+                member["patch_reliabilities"]
+                != member["scoring_patch_reliabilities"]
+                for member in training_members
+            )
+        )
+
+    def test_legacy_reliability_leaves_bootstrap_scoring_unchanged(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="confidence",
+            candidate_reliability_enabled=True,
+            candidate_patch_reliability_mode="legacy_rank_product",
+            min_cluster_support=10,
+            committee_cap=2,
+        )
+
+        manager.advance(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            channel_support=1.0,
+            expert_channel_supports={},
+            patch_reliabilities=torch.tensor([0.6, 0.9]),
+        )
+
+        self.assertNotIn(
+            "scoring_patch_reliabilities",
+            manager.active_experts[0],
         )
 
     def test_confidence_cold_start_downweights_structural_risk_outlier(self):
@@ -853,6 +985,33 @@ class DynamicExpertManagerTest(unittest.TestCase):
         self.assertEqual(events[3]["admission_route"], "bootstrap")
         self.assertEqual(events[3]["bootstrap"]["pool_size"], 4)
         self.assertEqual(len(events[3]["bootstrap"]["selected_image_ids"]), 3)
+
+    def test_adaptive_bootstrap_materializes_scoring_patch_reliability(self):
+        manager = DynamicExpertManager(
+            cold_start_mode="adaptive",
+            cold_start_min_samples=4,
+            cold_start_max_samples=6,
+            cold_start_required_members=3,
+            candidate_reliability_enabled=True,
+            candidate_patch_reliability_mode="cross_patch_robust",
+        )
+        for step in range(4):
+            manager.advance(
+                step=step,
+                image_id=step,
+                dino_patch_features=patch_features(1.0, 0.0),
+                ms_score=None if step == 0 else 0.1,
+                channel_support=None if step == 0 else 1.0,
+                expert_channel_supports={},
+                patch_reliabilities=torch.tensor([0.6, 0.9]),
+            )
+
+        expert = manager.active_experts[0]
+        self.assertEqual(
+            expert["scoring_patch_reliabilities"],
+            [1.0, 1.0],
+        )
+        self.assertEqual(len(expert["reference_member_image_ids"]), 3)
 
     def test_bootstrap_expert_carries_lab_baseline(self):
         manager = DynamicExpertManager(

@@ -48,6 +48,7 @@ PRESSURE_VARIANTS = (
     "priority4_patch_kcenter_victim",
     "priority5_task_aware_virtual_swap",
     "priority5_task_aware_soft_reliability",
+    "priority5_task_aware_cross_patch_reliability",
 )
 
 

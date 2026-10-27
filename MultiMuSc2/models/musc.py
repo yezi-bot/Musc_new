@@ -821,6 +821,12 @@ class MuSc():
                                     'candidate_reliability_position_radius', 1
                                 )
                             ),
+                            'candidate_patch_reliability_mode': str(
+                                self.dynamic_committee_cfg.get(
+                                    'candidate_patch_reliability_mode',
+                                    'legacy_rank_product',
+                                )
+                            ),
                             'reference_reliability_penalty': float(
                                 self.dynamic_committee_cfg.get(
                                     'reference_reliability_penalty', 1.0

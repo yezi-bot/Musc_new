@@ -81,6 +81,19 @@ class GradualDriftLabAuditTest(unittest.TestCase):
             history_reentry["photometric_history_reentry_members"], 2
         )
 
+    def test_priority5_cross_patch_variant_preserves_legacy_comparator(self):
+        legacy = VARIANTS["priority5_task_aware_soft_reliability"]
+        cross_patch = VARIANTS[
+            "priority5_task_aware_cross_patch_reliability"
+        ]
+
+        self.assertNotIn("candidate_patch_reliability_mode", legacy)
+        self.assertEqual(
+            cross_patch["candidate_patch_reliability_mode"],
+            "cross_patch_robust",
+        )
+        self.assertTrue(cross_patch["candidate_reliability_enabled"])
+
     def test_state_ablation_variants_enable_mechanisms_incrementally(self):
         history = VARIANTS[
             "photometric_multistage_cap2_dual_replace_history_reentry"

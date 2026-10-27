@@ -143,6 +143,34 @@ def aggregate_reference_distances(
     )
     if not return_reliability_audit:
         return weighted_score
+    k_min, k_max, _ = safe_topmin_counts(
+        reference_count,
+        topmin_min,
+        topmin_max,
+    )
+    contributing_reference_indices = torch.topk(
+        weighted_nearest.float(),
+        k_max,
+        largest=False,
+        sorted=True,
+    ).indices[:, k_min:k_max]
+    contributing_reliabilities = selected_reliabilities.gather(
+        1,
+        contributing_reference_indices,
+    )
+    selected_reference_raw_counts = torch.bincount(
+        contributing_reference_indices.reshape(-1),
+        minlength=reference_count,
+    )
+    selected_reference_effective_weights = torch.zeros(
+        reference_count,
+        device=contributing_reliabilities.device,
+        dtype=contributing_reliabilities.dtype,
+    ).scatter_add(
+        0,
+        contributing_reference_indices.reshape(-1),
+        contributing_reliabilities.reshape(-1),
+    )
     return weighted_score, {
         "unweighted_distance": unweighted_score,
         "score_shift": weighted_score - unweighted_score,
@@ -156,6 +184,13 @@ def aggregate_reference_distances(
         "selection_changed_fraction": float(
             (selected_indices != raw_nearest_indices).float().mean()
         ),
+        "selected_reference_raw_counts": [
+            int(value) for value in selected_reference_raw_counts.tolist()
+        ],
+        "selected_reference_effective_weights": [
+            float(value)
+            for value in selected_reference_effective_weights.tolist()
+        ],
         "bank_reliability_mean": float(reliabilities.mean()),
         "bank_reliability_min": float(reliabilities.min()),
     }

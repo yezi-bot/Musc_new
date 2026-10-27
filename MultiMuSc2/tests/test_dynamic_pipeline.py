@@ -96,6 +96,53 @@ class DynamicPipelineTest(unittest.TestCase):
         self.assertEqual(audits[2]["active_committee_confidence"], 0.25)
         self.assertEqual(audits[2]["expert_image_ids"], [0])
 
+    def test_full_and_confidence_experts_report_actual_contributions(self):
+        dino = synthetic_features(3)
+        timeline = scoring_timeline(3)
+        timeline[2]["active_experts_before"] = [
+            {
+                "expert_id": 10,
+                "image_id": 0,
+                "cluster_id": 0,
+                "admission_step": 0,
+                "scoring_weight": 1.0,
+                "scoring_patch_reliabilities": [1.0] * 4,
+            },
+            {
+                "expert_id": 11,
+                "image_id": 1,
+                "cluster_id": 1,
+                "admission_step": 1,
+                "scoring_weight": 0.25,
+                "scoring_patch_reliabilities": [0.5] * 4,
+            },
+        ]
+
+        _, audits = score_dynamic_msm2_layer(
+            dino,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+        )
+
+        contributions = audits[2]["selected_reference_contributions"]
+        self.assertEqual(
+            [item["expert_id"] for item in contributions],
+            [10, 11],
+        )
+        self.assertEqual(
+            [item["blend_weight"] for item in contributions],
+            [0.75, 0.25],
+        )
+        self.assertEqual(
+            [item["raw_weight"] for item in contributions],
+            [3.0, 1.0],
+        )
+        self.assertEqual(
+            [item["effective_weight"] for item in contributions],
+            [3.0, 0.5],
+        )
+
     def test_confidence_state_is_strictly_historical_during_scoring(self):
         dino = synthetic_features(4)
         timeline = build_dynamic_committee_timeline(

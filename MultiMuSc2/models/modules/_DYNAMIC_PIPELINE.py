@@ -896,6 +896,12 @@ def _distance_audit(score_audit):
                 "reliability_selection_changed_fraction": reliability[
                     "selection_changed_fraction"
                 ],
+                "selected_reference_raw_counts": reliability[
+                    "selected_reference_raw_counts"
+                ],
+                "selected_reference_effective_weights": reliability[
+                    "selected_reference_effective_weights"
+                ],
                 "reference_bank_reliability_mean": reliability[
                     "bank_reliability_mean"
                 ],
@@ -905,6 +911,44 @@ def _distance_audit(score_audit):
             }
         )
     return result
+
+
+def _reference_contributions(
+    score_audit,
+    expert_ids,
+    blend_weight=1.0,
+):
+    reliability = (
+        score_audit.get("reference_reliability")
+        if score_audit is not None
+        else None
+    )
+    if reliability is None:
+        return []
+    raw_counts = reliability.get("selected_reference_raw_counts", [])
+    effective_weights = reliability.get(
+        "selected_reference_effective_weights", []
+    )
+    if not (
+        len(raw_counts) == len(expert_ids)
+        and len(effective_weights) == len(expert_ids)
+    ):
+        raise ValueError(
+            "reference contribution audit must align with expert ids"
+        )
+    return [
+        {
+            "expert_id": int(expert_id),
+            "raw_weight": float(raw) * float(blend_weight),
+            "effective_weight": float(effective) * float(blend_weight),
+            "blend_weight": float(blend_weight),
+        }
+        for expert_id, raw, effective in zip(
+            expert_ids,
+            raw_counts,
+            effective_weights,
+        )
+    ]
 
 
 def score_dynamic_msm2_layer(
@@ -1054,6 +1098,7 @@ def score_dynamic_msm2_layer(
         fallback_reason = None
         effective_mode = fusion_mode
         score_audit = None
+        reference_contributions = []
         fuser_retrained = False
         training_recomputed = False
         change_ratio = None
@@ -1098,6 +1143,7 @@ def score_dynamic_msm2_layer(
                 for index, weight in enumerate(active_expert_scoring_weights)
                 if weight < 1.0
             ]
+            confidence_reference_audits = []
             if full_expert_image_ids:
                 full_patch_reliabilities = (
                     active_patch_reliability_tensor.index_select(
@@ -1140,7 +1186,7 @@ def score_dynamic_msm2_layer(
                     if active_patch_reliability_tensor is not None
                     else None
                 )
-                confidence_score, _ = MSM2_online(
+                confidence_score, confidence_score_audit = MSM2_online(
                     current_dino,
                     None,
                     dino_features[[confidence_image_id]],
@@ -1157,6 +1203,45 @@ def score_dynamic_msm2_layer(
                     patch_score
                     + confidence_weight * (confidence_score - patch_score)
                 )
+                confidence_reference_audits.append(
+                    (
+                        confidence_index,
+                        confidence_weight,
+                        confidence_score_audit,
+                    )
+                )
+            remaining_blend_weight = 1.0
+            confidence_contributions = []
+            for (
+                confidence_index,
+                confidence_weight,
+                confidence_score_audit,
+            ) in reversed(confidence_reference_audits):
+                contribution_weight = (
+                    float(confidence_weight) * remaining_blend_weight
+                )
+                confidence_contributions.extend(
+                    _reference_contributions(
+                        confidence_score_audit,
+                        [active[confidence_index]["expert_id"]],
+                        blend_weight=contribution_weight,
+                    )
+                )
+                remaining_blend_weight *= 1.0 - float(confidence_weight)
+            if score_audit is not None:
+                reference_contributions.extend(
+                    _reference_contributions(
+                        score_audit,
+                        [
+                            active[index]["expert_id"]
+                            for index in full_expert_indices
+                        ],
+                        blend_weight=remaining_blend_weight,
+                    )
+                )
+            reference_contributions.extend(
+                reversed(confidence_contributions)
+            )
             if confidence_experts:
                 effective_mode = "dino_confidence_blend"
         elif fusion_mode == "clip_only":
@@ -1227,8 +1312,11 @@ def score_dynamic_msm2_layer(
                         [
                             torch.as_tensor(
                                 member.get(
-                                    "patch_reliabilities",
-                                    torch.ones(current_dino.shape[0]),
+                                    "scoring_patch_reliabilities",
+                                    member.get(
+                                        "patch_reliabilities",
+                                        torch.ones(current_dino.shape[0]),
+                                    ),
                                 ),
                                 device=current_dino.device,
                                 dtype=current_dino.dtype,
@@ -1531,7 +1619,14 @@ def score_dynamic_msm2_layer(
                 )
                 effective_mode = "dino_provisional"
 
+        if fusion_mode != "dino_only" and score_audit is not None:
+            reference_contributions = _reference_contributions(
+                score_audit,
+                [expert["expert_id"] for expert in active],
+            )
+
         if not torch.isfinite(patch_score).all():
+            reference_contributions = []
             if fusion_mode == "clip_only":
                 patch_score, fallback_reason = _strict_history_clip_fallback(
                     clip_features[step],
@@ -1567,6 +1662,11 @@ def score_dynamic_msm2_layer(
                 )
                 for values in active_expert_patch_reliabilities
             ],
+            "scored_reference_expert_ids": [
+                int(item["expert_id"])
+                for item in reference_contributions
+            ],
+            "selected_reference_contributions": reference_contributions,
             "active_committee_confidence": active_committee_confidence,
             "provisional_expert_image_id": (
                 int(provisional["image_id"])

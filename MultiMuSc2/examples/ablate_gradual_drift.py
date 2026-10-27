@@ -388,6 +388,10 @@ VARIANTS["priority5_task_aware_soft_reliability"] = {
     "candidate_reliability_position_radius": 1,
     "reference_reliability_penalty": 1.0,
 }
+VARIANTS["priority5_task_aware_cross_patch_reliability"] = {
+    **VARIANTS["priority5_task_aware_soft_reliability"],
+    "candidate_patch_reliability_mode": "cross_patch_robust",
+}
 VARIANTS["photometric_multistage_cap2_state_distribution_only"] = {
     **VARIANTS["photometric_multistage_cap2_dual_replace_history_reentry"],
     "photometric_state_distribution_enabled": True,
@@ -828,6 +832,12 @@ def configure_variant(
     )
     committee["candidate_reliability_position_radius"] = int(
         variant.get("candidate_reliability_position_radius", 1)
+    )
+    committee["candidate_patch_reliability_mode"] = str(
+        variant.get(
+            "candidate_patch_reliability_mode",
+            "legacy_rank_product",
+        )
     )
     committee["reference_reliability_penalty"] = float(
         variant.get("reference_reliability_penalty", 1.0)
@@ -2237,6 +2247,8 @@ def expert_metrics(
     effective_reference_weight_ratio = None
     polluted_effective_reference_weight = 0.0
     polluted_raw_reference_weight = 0.0
+    polluted_actual_selection_step_count = 0
+    polluted_reference_bank_fallback_step_count = 0
     polluted_effective_reference_weight_ratio = None
     polluted_reference_score_shift_mean = None
     polluted_reference_normal_score_shift_mean = None
@@ -2290,6 +2302,8 @@ def expert_metrics(
         raw_reference_weights = []
         polluted_effective_reference_weight = 0.0
         polluted_raw_reference_weight = 0.0
+        polluted_actual_selection_step_count = 0
+        polluted_reference_bank_fallback_step_count = 0
         polluted_reference_score_shifts = []
         polluted_reference_normal_score_shifts = []
         polluted_reference_anomaly_score_shifts = []
@@ -2338,17 +2352,37 @@ def expert_metrics(
             if effective_weight is not None and raw_weight is not None:
                 effective_reference_weights.append(float(effective_weight))
                 raw_reference_weights.append(float(raw_weight))
-            patch_reliability_means = scoring_record.get(
-                "active_expert_patch_reliability_means",
-                [1.0] * len(expert_ids),
+            reference_contributions = scoring_record.get(
+                "selected_reference_contributions", []
             )
-            for expert_id, patch_mean in zip(
-                expert_ids,
-                patch_reliability_means,
-            ):
-                if int(expert_id) in polluted_expert_ids:
-                    polluted_effective_reference_weight += float(patch_mean)
-                    polluted_raw_reference_weight += 1.0
+            if reference_contributions:
+                polluted_actual_selection_step_count += 1
+                for contribution in reference_contributions:
+                    if (
+                        int(contribution["expert_id"])
+                        in polluted_expert_ids
+                    ):
+                        polluted_effective_reference_weight += float(
+                            contribution["effective_weight"]
+                        )
+                        polluted_raw_reference_weight += float(
+                            contribution["raw_weight"]
+                        )
+            else:
+                polluted_reference_bank_fallback_step_count += 1
+                patch_reliability_means = scoring_record.get(
+                    "active_expert_patch_reliability_means",
+                    [1.0] * len(expert_ids),
+                )
+                for expert_id, patch_mean in zip(
+                    expert_ids,
+                    patch_reliability_means,
+                ):
+                    if int(expert_id) in polluted_expert_ids:
+                        polluted_effective_reference_weight += float(
+                            patch_mean
+                        )
+                        polluted_raw_reference_weight += 1.0
             if bootstrap_reference_first_weighted_scoring_step is None:
                 if any(
                     int(expert_id) in bootstrap_confidence_expert_ids
@@ -2495,6 +2529,12 @@ def expert_metrics(
             polluted_effective_reference_weight
         ),
         "polluted_raw_reference_weight": polluted_raw_reference_weight,
+        "polluted_actual_selection_step_count": (
+            polluted_actual_selection_step_count
+        ),
+        "polluted_reference_bank_fallback_step_count": (
+            polluted_reference_bank_fallback_step_count
+        ),
         "polluted_effective_reference_weight_ratio": (
             polluted_effective_reference_weight_ratio
         ),
@@ -3797,6 +3837,9 @@ def run_variant(
         "candidate_reliability_position_radius": cfg["models"][
             "dynamic_committee"
         ].get("candidate_reliability_position_radius"),
+        "candidate_patch_reliability_mode": cfg["models"][
+            "dynamic_committee"
+        ].get("candidate_patch_reliability_mode"),
         "reference_reliability_penalty": cfg["models"][
             "dynamic_committee"
         ].get("reference_reliability_penalty"),

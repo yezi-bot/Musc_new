@@ -162,6 +162,32 @@ class OnlineMSMTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(weighted, baseline))
 
+    def test_reliability_audit_groups_actual_selection_by_reference(self):
+        current = torch.tensor([[0.0, 0.0], [10.0, 0.0]])
+        references = torch.tensor(
+            [
+                [[0.0, 0.0], [0.0, 1.0]],
+                [[10.0, 0.0], [10.0, 1.0]],
+            ]
+        )
+        reliabilities = torch.tensor(
+            [[0.5, 0.9], [0.8, 0.9]]
+        )
+
+        _, audit = aggregate_reference_distances(
+            current,
+            references,
+            reference_patch_reliabilities=reliabilities,
+            reliability_penalty=0.0,
+            return_reliability_audit=True,
+        )
+
+        self.assertEqual(audit["selected_reference_raw_counts"], [1, 1])
+        np.testing.assert_allclose(
+            audit["selected_reference_effective_weights"],
+            [0.5, 0.8],
+        )
+
     def test_clip_only_returns_clip_distance(self):
         current = torch.zeros(2, 2)
         expert_dino = torch.full((1, 2, 2), 2.0)

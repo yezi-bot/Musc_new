@@ -59,6 +59,12 @@ models:
     budget_virtual_swap_max_normal_score_shift: 0.05
     budget_virtual_swap_max_iqr_increase: 0.05
     budget_virtual_swap_history_size: 32
+    candidate_reliability_enabled: false
+    candidate_reliability_floor: 0.1
+    candidate_unidirectional_weight: 0.25
+    candidate_reliability_position_radius: 1
+    candidate_patch_reliability_mode: legacy_rank_product
+    reference_reliability_penalty: 1.0
     budget_coverage_channel_weight: 1.0
     budget_coverage_lab_weight: 1.0
     budget_coverage_dino_weight: 1.0

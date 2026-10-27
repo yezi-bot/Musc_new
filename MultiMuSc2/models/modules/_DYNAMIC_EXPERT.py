@@ -109,6 +109,7 @@ class DynamicExpertManager:
     candidate_reliability_floor=0.1,
     candidate_unidirectional_weight=0.25,
     candidate_reliability_position_radius=1,
+    candidate_patch_reliability_mode="legacy_rank_product",
     reference_reliability_penalty=1.0,
     budget_coverage_channel_weight=1.0,
     budget_coverage_lab_weight=1.0,
@@ -454,6 +455,14 @@ class DynamicExpertManager:
             raise ValueError(
                 "candidate_reliability_position_radius must be non-negative"
             )
+      if candidate_patch_reliability_mode not in {
+            "legacy_rank_product",
+            "cross_patch_robust",
+      }:
+            raise ValueError(
+                "candidate_patch_reliability_mode must be "
+                "legacy_rank_product or cross_patch_robust"
+            )
       if reference_reliability_penalty < 0.0:
             raise ValueError(
                 "reference_reliability_penalty must be non-negative"
@@ -697,6 +706,9 @@ class DynamicExpertManager:
       )
       self.candidate_reliability_position_radius = int(
             candidate_reliability_position_radius
+      )
+      self.candidate_patch_reliability_mode = str(
+            candidate_patch_reliability_mode
       )
       self.reference_reliability_penalty = float(
             reference_reliability_penalty
@@ -1052,7 +1064,17 @@ class DynamicExpertManager:
                                         member["patch_reliabilities"],
                                         dtype=torch.float32,
                                     ).tolist()
-                                ]
+                                ],
+                                "scoring_patch_reliabilities": [
+                                    float(value)
+                                    for value in torch.as_tensor(
+                                        member.get(
+                                            "scoring_patch_reliabilities",
+                                            member["patch_reliabilities"],
+                                        ),
+                                        dtype=torch.float32,
+                                    ).tolist()
+                                ],
                             }
                             if member.get("patch_reliabilities") is not None
                             else {}
@@ -1292,15 +1314,62 @@ class DynamicExpertManager:
             "patch_count": int(features.shape[0]),
         }
 
-    def _bidirectional_member_support(self, left, right):
+    def _attach_candidate_reliability(
+        self,
+        member,
+        dino_patch_features,
+        patch_reliabilities,
+    ):
+        if (
+            not self.candidate_reliability_enabled
+            or self.candidate_patch_reliability_mode
+            != "cross_patch_robust"
+        ):
+            return
+        if patch_reliabilities is None:
+            patch_reliabilities = torch.ones(
+                dino_patch_features.shape[0],
+                dtype=torch.float32,
+            )
+        base = torch.as_tensor(
+            patch_reliabilities,
+            dtype=torch.float32,
+        ).detach().cpu()
+        if base.shape != (dino_patch_features.shape[0],):
+            raise ValueError(
+                "patch_reliabilities must contain one value per patch"
+            )
+        if not torch.isfinite(base).all():
+            raise ValueError("patch_reliabilities contain non-finite values")
+        if ((base <= 0.0) | (base > 1.0)).any():
+            raise ValueError("patch_reliabilities must be within (0, 1]")
+        member["base_patch_reliabilities"] = base
+        member["patch_reliabilities"] = base.clone()
+        member["scoring_patch_reliabilities"] = torch.ones_like(base)
+        member["reliability_patch_bank"] = self._candidate_patch_bank(
+            dino_patch_features,
+            base,
+        )
+        member["member_reliability"] = 0.5
+
+    def _bidirectional_member_support(
+        self,
+        left,
+        right,
+        *,
+        return_patch_support=False,
+    ):
         left_bank = left.get("reliability_patch_bank")
         right_bank = right.get("reliability_patch_bank")
         if left_bank is None or right_bank is None:
-            return 0.5, 0.5, {
+            audit = {
                 "mutual_fraction": 0.0,
                 "left_directional_support": 0.5,
                 "right_directional_support": 0.5,
             }
+            if return_patch_support:
+                return 0.5, 0.5, None, None, audit
+            return 0.5, 0.5, audit
         left_features = left_bank["features"]
         right_features = right_bank["features"]
         left_grid = math.isqrt(int(left_bank["patch_count"]))
@@ -1377,19 +1446,36 @@ class DynamicExpertManager:
         weak = self.candidate_unidirectional_weight
         left_weights = torch.where(left_mutual, 1.0, weak)
         right_weights = torch.where(right_mutual, 1.0, weak)
+        floor = self.candidate_reliability_floor
+        left_patch_support = torch.full_like(left_values, floor)
+        right_patch_support = torch.full_like(right_values, floor)
+        left_weighted_support = (
+            left_values[left_available] * left_weights[left_available]
+        )
+        right_weighted_support = (
+            right_values[right_available] * right_weights[right_available]
+        )
+        left_patch_support[left_available] = left_weighted_support.clamp(
+            min=floor,
+            max=1.0,
+        )
+        right_patch_support[right_available] = right_weighted_support.clamp(
+            min=floor,
+            max=1.0,
+        )
         left_support = (
-            float((left_values[left_available] * left_weights[left_available]).mean())
+            float(left_weighted_support.mean())
             if left_available.any()
-            else self.candidate_reliability_floor
+            else floor
         )
         right_support = (
-            float((right_values[right_available] * right_weights[right_available]).mean())
+            float(right_weighted_support.mean())
             if right_available.any()
-            else self.candidate_reliability_floor
+            else floor
         )
         mutual_count = int(left_mutual.sum())
         available_count = int(left_available.sum())
-        return left_support, right_support, {
+        audit = {
             "mutual_fraction": (
                 float(mutual_count / available_count)
                 if available_count
@@ -1398,23 +1484,63 @@ class DynamicExpertManager:
             "left_directional_support": left_support,
             "right_directional_support": right_support,
         }
+        if return_patch_support:
+            return (
+                left_support,
+                right_support,
+                left_patch_support,
+                right_patch_support,
+                audit,
+            )
+        return left_support, right_support, audit
+
+    def _cross_patch_scoring_reliability(self, patch_support):
+        support = torch.as_tensor(
+            patch_support,
+            dtype=torch.float32,
+        ).detach().cpu().clamp(
+            min=self.candidate_reliability_floor,
+            max=1.0,
+        )
+        center = support.median()
+        mad = (support - center).abs().median()
+        scale = max(float(1.4826 * mad), 0.02)
+        low_outlier_strength = (
+            (center - support) / scale - 2.5
+        ).clamp_min(0.0)
+        return (1.0 / (1.0 + low_outlier_strength)).clamp(
+            min=self.candidate_reliability_floor,
+            max=1.0,
+        )
 
     def _refresh_candidate_reliabilities(self, members):
         if not self.candidate_reliability_enabled or not members:
             return
         support_values = [[] for _ in members]
+        patch_support_values = [[] for _ in members]
         pair_audits = [[] for _ in members]
         for left_index, right_index in itertools.combinations(
             range(len(members)), 2
         ):
-            left_support, right_support, pair_audit = (
+            (
+                left_support,
+                right_support,
+                left_patch_support,
+                right_patch_support,
+                pair_audit,
+            ) = (
                 self._bidirectional_member_support(
                     members[left_index],
                     members[right_index],
+                    return_patch_support=True,
                 )
             )
             support_values[left_index].append(left_support)
             support_values[right_index].append(right_support)
+            if left_patch_support is not None:
+                patch_support_values[left_index].append(left_patch_support)
+            if right_patch_support is not None:
+                patch_support_values[right_index].append(right_patch_support)
             pair_audits[left_index].append(pair_audit)
             pair_audits[right_index].append(pair_audit)
 
@@ -1424,7 +1550,19 @@ class DynamicExpertManager:
             if base is None:
                 continue
             base = torch.as_tensor(base, dtype=torch.float32).cpu()
-            channel_evidence = float(base.mean())
+            if self.candidate_patch_reliability_mode == "cross_patch_robust":
+                channel_evidence = member.get("channel_support")
+                if channel_evidence is None:
+                    channel_evidence = member.get(
+                        "provisional_channel_support"
+                    )
+                channel_evidence = (
+                    float(channel_evidence)
+                    if channel_evidence is not None
+                    else 0.5
+                )
+            else:
+                channel_evidence = float(base.mean())
             threshold = member.get("historical_ms_threshold")
             score = member.get("ms_score")
             risk_evidence = 0.5
@@ -1458,8 +1596,26 @@ class DynamicExpertManager:
                 min=floor,
                 max=1.0,
             )
+            if self.candidate_patch_reliability_mode == "cross_patch_robust":
+                if patch_support_values[index]:
+                    cross_patch_support = torch.stack(
+                        patch_support_values[index],
+                        dim=0,
+                    ).mean(dim=0)
+                    scoring_reliability = (
+                        self._cross_patch_scoring_reliability(
+                            cross_patch_support
+                        )
+                    )
+                else:
+                    cross_patch_support = torch.ones_like(base)
+                    scoring_reliability = torch.ones_like(base)
+            else:
+                cross_patch_support = None
+                scoring_reliability = effective
             member["member_reliability"] = member_reliability
             member["patch_reliabilities"] = effective
+            member["scoring_patch_reliabilities"] = scoring_reliability
             patch_bank = member.get("reliability_patch_bank")
             if patch_bank is not None:
                 member["patch_prototypes"] = self._patch_coreset(
@@ -1473,6 +1629,25 @@ class DynamicExpertManager:
                 "member_reliability": member_reliability,
                 "patch_reliability_mean": float(effective.mean()),
                 "patch_reliability_min": float(effective.min()),
+                "scoring_patch_reliability_mean": float(
+                    scoring_reliability.mean()
+                ),
+                "scoring_patch_reliability_min": float(
+                    scoring_reliability.min()
+                ),
+                "cross_patch_support_mean": (
+                    float(cross_patch_support.mean())
+                    if cross_patch_support is not None
+                    else None
+                ),
+                "cross_patch_support_min": (
+                    float(cross_patch_support.min())
+                    if cross_patch_support is not None
+                    else None
+                ),
+                "patch_reliability_mode": (
+                    self.candidate_patch_reliability_mode
+                ),
                 "pair_support": pair_audits[index],
             }
 
@@ -1836,6 +2011,7 @@ class DynamicExpertManager:
         forced,
         confirmation_steps=0,
     ):
+        self._refresh_candidate_reliabilities(selected)
         medoid_index = int(similarities.mean(dim=1).argmax())
         representative = selected[medoid_index]
         cluster_id = len(self.clusters)
@@ -1868,6 +2044,37 @@ class DynamicExpertManager:
             "admission_route": "bootstrap",
             "lab_state": self._build_lab_state(selected, step=step),
         }
+        if (
+            self.candidate_reliability_enabled
+            and self.candidate_patch_reliability_mode
+            == "cross_patch_robust"
+        ):
+            expert["member_reliability"] = float(
+                representative.get("member_reliability", 1.0)
+            )
+            expert["scoring_patch_reliabilities"] = [
+                float(value)
+                for value in torch.as_tensor(
+                    representative.get(
+                        "scoring_patch_reliabilities",
+                        representative["patch_reliabilities"],
+                    ),
+                    dtype=torch.float32,
+                ).tolist()
+            ]
+            expert["reference_reliability_penalty"] = float(
+                self.reference_reliability_penalty
+            )
+            expert["reliability_audit"] = dict(
+                representative.get("reliability_audit", {})
+            )
+            expert["reference_member_image_ids"] = [
+                int(item["image_id"]) for item in selected
+            ]
+            expert["reference_member_reliabilities"] = [
+                float(item.get("member_reliability", 1.0))
+                for item in selected
+            ]
         self.active_experts.append(expert)
         self._register_expert_historical_state(expert, "active", step)
         self.admitted_count += 1
@@ -2103,6 +2310,7 @@ class DynamicExpertManager:
         ms_score,
         channel_support,
         lab_feature,
+        patch_reliabilities=None,
     ):
         member = {
             "step": int(step),
@@ -2120,6 +2328,11 @@ class DynamicExpertManager:
             "provisional_channel_support": None,
             "lab_feature": self._lab_feature(lab_feature),
         }
+        self._attach_candidate_reliability(
+            member,
+            dino_patch_features,
+            patch_reliabilities,
+        )
         prequential_profile = None
         if self.cold_start_reference_confidence_mode == "prequential":
             prequential_profile = self._bootstrap_prequential_profile(
@@ -2134,6 +2347,9 @@ class DynamicExpertManager:
         del self.bootstrap_confidence_members[
             :-self.cold_start_confidence_history
         ]
+        self._refresh_candidate_reliabilities(
+            self.bootstrap_confidence_members
+        )
         profile = self._bootstrap_confidence_profile(
             self.bootstrap_confidence_members
         )
@@ -2239,6 +2455,35 @@ class DynamicExpertManager:
             freeze_anchor=bool(profile["reference_confidence"] > 0.0),
             step=step,
         )
+        if (
+            self.candidate_reliability_enabled
+            and self.candidate_patch_reliability_mode
+            == "cross_patch_robust"
+        ):
+            expert["member_reliability"] = float(
+                representative.get("member_reliability", 1.0)
+            )
+            expert["scoring_patch_reliabilities"] = [
+                float(value)
+                for value in torch.as_tensor(
+                    representative.get(
+                        "scoring_patch_reliabilities",
+                        representative["patch_reliabilities"],
+                    ),
+                    dtype=torch.float32,
+                ).tolist()
+            ]
+            expert["reference_reliability_penalty"] = float(
+                self.reference_reliability_penalty
+            )
+            expert["reliability_audit"] = dict(
+                representative.get("reliability_audit", {})
+            )
+            expert["reference_member_image_ids"] = list(member_ids)
+            expert["reference_member_reliabilities"] = [
+                float(item.get("member_reliability", 1.0))
+                for item in self.bootstrap_confidence_members
+            ]
         self._register_expert_historical_state(expert, "active", step)
 
         self.last_bootstrap_event = {
@@ -2283,6 +2528,7 @@ class DynamicExpertManager:
         channel_support,
         provisional_channel_support,
         lab_feature,
+        patch_reliabilities=None,
     ):
         embedding = self._image_embedding(dino_patch_features)
         member = {
@@ -2301,6 +2547,11 @@ class DynamicExpertManager:
             "provisional_channel_support": provisional_channel_support,
             "lab_feature": self._lab_feature(lab_feature),
         }
+        self._attach_candidate_reliability(
+            member,
+            dino_patch_features,
+            patch_reliabilities,
+        )
 
         if self.bootstrap_provisional is not None:
             provisional = self.bootstrap_provisional
@@ -6272,7 +6523,10 @@ class DynamicExpertManager:
             restored_expert["scoring_patch_reliabilities"] = [
                 float(value)
                 for value in torch.as_tensor(
-                    representative["patch_reliabilities"],
+                    representative.get(
+                        "scoring_patch_reliabilities",
+                        representative["patch_reliabilities"],
+                    ),
                     dtype=torch.float32,
                 ).tolist()
             ]
@@ -7926,7 +8180,10 @@ class DynamicExpertManager:
             expert["scoring_patch_reliabilities"] = [
                 float(value)
                 for value in torch.as_tensor(
-                    member.get("patch_reliabilities"),
+                    member.get(
+                        "scoring_patch_reliabilities",
+                        member.get("patch_reliabilities"),
+                    ),
                     dtype=torch.float32,
                 ).tolist()
             ]
@@ -9543,7 +9800,10 @@ class DynamicExpertManager:
             expert["scoring_patch_reliabilities"] = [
                 float(value)
                 for value in torch.as_tensor(
-                    representative["patch_reliabilities"],
+                    representative.get(
+                        "scoring_patch_reliabilities",
+                        representative["patch_reliabilities"],
+                    ),
                     dtype=torch.float32,
                 ).tolist()
             ]
@@ -9716,6 +9976,7 @@ class DynamicExpertManager:
                     ms_score,
                     channel_support,
                     lab_feature,
+                    patch_reliabilities,
                 )
             elif not bootstrap_expert_exists:
                 (
@@ -9790,6 +10051,7 @@ class DynamicExpertManager:
                         ms_score,
                         channel_support,
                         lab_feature,
+                        patch_reliabilities,
                     )
                 elif not has_non_bootstrap_expert:
                     self.last_bootstrap_event = {
@@ -9826,6 +10088,7 @@ class DynamicExpertManager:
                 channel_support,
                 provisional_channel_support,
                 lab_feature,
+                patch_reliabilities,
             )
         else:
             (
