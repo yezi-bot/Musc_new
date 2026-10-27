@@ -59,6 +59,9 @@ def aggregate_reference_distances(
     references,
     topmin_min=0,
     topmin_max=0.3,
+    reference_patch_reliabilities=None,
+    reliability_penalty=1.0,
+    return_reliability_audit=False,
 ):
     if query.ndim != 2:
         raise ValueError("query must have shape [patch_count, feature_dim]")
@@ -70,6 +73,8 @@ def aggregate_reference_distances(
         raise ValueError("at least one reference image is required")
     if query.shape[1] != references.shape[2]:
         raise ValueError("query and references must have the same feature dimension")
+    if reliability_penalty < 0.0:
+        raise ValueError("reliability_penalty must be non-negative")
 
     patch_count = query.shape[0]
     reference_count, reference_patch_count, feature_dim = references.shape
@@ -81,8 +86,79 @@ def aggregate_reference_distances(
         reference_count,
         reference_patch_count,
     )
-    nearest_patch = distances.min(dim=-1).values
-    return interval_average(nearest_patch, topmin_min, topmin_max)
+    unweighted_nearest = distances.min(dim=-1).values
+    unweighted_score = interval_average(
+        unweighted_nearest,
+        topmin_min,
+        topmin_max,
+    )
+    if reference_patch_reliabilities is None:
+        if return_reliability_audit:
+            return unweighted_score, None
+        return unweighted_score
+
+    reliabilities = torch.as_tensor(
+        reference_patch_reliabilities,
+        device=distances.device,
+        dtype=distances.dtype,
+    )
+    if reliabilities.shape != (reference_count, reference_patch_count):
+        raise ValueError(
+            "reference_patch_reliabilities must match reference patch shape"
+        )
+    if not torch.isfinite(reliabilities).all():
+        raise ValueError("reference_patch_reliabilities contain non-finite values")
+    if ((reliabilities <= 0.0) | (reliabilities > 1.0)).any():
+        raise ValueError(
+            "reference_patch_reliabilities must be within (0, 1]"
+        )
+
+    raw_nearest_indices = distances.argmin(dim=-1)
+    reference_scale = (
+        torch.quantile(distances.float(), 0.75, dim=-1)
+        - unweighted_nearest.float()
+    ).clamp_min(torch.finfo(distances.dtype).eps)
+    selection_cost = distances + (
+        float(reliability_penalty)
+        * reference_scale[:, :, None]
+        * (reliabilities[None, :, :].reciprocal() - 1.0)
+    )
+    selected_indices = selection_cost.argmin(dim=-1)
+    weighted_nearest = distances.gather(
+        -1,
+        selected_indices.unsqueeze(-1),
+    ).squeeze(-1)
+    selected_reliabilities = reliabilities.unsqueeze(0).expand(
+        patch_count,
+        -1,
+        -1,
+    ).gather(
+        -1,
+        selected_indices.unsqueeze(-1),
+    ).squeeze(-1)
+    weighted_score = interval_average(
+        weighted_nearest,
+        topmin_min,
+        topmin_max,
+    )
+    if not return_reliability_audit:
+        return weighted_score
+    return weighted_score, {
+        "unweighted_distance": unweighted_score,
+        "score_shift": weighted_score - unweighted_score,
+        "reference_reliability_mean": float(selected_reliabilities.mean()),
+        "reference_reliability_min": float(selected_reliabilities.min()),
+        "low_reliability_fraction": float(
+            (selected_reliabilities < 0.5).float().mean()
+        ),
+        "effective_reference_weight": float(selected_reliabilities.sum()),
+        "raw_reference_weight": int(selected_reliabilities.numel()),
+        "selection_changed_fraction": float(
+            (selected_indices != raw_nearest_indices).float().mean()
+        ),
+        "bank_reliability_mean": float(reliabilities.mean()),
+        "bank_reliability_min": float(reliabilities.min()),
+    }
 
 
 def MSM2_online(
@@ -99,13 +175,23 @@ def MSM2_online(
     epsilon=1e-6,
     topmin_min=0,
     topmin_max=0.3,
+    dino_patch_reliabilities=None,
+    reliability_penalty=1.0,
 ):
-    dino_distance = aggregate_reference_distances(
+    dino_result = aggregate_reference_distances(
         current_dino,
         expert_dino,
         topmin_min,
         topmin_max,
+        reference_patch_reliabilities=dino_patch_reliabilities,
+        reliability_penalty=reliability_penalty,
+        return_reliability_audit=dino_patch_reliabilities is not None,
     )
+    if dino_patch_reliabilities is None:
+        dino_distance = dino_result
+        reliability_audit = None
+    else:
+        dino_distance, reliability_audit = dino_result
     if fusion_mode == "dino_only":
         return dino_distance, {
             "fusion_mode": fusion_mode,
@@ -113,6 +199,7 @@ def MSM2_online(
             "dino_distance": dino_distance,
             "clip_distance": None,
             "fuser_score": None,
+            "reference_reliability": reliability_audit,
         }
 
     if current_clip is None or expert_clip is None:
@@ -170,6 +257,7 @@ def MSM2_online(
         "dino_distance": dino_distance,
         "clip_distance": clip_distance,
         "fuser_score": fuser_score,
+        "reference_reliability": reliability_audit,
     }
     if fuser_score is not None:
         audit["fuser_min"] = float(fuser_score.min())
@@ -190,6 +278,7 @@ def build_causal_fuser_training_data(
     clip_weight=0.5,
     topmin_min=0,
     topmin_max=0.3,
+    training_dino_patch_reliabilities=None,
 ):
     member_count = len(image_ids)
     if training_dino.ndim != 3 or training_clip.ndim != 3:
@@ -205,6 +294,31 @@ def build_causal_fuser_training_data(
         raise ValueError("fuser training image IDs must be unique")
     if any(step >= current_step for step in member_steps):
         raise ValueError("fuser training members must be strictly historical")
+    if training_dino_patch_reliabilities is not None:
+        training_dino_patch_reliabilities = torch.as_tensor(
+            training_dino_patch_reliabilities,
+            device=training_dino.device,
+            dtype=training_dino.dtype,
+        )
+        if training_dino_patch_reliabilities.shape != (
+            member_count,
+            training_dino.shape[1],
+        ):
+            raise ValueError(
+                "training_dino_patch_reliabilities must match "
+                "training DINO image and patch counts"
+            )
+        if not torch.isfinite(training_dino_patch_reliabilities).all():
+            raise ValueError(
+                "training_dino_patch_reliabilities contain non-finite values"
+            )
+        if (
+            (training_dino_patch_reliabilities <= 0.0)
+            | (training_dino_patch_reliabilities > 1.0)
+        ).any():
+            raise ValueError(
+                "training_dino_patch_reliabilities must be within (0, 1]"
+            )
     if member_count < 2:
         return {
             "available": False,
@@ -228,6 +342,11 @@ def build_causal_fuser_training_data(
             training_dino[reference_indices],
             topmin_min,
             topmin_max,
+            reference_patch_reliabilities=(
+                training_dino_patch_reliabilities[reference_indices]
+                if training_dino_patch_reliabilities is not None
+                else None
+            ),
         )
         clip_distance = aggregate_reference_distances(
             training_clip[index],
@@ -270,6 +389,7 @@ def fit_causal_detect_fuser(
     clip_weight=0.5,
     topmin_min=0,
     topmin_max=0.3,
+    training_dino_patch_reliabilities=None,
 ):
     training = build_causal_fuser_training_data(
         training_dino,
@@ -281,6 +401,7 @@ def fit_causal_detect_fuser(
         clip_weight,
         topmin_min,
         topmin_max,
+        training_dino_patch_reliabilities,
     )
     if not training["available"]:
         training["fitted"] = False

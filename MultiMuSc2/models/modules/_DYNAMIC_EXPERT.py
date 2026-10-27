@@ -101,6 +101,15 @@ class DynamicExpertManager:
     budget_patch_prototype_count=32,
     budget_patch_victim_selection_enabled=False,
     budget_patch_kcenter_victim_selection_enabled=False,
+    budget_virtual_swap_enabled=False,
+    budget_virtual_swap_max_normal_score_shift=0.05,
+    budget_virtual_swap_max_iqr_increase=0.05,
+    budget_virtual_swap_history_size=32,
+    candidate_reliability_enabled=False,
+    candidate_reliability_floor=0.1,
+    candidate_unidirectional_weight=0.25,
+    candidate_reliability_position_radius=1,
+    reference_reliability_penalty=1.0,
     budget_coverage_channel_weight=1.0,
     budget_coverage_lab_weight=1.0,
     budget_coverage_dino_weight=1.0,
@@ -404,6 +413,18 @@ class DynamicExpertManager:
             raise ValueError(
                 "budget_replacement_margin must be within [0, 1]"
             )
+      if budget_virtual_swap_max_normal_score_shift < 0.0:
+            raise ValueError(
+                "budget_virtual_swap_max_normal_score_shift must be non-negative"
+            )
+      if budget_virtual_swap_max_iqr_increase < 0.0:
+            raise ValueError(
+                "budget_virtual_swap_max_iqr_increase must be non-negative"
+            )
+      if budget_virtual_swap_history_size < 1:
+            raise ValueError(
+                "budget_virtual_swap_history_size must be at least 1"
+            )
       coverage_weights = (
             budget_coverage_channel_weight,
             budget_coverage_lab_weight,
@@ -420,6 +441,22 @@ class DynamicExpertManager:
             raise ValueError(
                 "photometric_budget_admission_mode must be channel_only "
                 "or channel_or_lab"
+            )
+      if not 0.0 < candidate_reliability_floor <= 1.0:
+            raise ValueError(
+                "candidate_reliability_floor must be within (0, 1]"
+            )
+      if not 0.0 <= candidate_unidirectional_weight <= 1.0:
+            raise ValueError(
+                "candidate_unidirectional_weight must be within [0, 1]"
+            )
+      if candidate_reliability_position_radius < 0:
+            raise ValueError(
+                "candidate_reliability_position_radius must be non-negative"
+            )
+      if reference_reliability_penalty < 0.0:
+            raise ValueError(
+                "reference_reliability_penalty must be non-negative"
             )
       if not 0 <= minimum_active_experts <= committee_cap:
             raise ValueError(
@@ -637,6 +674,33 @@ class DynamicExpertManager:
       self.budget_patch_kcenter_victim_selection_enabled = bool(
             budget_patch_kcenter_victim_selection_enabled
       )
+      self.budget_virtual_swap_enabled = bool(
+            budget_virtual_swap_enabled
+      )
+      self.budget_virtual_swap_max_normal_score_shift = float(
+            budget_virtual_swap_max_normal_score_shift
+      )
+      self.budget_virtual_swap_max_iqr_increase = float(
+            budget_virtual_swap_max_iqr_increase
+      )
+      self.budget_virtual_swap_history_size = int(
+            budget_virtual_swap_history_size
+      )
+      self.candidate_reliability_enabled = bool(
+            candidate_reliability_enabled
+      )
+      self.candidate_reliability_floor = float(
+            candidate_reliability_floor
+      )
+      self.candidate_unidirectional_weight = float(
+            candidate_unidirectional_weight
+      )
+      self.candidate_reliability_position_radius = int(
+            candidate_reliability_position_radius
+      )
+      self.reference_reliability_penalty = float(
+            reference_reliability_penalty
+      )
       self.budget_coverage_channel_weight = float(
             budget_coverage_channel_weight
       )
@@ -834,6 +898,30 @@ class DynamicExpertManager:
                     float(weight)
                     for weight in expert.get("state_member_weights", [])
                 ]
+            if expert.get("scoring_patch_reliabilities") is not None:
+                snapshot["scoring_patch_reliabilities"] = list(
+                    expert["scoring_patch_reliabilities"]
+                )
+                snapshot["member_reliability"] = float(
+                    expert.get("member_reliability", 1.0)
+                )
+                snapshot["reference_reliability_penalty"] = float(
+                    expert.get("reference_reliability_penalty", 1.0)
+                )
+                snapshot["reference_member_image_ids"] = [
+                    int(value)
+                    for value in expert.get(
+                        "reference_member_image_ids",
+                        [expert["image_id"]],
+                    )
+                ]
+                snapshot["reference_member_reliabilities"] = [
+                    float(value)
+                    for value in expert.get(
+                        "reference_member_reliabilities",
+                        [expert.get("member_reliability", 1.0)],
+                    )
+                ]
             if expert.get("lab_state") is not None:
                 snapshot["lab_state"] = dict(expert["lab_state"])
             snapshots.append(snapshot)
@@ -924,6 +1012,15 @@ class DynamicExpertManager:
                     float(weight)
                     for weight in expert.get("state_member_weights", [])
                 ],
+                "member_reliability": expert.get("member_reliability"),
+                "scoring_patch_reliability_mean": (
+                    float(
+                        np.mean(expert["scoring_patch_reliabilities"])
+                    )
+                    if expert.get("scoring_patch_reliabilities")
+                    else None
+                ),
+                "reliability_audit": expert.get("reliability_audit"),
                 "lifecycle_state": expert.get(
                     "lifecycle_state", "active"
                 ),
@@ -947,6 +1044,19 @@ class DynamicExpertManager:
                             "step": member["step"],
                             "image_id": member["image_id"],
                             "cluster_id": cluster_id,
+                        **(
+                            {
+                                "patch_reliabilities": [
+                                    float(value)
+                                    for value in torch.as_tensor(
+                                        member["patch_reliabilities"],
+                                        dtype=torch.float32,
+                                    ).tolist()
+                                ]
+                            }
+                            if member.get("patch_reliabilities") is not None
+                            else {}
+                        ),
                         }
                     )
 
@@ -1079,7 +1189,12 @@ class DynamicExpertManager:
             dim=0,
         ).cpu()
 
-    def _patch_coreset(self, dino_patch_features, patch_ids=None):
+    def _patch_coreset(
+        self,
+        dino_patch_features,
+        patch_ids=None,
+        patch_reliabilities=None,
+    ):
         if not self.budget_patch_coverage_enabled:
             return None
         features = dino_patch_features.detach().float().cpu()
@@ -1088,12 +1203,28 @@ class DynamicExpertManager:
                 "dino_patch_features must have shape "
                 "[patch_count, feature_dim]"
             )
+        reliabilities = None
+        if patch_reliabilities is not None:
+            reliabilities = torch.as_tensor(
+                patch_reliabilities,
+                dtype=torch.float32,
+            ).detach().cpu()
+            if reliabilities.shape != (features.shape[0],):
+                raise ValueError(
+                    "patch_reliabilities must contain one value per patch"
+                )
+            if ((reliabilities <= 0.0) | (reliabilities > 1.0)).any():
+                raise ValueError(
+                    "patch_reliabilities must be within (0, 1]"
+                )
         if patch_ids:
             indices = torch.as_tensor(
                 sorted({int(patch_id) for patch_id in patch_ids}),
                 dtype=torch.long,
             )
             features = features.index_select(0, indices)
+            if reliabilities is not None:
+                reliabilities = reliabilities.index_select(0, indices)
         features = F.normalize(features, dim=1)
         budget = min(
             int(self.budget_patch_prototype_count),
@@ -1101,12 +1232,25 @@ class DynamicExpertManager:
         )
         if budget == int(features.shape[0]):
             return features
-        center = F.normalize(features.mean(dim=0), dim=0)
-        first = int((features @ center).argmax())
+        center = F.normalize(
+            (
+                features * reliabilities[:, None]
+                if reliabilities is not None
+                else features
+            ).sum(dim=0),
+            dim=0,
+        )
+        first_scores = features @ center
+        if reliabilities is not None:
+            first_scores = first_scores * reliabilities
+        first = int(first_scores.argmax())
         selected = [first]
         maximum_similarity = features @ features[first]
         for _ in range(1, budget):
-            next_index = int(maximum_similarity.argmin())
+            selection_score = maximum_similarity
+            if reliabilities is not None:
+                selection_score = selection_score + (1.0 - reliabilities)
+            next_index = int(selection_score.argmin())
             selected.append(next_index)
             maximum_similarity = torch.maximum(
                 maximum_similarity,
@@ -1116,6 +1260,235 @@ class DynamicExpertManager:
             0,
             torch.as_tensor(selected, dtype=torch.long),
         )
+
+    def _candidate_patch_bank(
+        self,
+        dino_patch_features,
+        patch_reliabilities,
+    ):
+        if not self.candidate_reliability_enabled:
+            return None
+        features = F.normalize(
+            dino_patch_features.detach().float().cpu(),
+            dim=1,
+        )
+        reliabilities = torch.as_tensor(
+            patch_reliabilities,
+            dtype=torch.float32,
+        ).detach().cpu()
+        if reliabilities.shape != (features.shape[0],):
+            raise ValueError(
+                "patch_reliabilities must contain one value per patch"
+            )
+        if not torch.isfinite(reliabilities).all():
+            raise ValueError("patch_reliabilities contain non-finite values")
+        if ((reliabilities <= 0.0) | (reliabilities > 1.0)).any():
+            raise ValueError("patch_reliabilities must be within (0, 1]")
+        patch_ids = torch.arange(features.shape[0], dtype=torch.long)
+        return {
+            "features": features,
+            "patch_ids": patch_ids,
+            "base_reliabilities": reliabilities,
+            "patch_count": int(features.shape[0]),
+        }
+
+    def _bidirectional_member_support(self, left, right):
+        left_bank = left.get("reliability_patch_bank")
+        right_bank = right.get("reliability_patch_bank")
+        if left_bank is None or right_bank is None:
+            return 0.5, 0.5, {
+                "mutual_fraction": 0.0,
+                "left_directional_support": 0.5,
+                "right_directional_support": 0.5,
+            }
+        left_features = left_bank["features"]
+        right_features = right_bank["features"]
+        left_grid = math.isqrt(int(left_bank["patch_count"]))
+        right_grid = math.isqrt(int(right_bank["patch_count"]))
+        if (
+            left_grid * left_grid != int(left_bank["patch_count"])
+            or right_grid != left_grid
+        ):
+            similarities = (left_features @ right_features.T).clamp(
+                0.0, 1.0
+            )
+            left_values, left_matches = similarities.max(dim=1)
+            right_values, right_matches = similarities.max(dim=0)
+        else:
+            radius = self.candidate_reliability_position_radius
+            patch_count = int(left_bank["patch_count"])
+            left_values = torch.full((patch_count,), -1.0)
+            right_values = torch.full((patch_count,), -1.0)
+            left_matches = torch.full((patch_count,), -1, dtype=torch.long)
+            right_matches = torch.full((patch_count,), -1, dtype=torch.long)
+            patch_grid = torch.arange(patch_count).reshape(
+                left_grid, left_grid
+            )
+            for row_delta in range(-radius, radius + 1):
+                for col_delta in range(-radius, radius + 1):
+                    left_row_start = max(0, -row_delta)
+                    left_row_end = left_grid - max(0, row_delta)
+                    left_col_start = max(0, -col_delta)
+                    left_col_end = left_grid - max(0, col_delta)
+                    right_row_start = left_row_start + row_delta
+                    right_row_end = left_row_end + row_delta
+                    right_col_start = left_col_start + col_delta
+                    right_col_end = left_col_end + col_delta
+                    left_indices = patch_grid[
+                        left_row_start:left_row_end,
+                        left_col_start:left_col_end,
+                    ].flatten()
+                    right_indices = patch_grid[
+                        right_row_start:right_row_end,
+                        right_col_start:right_col_end,
+                    ].flatten()
+                    values = (
+                        left_features.index_select(0, left_indices)
+                        * right_features.index_select(0, right_indices)
+                    ).sum(dim=1).clamp(0.0, 1.0)
+                    left_better = values > left_values[left_indices]
+                    left_values[left_indices[left_better]] = values[left_better]
+                    left_matches[left_indices[left_better]] = right_indices[
+                        left_better
+                    ]
+                    right_better = values > right_values[right_indices]
+                    right_values[right_indices[right_better]] = values[
+                        right_better
+                    ]
+                    right_matches[right_indices[right_better]] = left_indices[
+                        right_better
+                    ]
+        left_available = left_values >= 0.0
+        right_available = right_values >= 0.0
+        left_mutual = torch.zeros_like(left_available)
+        if left_available.any():
+            left_indices = torch.arange(left_values.numel())
+            left_mutual[left_available] = (
+                right_matches[left_matches[left_available]]
+                == left_indices[left_available]
+            )
+        right_mutual = torch.zeros_like(right_available)
+        if right_available.any():
+            right_indices = torch.arange(right_values.numel())
+            right_mutual[right_available] = (
+                left_matches[right_matches[right_available]]
+                == right_indices[right_available]
+            )
+        weak = self.candidate_unidirectional_weight
+        left_weights = torch.where(left_mutual, 1.0, weak)
+        right_weights = torch.where(right_mutual, 1.0, weak)
+        left_support = (
+            float((left_values[left_available] * left_weights[left_available]).mean())
+            if left_available.any()
+            else self.candidate_reliability_floor
+        )
+        right_support = (
+            float((right_values[right_available] * right_weights[right_available]).mean())
+            if right_available.any()
+            else self.candidate_reliability_floor
+        )
+        mutual_count = int(left_mutual.sum())
+        available_count = int(left_available.sum())
+        return left_support, right_support, {
+            "mutual_fraction": (
+                float(mutual_count / available_count)
+                if available_count
+                else 0.0
+            ),
+            "left_directional_support": left_support,
+            "right_directional_support": right_support,
+        }
+
+    def _refresh_candidate_reliabilities(self, members):
+        if not self.candidate_reliability_enabled or not members:
+            return
+        support_values = [[] for _ in members]
+        pair_audits = [[] for _ in members]
+        for left_index, right_index in itertools.combinations(
+            range(len(members)), 2
+        ):
+            left_support, right_support, pair_audit = (
+                self._bidirectional_member_support(
+                    members[left_index],
+                    members[right_index],
+                )
+            )
+            support_values[left_index].append(left_support)
+            support_values[right_index].append(right_support)
+            pair_audits[left_index].append(pair_audit)
+            pair_audits[right_index].append(pair_audit)
+
+        floor = self.candidate_reliability_floor
+        for index, member in enumerate(members):
+            base = member.get("base_patch_reliabilities")
+            if base is None:
+                continue
+            base = torch.as_tensor(base, dtype=torch.float32).cpu()
+            channel_evidence = float(base.mean())
+            threshold = member.get("historical_ms_threshold")
+            score = member.get("ms_score")
+            risk_evidence = 0.5
+            if (
+                threshold is not None
+                and score is not None
+                and float(threshold) > 0.0
+            ):
+                risk_ratio = float(score) / max(float(threshold), 1e-12)
+                risk_evidence = min(1.0, 1.0 / max(risk_ratio, 1e-12))
+            cross_support = (
+                float(np.mean(support_values[index]))
+                if support_values[index]
+                else 0.5
+            )
+            member_reliability = float(
+                max(
+                    floor,
+                    min(
+                        1.0,
+                        (
+                            max(channel_evidence, floor)
+                            * max(risk_evidence, floor)
+                            * max(cross_support, floor)
+                        )
+                        ** (1.0 / 3.0),
+                    ),
+                )
+            )
+            effective = (base * member_reliability).clamp(
+                min=floor,
+                max=1.0,
+            )
+            member["member_reliability"] = member_reliability
+            member["patch_reliabilities"] = effective
+            patch_bank = member.get("reliability_patch_bank")
+            if patch_bank is not None:
+                member["patch_prototypes"] = self._patch_coreset(
+                    patch_bank["features"],
+                    patch_reliabilities=effective,
+                )
+            member["reliability_audit"] = {
+                "channel_evidence": channel_evidence,
+                "risk_evidence": risk_evidence,
+                "bidirectional_support": cross_support,
+                "member_reliability": member_reliability,
+                "patch_reliability_mean": float(effective.mean()),
+                "patch_reliability_min": float(effective.min()),
+                "pair_support": pair_audits[index],
+            }
+
+    def _candidate_weighted_embedding_sum(self, members):
+        if not self.candidate_reliability_enabled:
+            return torch.stack(
+                [member["embedding"] for member in members]
+            ).sum(dim=0)
+        self._refresh_candidate_reliabilities(members)
+        return torch.stack(
+            [
+                member["embedding"]
+                * float(member.get("member_reliability", 1.0))
+                for member in members
+            ]
+        ).sum(dim=0)
 
     @staticmethod
     def _lab_feature(value):
@@ -1146,16 +1519,27 @@ class DynamicExpertManager:
         freeze_anchor=True,
         step=None,
     ):
-        features = [
-            member.get("lab_feature")
+        eligible_members = [
+            member
             for member in members
             if member.get("lab_feature") is not None
         ]
+        features = [member["lab_feature"] for member in eligible_members]
         if not self.cold_start_lab_enabled or len(features) != len(members):
             return None
 
         features = np.stack(features, axis=0)
-        center = np.median(features, axis=0)
+        if self.candidate_reliability_enabled:
+            weights = np.asarray(
+                [
+                    float(member.get("member_reliability", 1.0))
+                    for member in eligible_members
+                ],
+                dtype=np.float64,
+            )
+            center = np.average(features, axis=0, weights=weights)
+        else:
+            center = np.median(features, axis=0)
         profiles = [
             self._lab_distances(feature, center)
             for feature in features
@@ -3490,14 +3874,24 @@ class DynamicExpertManager:
         candidate_route="new_distribution",
         historical_ms_threshold=None,
         current_expert_supports=None,
+        patch_reliabilities=None,
     ):
-        return {
+        member = {
             "step": int(step),
             "image_id": int(image_id),
             "embedding": self._image_embedding(dino_patch_features),
             "patch_prototypes": self._patch_coreset(
                 dino_patch_features,
-                patch_ids=memory_patch_ids,
+                patch_ids=(
+                    None
+                    if self.candidate_reliability_enabled
+                    else memory_patch_ids
+                ),
+                patch_reliabilities=(
+                    patch_reliabilities
+                    if self.candidate_reliability_enabled
+                    else None
+                ),
             ),
             "quality": float(provisional_channel_support or 0.0),
             "ms_score": ms_score,
@@ -3518,8 +3912,40 @@ class DynamicExpertManager:
                 current_expert_supports
             ),
         }
+        if self.candidate_reliability_enabled:
+            if patch_reliabilities is None:
+                patch_reliabilities = torch.ones(
+                    dino_patch_features.shape[0],
+                    dtype=torch.float32,
+                )
+            base_reliabilities = torch.as_tensor(
+                patch_reliabilities,
+                dtype=torch.float32,
+            ).detach().cpu()
+            member["base_patch_reliabilities"] = base_reliabilities
+            member["patch_reliabilities"] = base_reliabilities.clone()
+            member["reliability_patch_bank"] = self._candidate_patch_bank(
+                dino_patch_features,
+                base_reliabilities,
+            )
+            member["member_reliability"] = 0.5
+        return member
 
     def _select_irbank_members(self, pool, min_keep=1):
+        if self.candidate_reliability_enabled:
+            eligible = list(pool)
+            self._refresh_candidate_reliabilities(eligible)
+            return sorted(
+                eligible,
+                key=lambda item: (
+                    float(item["ms_short_score"])
+                    / max(
+                        float(item.get("member_reliability", 1.0)),
+                        self.candidate_reliability_floor,
+                    ),
+                    int(item["step"]),
+                ),
+            )
         eligible = [
             member for member in pool if member.get("memory_patch_ids")
         ]
@@ -3811,6 +4237,9 @@ class DynamicExpertManager:
                     "memory_patch_ids": list(
                         member.get("memory_patch_ids", [])
                     ),
+                    "member_reliability": float(
+                        member.get("member_reliability", 1.0)
+                    ),
                 }
             )
         return records[-self.photometric_history_max:]
@@ -3821,7 +4250,22 @@ class DynamicExpertManager:
         lab_features = np.stack(
             [record["lab_feature"] for record in member_records], axis=0
         )
-        lab_center = np.median(lab_features, axis=0)
+        reliability_weights = np.asarray(
+            [
+                float(record.get("member_reliability", 1.0))
+                for record in member_records
+            ],
+            dtype=np.float64,
+        )
+        lab_center = (
+            np.average(
+                lab_features,
+                axis=0,
+                weights=reliability_weights,
+            )
+            if self.candidate_reliability_enabled
+            else np.median(lab_features, axis=0)
+        )
         profiles = [
             self._lab_distances(feature, lab_center)
             for feature in lab_features
@@ -3843,10 +4287,16 @@ class DynamicExpertManager:
                 float(floor),
             )
 
+        dino_stack = torch.stack(
+            [record["embedding"] for record in member_records]
+        )
+        if self.candidate_reliability_enabled:
+            dino_stack = dino_stack * torch.as_tensor(
+                reliability_weights,
+                dtype=dino_stack.dtype,
+            )[:, None]
         dino_center = F.normalize(
-            torch.stack(
-                [record["embedding"] for record in member_records]
-            ).sum(dim=0),
+            dino_stack.sum(dim=0),
             dim=0,
         ).detach().cpu()
         return {
@@ -3857,6 +4307,7 @@ class DynamicExpertManager:
             "member_image_ids": [
                 int(record["image_id"]) for record in member_records
             ],
+            "member_reliabilities": reliability_weights.tolist(),
         }
 
     def _record_state_lifecycle_event(
@@ -4295,6 +4746,14 @@ class DynamicExpertManager:
                 distribution["member_image_ids"]
                 if distribution is not None
                 else [int(record["image_id"]) for record in combined_records]
+            ),
+            "member_reliabilities": (
+                distribution.get("member_reliabilities", [])
+                if distribution is not None
+                else [
+                    float(record.get("member_reliability", 1.0))
+                    for record in combined_records
+                ]
             ),
             "l_radius": max(
                 float(l_threshold or 0.0), self.photometric_l_ewma_floor
@@ -5668,8 +6127,19 @@ class DynamicExpertManager:
                 candidate_evidence=candidate_evidence,
             )
             if expert_id is None:
+                self._update_matched_historical_state(
+                    history_match,
+                    candidate_members,
+                    step,
+                )
                 event["decision"] = "history_reentry_rejected"
-                event["reason"] = "historical_state_materialization_failed"
+                event["reason"] = (
+                    (self.last_budget_replacement_evaluation or {}).get(
+                        "outcome",
+                        "historical_state_materialization_failed",
+                    )
+                )
+                event["retained_in_history"] = True
                 self.last_history_reentry_event = event
                 return None, None
             new_expert = next(
@@ -5730,8 +6200,18 @@ class DynamicExpertManager:
                     replacement_audit,
                 )
             ):
+                self._update_matched_historical_state(
+                    history_match,
+                    candidate_members,
+                    step,
+                )
                 event["decision"] = "history_reentry_rejected"
-                event["reason"] = "replacement_failed"
+                event["reason"] = (
+                    (self.last_budget_replacement_evaluation or {}).get(
+                        "outcome", "replacement_failed"
+                    )
+                )
+                event["retained_in_history"] = True
                 self.last_history_reentry_event = event
                 return None, None
             event["victim_expert_id"] = int(victim_id)
@@ -5746,8 +6226,10 @@ class DynamicExpertManager:
             if key in existing_members:
                 continue
             cluster["members"].append(member)
-            cluster["embedding_sum"] += member["embedding"]
             existing_members.add(key)
+        cluster["embedding_sum"] = self._candidate_weighted_embedding_sum(
+            cluster["members"]
+        )
 
         representative = min(
             candidate_members,
@@ -5783,6 +6265,23 @@ class DynamicExpertManager:
             "reentry_from_expert_id": int(retired_expert["expert_id"]),
             "reentry_count": int(retired_expert.get("reentry_count", 0)) + 1,
         }
+        if self.candidate_reliability_enabled:
+            restored_expert["member_reliability"] = float(
+                representative.get("member_reliability", 1.0)
+            )
+            restored_expert["scoring_patch_reliabilities"] = [
+                float(value)
+                for value in torch.as_tensor(
+                    representative["patch_reliabilities"],
+                    dtype=torch.float32,
+                ).tolist()
+            ]
+            restored_expert["reference_reliability_penalty"] = float(
+                self.reference_reliability_penalty
+            )
+            restored_expert["reliability_audit"] = dict(
+                representative.get("reliability_audit", {})
+            )
         cluster["active_expert_id"] = expert_id
         self.active_experts.append(restored_expert)
         self._register_expert_historical_state(
@@ -6300,6 +6799,312 @@ class DynamicExpertManager:
             }
         return profiles
 
+    def _virtual_entity_support(self, record, entity):
+        """Estimate scoring-task support for a virtual committee member."""
+        expert_id = entity.get("expert_id")
+        if expert_id is None:
+            channel_score = 0.0
+        else:
+            threshold = record.get("support_threshold")
+            support = record.get("supports", {}).get(expert_id)
+            channel_score = (
+                min(
+                    max(float(support) / max(float(threshold), 1e-12), 0.0),
+                    1.0,
+                )
+                if support is not None and threshold is not None
+                else 0.0
+            )
+
+        lab_feature = record.get("lab_feature")
+        lab_center = entity.get("lab_center")
+        if lab_feature is None or lab_center is None:
+            lab_score = 0.0
+        else:
+            distances = self._lab_distances(
+                np.asarray(lab_feature, dtype=np.float64), lab_center
+            )
+            relative = max(
+                distances["l_distance"]
+                / max(float(entity.get("lab_l_scale") or 0.0),
+                      self.photometric_l_ewma_floor),
+                distances["ab_distance"]
+                / max(float(entity.get("lab_ab_scale") or 0.0),
+                      self.photometric_ab_ewma_floor),
+            )
+            lab_score = float(math.exp(-relative))
+
+        record_prototypes = record.get("patch_prototypes")
+        entity_prototypes = entity.get("patch_prototypes")
+        embedding = record.get("embedding")
+        entity_embedding = entity.get("embedding")
+        if record_prototypes is not None and entity_prototypes is not None:
+            similarities = record_prototypes @ entity_prototypes.T
+            dino_score = float(
+                ((similarities.max(dim=1).values + 1.0) / 2.0)
+                .clamp(0.0, 1.0)
+                .mean()
+            )
+        elif embedding is not None and entity_embedding is not None:
+            similarity = float(
+                F.normalize(embedding, dim=0) @ entity_embedding
+            )
+            dino_score = min(max((similarity + 1.0) / 2.0, 0.0), 1.0)
+        else:
+            dino_score = 0.0
+
+        if record_prototypes is not None and entity_prototypes is not None:
+            return dino_score
+        if embedding is not None and entity_embedding is not None:
+            return dino_score
+        if channel_score > 0.0:
+            return channel_score
+        return lab_score
+
+    def _historical_revisit_records(self):
+        records = []
+        for state in self.historical_states:
+            state_records = list(state.get("member_records", []))
+            if not state_records:
+                state_records = [
+                    {
+                        "step": int(state.get("last_seen_step", self.last_step)),
+                        "image_id": -int(state["state_id"]) - 1,
+                        "lab_feature": state.get("lab_center"),
+                        "embedding": state.get("dino_center"),
+                    }
+                ]
+            for record in state_records:
+                if (
+                    record.get("lab_feature") is None
+                    or record.get("embedding") is None
+                ):
+                    continue
+                records.append(
+                    {
+                        "state_id": int(state["state_id"]),
+                        "step": int(record.get("step", self.last_step)),
+                        "image_id": int(record.get("image_id", -1)),
+                        "support_threshold": None,
+                        "supports": {},
+                        "embedding": record.get("embedding"),
+                        "patch_prototypes": None,
+                        "lab_feature": record.get("lab_feature"),
+                    }
+                )
+        return records
+
+    def _virtual_candidate_records(self, candidate_members, support_threshold):
+        records = []
+        for member in candidate_members:
+            embedding = member.get("embedding")
+            patch_prototypes = member.get("patch_prototypes")
+            if embedding is None and patch_prototypes is None:
+                continue
+            records.append(
+                {
+                    "step": int(member.get("step", self.last_step)),
+                    "image_id": int(member["image_id"]),
+                    "support_threshold": support_threshold,
+                    "supports": dict(
+                        member.get("current_expert_supports", {})
+                    ),
+                    "embedding": embedding,
+                    "patch_prototypes": patch_prototypes,
+                    "lab_feature": member.get("lab_feature"),
+                }
+            )
+        return records
+
+    def _virtual_swap_profiles(
+        self, candidate_members, support_threshold, candidate_evidence=None
+    ):
+        """Evaluate each victim on trusted history before committing a swap."""
+        records = list(self.coverage_history)[
+            -self.budget_virtual_swap_history_size :
+        ]
+        if not records or not self.active_experts:
+            return {}
+
+        expert_entities = {
+            int(expert["expert_id"]): self._coverage_loss_expert_entity(expert)
+            for expert in self.active_experts
+        }
+        candidate_entity = self._coverage_loss_candidate_entity(
+            candidate_members
+        )
+        baseline_entities = list(expert_entities.values())
+        baseline_support = np.asarray(
+            [
+                max(
+                    self._virtual_entity_support(record, entity)
+                    for entity in baseline_entities
+                )
+                for record in records
+            ],
+            dtype=np.float64,
+        )
+        baseline_scores = 1.0 - baseline_support
+        baseline_iqr = float(
+            np.percentile(baseline_scores, 75)
+            - np.percentile(baseline_scores, 25)
+        )
+        revisit_records = self._historical_revisit_records()
+        candidate_records = self._virtual_candidate_records(
+            candidate_members, support_threshold
+        )
+        baseline_revisit_support = np.asarray(
+            [
+                max(
+                    self._virtual_entity_support(record, entity)
+                    for entity in baseline_entities
+                )
+                for record in revisit_records
+            ],
+            dtype=np.float64,
+        )
+        profiles = {}
+        for victim_id in expert_entities:
+            retained = [
+                entity
+                for entity_id, entity in expert_entities.items()
+                if entity_id != victim_id
+            ]
+            swapped_entities = retained + [candidate_entity]
+            swapped_support = np.asarray(
+                [
+                    max(
+                        self._virtual_entity_support(record, entity)
+                        for entity in swapped_entities
+                    )
+                    for record in records
+                ],
+                dtype=np.float64,
+            )
+            swapped_scores = 1.0 - swapped_support
+            score_delta = swapped_scores - baseline_scores
+            swapped_iqr = float(
+                np.percentile(swapped_scores, 75)
+                - np.percentile(swapped_scores, 25)
+            )
+            current_count = min(8, len(records))
+            recent_support_loss = float(
+                np.mean(
+                    np.maximum(
+                        baseline_support[-current_count:]
+                        - swapped_support[-current_count:],
+                        0.0,
+                    )
+                )
+            )
+            if candidate_records:
+                baseline_candidate_support = np.asarray(
+                    [
+                        max(
+                            self._virtual_entity_support(record, entity)
+                            for entity in baseline_entities
+                        )
+                        for record in candidate_records
+                    ],
+                    dtype=np.float64,
+                )
+                swapped_candidate_support = np.asarray(
+                    [
+                        max(
+                            self._virtual_entity_support(record, entity)
+                            for entity in swapped_entities
+                        )
+                        for record in candidate_records
+                    ],
+                    dtype=np.float64,
+                )
+                current_support_gain = float(
+                    np.mean(
+                        np.maximum(
+                            swapped_candidate_support
+                            - baseline_candidate_support,
+                            0.0,
+                        )
+                    )
+                )
+                current_support_loss = float(
+                    np.mean(
+                        np.maximum(
+                            baseline_candidate_support
+                            - swapped_candidate_support,
+                            0.0,
+                        )
+                    )
+                )
+            else:
+                current_support_gain = 0.0
+                current_support_loss = 0.0
+            if revisit_records:
+                swapped_revisit_support = np.asarray(
+                    [
+                        max(
+                            self._virtual_entity_support(record, entity)
+                            for entity in swapped_entities
+                        )
+                        for record in revisit_records
+                    ],
+                    dtype=np.float64,
+                )
+                recurrent_loss = float(
+                    np.mean(
+                        np.maximum(
+                            baseline_revisit_support
+                            - swapped_revisit_support,
+                            0.0,
+                        )
+                    )
+                )
+            else:
+                recurrent_loss = 0.0
+            median_shift = float(np.median(score_delta))
+            mean_shift = float(np.mean(score_delta))
+            iqr_increase = float(max(0.0, swapped_iqr - baseline_iqr))
+            support_loss = float(
+                np.mean(np.maximum(baseline_support - swapped_support, 0.0))
+            )
+            task_cost = float(
+                max(
+                    support_loss,
+                    recent_support_loss,
+                    current_support_loss,
+                    recurrent_loss,
+                )
+                + iqr_increase
+            )
+            net_task_gain = float(current_support_gain - task_cost)
+            safe = bool(
+                mean_shift
+                <= self.budget_virtual_swap_max_normal_score_shift
+                and iqr_increase
+                <= self.budget_virtual_swap_max_iqr_increase
+                and current_support_loss
+                <= self.budget_virtual_swap_max_normal_score_shift
+                and recurrent_loss
+                <= self.budget_virtual_swap_max_normal_score_shift
+            )
+            profiles[int(victim_id)] = {
+                "history_count": int(len(records)),
+                "median_normal_score_shift": median_shift,
+                "mean_normal_score_shift": mean_shift,
+                "normal_score_iqr_increase": iqr_increase,
+                "normal_support_loss": support_loss,
+                "current_state_support_loss": current_support_loss,
+                "current_state_support_gain": current_support_gain,
+                "recent_normal_support_loss": recent_support_loss,
+                "recurrent_state_loss": recurrent_loss,
+                "historical_revisit_count": int(len(revisit_records)),
+                "task_cost": task_cost,
+                "net_task_gain": net_task_gain,
+                "max_normal_score_shift": float(np.max(score_delta)),
+                "safe": safe,
+            }
+        return profiles
+
     def _expert_contribution_profiles(
         self,
         coverage_profiles,
@@ -6498,6 +7303,45 @@ class DynamicExpertManager:
             self.last_budget_replacement_evaluation = evaluation
             return None, None
 
+        virtual_swap_profiles = None
+        safe_virtual_victim_ids = None
+        if self.budget_virtual_swap_enabled:
+            task_new_coverage = bool(
+                channel_novel or lab_novel or history_novel
+            )
+            evaluation["task_new_coverage"] = bool(task_new_coverage)
+            virtual_swap_profiles = self._virtual_swap_profiles(
+                candidate_members,
+                support_threshold,
+                candidate_evidence=candidate_evidence,
+            )
+            evaluation["virtual_swap_enabled"] = True
+            evaluation["virtual_swap_profiles"] = virtual_swap_profiles
+            if not virtual_swap_profiles:
+                evaluation["outcome"] = "virtual_swap_insufficient_history"
+                self.last_budget_replacement_evaluation = evaluation
+                return None, None
+            safe_virtual_victim_ids = {
+                int(expert_id)
+                for expert_id, profile in virtual_swap_profiles.items()
+                if profile.get("safe", False)
+                and profile.get("net_task_gain", 0.0) > 0.0
+            }
+            if not safe_virtual_victim_ids:
+                has_safe_profile = any(
+                    profile.get("safe", False)
+                    for profile in virtual_swap_profiles.values()
+                )
+                evaluation["outcome"] = (
+                    "virtual_swap_no_positive_task_gain"
+                    if has_safe_profile
+                    else "virtual_swap_rejected"
+                )
+                self.last_budget_replacement_evaluation = evaluation
+                return None, None
+        else:
+            evaluation["virtual_swap_enabled"] = False
+
         coverage_profiles = self._expert_coverage_profiles()
         lab_uniqueness_profiles = self._expert_lab_uniqueness_profiles()
         if self.budget_coverage_loss_enabled:
@@ -6510,7 +7354,13 @@ class DynamicExpertManager:
                     for expert in self.active_experts
                 }
                 ranked_entity_ids = sorted(
-                    joint_profiles,
+                    [
+                        entity_id
+                        for entity_id in joint_profiles
+                        if entity_id == "candidate"
+                        or safe_virtual_victim_ids is None
+                        or int(entity_id) in safe_virtual_victim_ids
+                    ],
                     key=lambda entity_id: (
                         joint_profiles[entity_id]["eviction_loss"],
                         entity_id != "candidate",
@@ -6603,9 +7453,19 @@ class DynamicExpertManager:
                     candidate_members, support_threshold
                 )
             )
+            replacement_candidates = [
+                expert
+                for expert in self.active_experts
+                if safe_virtual_victim_ids is None
+                or int(expert["expert_id"]) in safe_virtual_victim_ids
+            ]
+            if not replacement_candidates:
+                evaluation["outcome"] = "virtual_swap_rejected"
+                self.last_budget_replacement_evaluation = evaluation
+                return None, None
             if self.budget_coverage_min_loss_only:
                 ranked = sorted(
-                    self.active_experts,
+                    replacement_candidates,
                     key=lambda expert: (
                         coverage_loss_profiles[int(expert["expert_id"])][
                             "removal_loss"
@@ -6618,7 +7478,7 @@ class DynamicExpertManager:
                 )
             else:
                 ranked = sorted(
-                    self.active_experts,
+                    replacement_candidates,
                     key=lambda expert: (
                         -coverage_loss_profiles[int(expert["expert_id"])][
                             "swap_gain"
@@ -6721,7 +7581,8 @@ class DynamicExpertManager:
             lab_profile = lab_uniqueness_profiles[expert_id]
             expert_contribution = expert_contributions[expert_id]
             replaceable = bool(
-                candidate_contribution["contribution_score"]
+                self.budget_virtual_swap_enabled
+                or candidate_contribution["contribution_score"]
                 > expert_contribution["contribution_score"]
                 + self.budget_replacement_margin
             )
@@ -6741,16 +7602,49 @@ class DynamicExpertManager:
             self.last_budget_replacement_evaluation = evaluation
             return None, None
 
+        if safe_virtual_victim_ids is not None:
+            eligible = [
+                item
+                for item in eligible
+                if int(item[0]["expert_id"]) in safe_virtual_victim_ids
+            ]
+            if not eligible:
+                evaluation["outcome"] = "virtual_swap_rejected"
+                self.last_budget_replacement_evaluation = evaluation
+                return None, None
+
         lab_aware_replacement = bool(
             photometric_route
             and self.photometric_budget_admission_mode == "channel_or_lab"
         )
         patch_victim_profile = None
+        semantic_replacement_losses = None
         use_patch_victim_selection = bool(
             self.budget_patch_victim_selection_enabled
             and (channel_novel or history_novel)
         )
         if use_patch_victim_selection:
+            semantic_replacement_losses = {
+                int(item[0]["expert_id"]): {
+                    "channel_loss": max(
+                        0.0,
+                        item[3]["channel_unique_score"]
+                        - candidate_contribution[
+                            "channel_new_coverage_score"
+                        ],
+                    ),
+                    "lab_loss": max(
+                        0.0,
+                        item[3]["lab_unique_score"]
+                        - candidate_contribution["lab_unique_score"],
+                    ),
+                }
+                for item in eligible
+            }
+            for profile in semantic_replacement_losses.values():
+                profile["total_loss"] = (
+                    profile["channel_loss"] + profile["lab_loss"]
+                )
             if self.budget_patch_kcenter_victim_selection_enabled:
                 joint_profiles = self._patch_kcenter_eviction_profiles(
                     candidate_members, support_threshold
@@ -6767,6 +7661,17 @@ class DynamicExpertManager:
             ) = min(
                 eligible,
                 key=lambda item: (
+                    (
+                        virtual_swap_profiles[
+                            int(item[0]["expert_id"])
+                        ]["net_task_gain"]
+                        * -1.0
+                        if virtual_swap_profiles is not None
+                        else 0.0
+                    ),
+                    semantic_replacement_losses[
+                        int(item[0]["expert_id"])
+                    ]["total_loss"],
                     joint_profiles[int(item[0]["expert_id"])][
                         "eviction_loss"
                     ],
@@ -6816,6 +7721,16 @@ class DynamicExpertManager:
                 "expert_coverage_profiles": coverage_profiles,
                 "expert_lab_uniqueness_profiles": lab_uniqueness_profiles,
                 "expert_contribution_profiles": expert_contributions,
+                "semantic_replacement_losses": (
+                    semantic_replacement_losses
+                    if use_patch_victim_selection
+                    else None
+                ),
+                "semantic_selection_mode": (
+                    "minimum_uncovered_channel_lab_loss"
+                    if use_patch_victim_selection
+                    else None
+                ),
                 "coverage_selection_mode": (
                     "patch_kcenter_minimum_victim_loss"
                     if (
@@ -6834,6 +7749,11 @@ class DynamicExpertManager:
                 "coverage_eviction_loss": (
                     float(patch_victim_profile["eviction_loss"])
                     if patch_victim_profile is not None
+                    else None
+                ),
+                "virtual_swap_selected_victim": (
+                    virtual_swap_profiles.get(int(victim["expert_id"]))
+                    if virtual_swap_profiles is not None
                     else None
                 ),
             }
@@ -6941,6 +7861,7 @@ class DynamicExpertManager:
         candidate_evidence=None,
     ):
         cluster_members = list(cluster_members or [member])
+        self._refresh_candidate_reliabilities(cluster_members)
         if len(self.active_experts) >= self.committee_cap:
             replacement_expert_id, replacement_audit = (
                 self._select_budget_replacement(
@@ -6963,9 +7884,9 @@ class DynamicExpertManager:
         cluster_id = len(self.clusters)
         self.clusters.append(
             {
-                "embedding_sum": torch.stack(
-                    [item["embedding"] for item in cluster_members]
-                ).sum(dim=0),
+                "embedding_sum": self._candidate_weighted_embedding_sum(
+                    cluster_members
+                ),
                 "members": cluster_members,
                 "active_expert_id": self.next_expert_id,
             }
@@ -6998,6 +7919,30 @@ class DynamicExpertManager:
                 "channel_support"
             ],
         }
+        if self.candidate_reliability_enabled:
+            expert["member_reliability"] = float(
+                member.get("member_reliability", 1.0)
+            )
+            expert["scoring_patch_reliabilities"] = [
+                float(value)
+                for value in torch.as_tensor(
+                    member.get("patch_reliabilities"),
+                    dtype=torch.float32,
+                ).tolist()
+            ]
+            expert["reference_reliability_penalty"] = float(
+                self.reference_reliability_penalty
+            )
+            expert["reliability_audit"] = dict(
+                member.get("reliability_audit", {})
+            )
+            expert["reference_member_image_ids"] = [
+                int(item["image_id"]) for item in cluster_members
+            ]
+            expert["reference_member_reliabilities"] = [
+                float(item.get("member_reliability", 1.0))
+                for item in cluster_members
+            ]
         self.active_experts.append(expert)
         self._register_expert_historical_state(
             expert,
@@ -7033,6 +7978,7 @@ class DynamicExpertManager:
         historical_ms_threshold=None,
         current_expert_supports=None,
         support_threshold=None,
+        patch_reliabilities=None,
     ):
         self.last_novel_quarantine_event = None
         if self.novel_admission_mode not in {
@@ -7054,8 +8000,9 @@ class DynamicExpertManager:
             ms_short_ratio,
             channel_support,
             provisional_channel_support,
-            memory_patch_ids,
-            lab_feature,
+            memory_patch_ids=memory_patch_ids,
+            patch_reliabilities=patch_reliabilities,
+            lab_feature=lab_feature,
             candidate_route=(
                 trigger_route
                 or self.novel_quarantine_route
@@ -7145,6 +8092,7 @@ class DynamicExpertManager:
             for pool_member in self.novel_quarantine:
                 unique_members[int(pool_member["image_id"])] = pool_member
             self.novel_quarantine = list(unique_members.values())
+            self._refresh_candidate_reliabilities(self.novel_quarantine)
             self.last_novel_quarantine_event = {
                 "decision": "opened",
                 "start_step": int(self.novel_quarantine[0]["step"]),
@@ -7181,6 +8129,7 @@ class DynamicExpertManager:
             for pool_member in self.novel_quarantine:
                 unique_members[int(pool_member["image_id"])] = pool_member
             self.novel_quarantine = list(unique_members.values())
+            self._refresh_candidate_reliabilities(self.novel_quarantine)
             self.novel_quarantine_route = trigger_route
             self.photometric_trigger_expert_id = (
                 int(photometric_trigger_expert_id)
@@ -7212,6 +8161,7 @@ class DynamicExpertManager:
             return None, None
 
         self.novel_quarantine.append(member)
+        self._refresh_candidate_reliabilities(self.novel_quarantine)
         photometric_required_count = self.photometric_min_low_risk_members
         provisional_profile = None
         history_reentry_match = None
@@ -7234,7 +8184,11 @@ class DynamicExpertManager:
             eligible_members = [
                 item
                 for item in self.novel_quarantine
-                if item.get("memory_patch_ids")
+                if (
+                    item.get("patch_reliabilities") is not None
+                    if self.candidate_reliability_enabled
+                    else bool(item.get("memory_patch_ids"))
+                )
             ]
             if len(eligible_members) >= 2:
                 provisional_profile = self._photometric_pool_profile(
@@ -7924,6 +8878,27 @@ class DynamicExpertManager:
                         support_threshold=support_threshold,
                         candidate_evidence=adaptive_admission_evidence,
                     )
+                retained_state = None
+                replacement_outcome = (
+                    (self.last_budget_replacement_evaluation or {}).get(
+                        "outcome"
+                    )
+                )
+                if (
+                    not photometric_history_reentry
+                    and expert_id is None
+                    and replacement_outcome in {
+                        "virtual_swap_rejected",
+                        "virtual_swap_insufficient_history",
+                        "virtual_swap_no_positive_task_gain",
+                    }
+                ):
+                    retained_state = self._record_photometric_state(
+                        representatives,
+                        step,
+                        state_status="stable",
+                        source_type="photometric_only",
+                    )
                 history_decision = (
                     self.last_history_reentry_event.get("decision")
                     if photometric_history_reentry
@@ -7936,6 +8911,8 @@ class DynamicExpertManager:
                         if history_decision is not None
                         else "confirmed_channel_gate"
                         if expert_id is not None
+                        else "retained_history_no_safe_swap"
+                        if retained_state is not None
                         else "cap_rejected"
                     ),
                     "start_step": pool[0]["step"],
@@ -7959,7 +8936,7 @@ class DynamicExpertManager:
                         else None
                     ),
                     "created_full_expert": expert_id is not None,
-                    "historical_state": None,
+                    "historical_state": retained_state,
                     "history_reentry": self.last_history_reentry_event,
                     "candidate_evidence": (
                         {
@@ -8129,6 +9106,7 @@ class DynamicExpertManager:
         lab_feature,
         lab_drift_profile,
         current_expert_supports=None,
+        patch_reliabilities=None,
     ):
         current_expert_supports = current_expert_supports or {}
         self.last_fitness_history_profile = None
@@ -8204,8 +9182,9 @@ class DynamicExpertManager:
             ms_short_ratio,
             channel_support,
             provisional_channel_support,
-            memory_patch_ids,
-            lab_feature,
+            memory_patch_ids=memory_patch_ids,
+            patch_reliabilities=patch_reliabilities,
+            lab_feature=lab_feature,
             candidate_route=(candidate_route or "history"),
             historical_ms_threshold=ms_threshold,
             current_expert_supports=current_expert_supports,
@@ -8279,11 +9258,16 @@ class DynamicExpertManager:
                     )
                     else None
                 ),
-                memory_patch_ids,
-                lab_feature,
-                photometric_seed_members,
-                photometric_trigger_expert_id,
-                photometric_trigger_lab_center,
+                memory_patch_ids=memory_patch_ids,
+                patch_reliabilities=patch_reliabilities,
+                lab_feature=lab_feature,
+                photometric_seed_members=photometric_seed_members,
+                photometric_trigger_expert_id=(
+                    photometric_trigger_expert_id
+                ),
+                photometric_trigger_lab_center=(
+                    photometric_trigger_lab_center
+                ),
                 historical_ms_threshold=ms_threshold,
                 current_expert_supports=current_expert_supports,
                 support_threshold=support_threshold,
@@ -8401,14 +9385,22 @@ class DynamicExpertManager:
 
         cluster = self.clusters[cluster_id]
 
-        cluster["members"].append(
-            {
+        cluster_member = {
                 "step": step,
                 "image_id": image_id,
                 "embedding": embedding,
                 "patch_prototypes": self._patch_coreset(
                     dino_patch_features,
-                    patch_ids=memory_patch_ids,
+                    patch_ids=(
+                        None
+                        if self.candidate_reliability_enabled
+                        else memory_patch_ids
+                    ),
+                    patch_reliabilities=(
+                        patch_reliabilities
+                        if self.candidate_reliability_enabled
+                        else None
+                    ),
                 ),
                 "quality": float(quality),
                 "ms_score": ms_score,
@@ -8423,9 +9415,32 @@ class DynamicExpertManager:
                     current_expert_supports
                 ),
             }
-        )
+        if self.candidate_reliability_enabled:
+            base_reliabilities = (
+                torch.as_tensor(
+                    patch_reliabilities,
+                    dtype=torch.float32,
+                ).detach().cpu()
+                if patch_reliabilities is not None
+                else torch.ones(
+                    dino_patch_features.shape[0],
+                    dtype=torch.float32,
+                )
+            )
+            cluster_member["base_patch_reliabilities"] = base_reliabilities
+            cluster_member["patch_reliabilities"] = base_reliabilities.clone()
+            cluster_member["reliability_patch_bank"] = (
+                self._candidate_patch_bank(
+                    dino_patch_features,
+                    base_reliabilities,
+                )
+            )
+            cluster_member["member_reliability"] = 0.5
+        cluster["members"].append(cluster_member)
         # 更新 cluster 中心
-        cluster["embedding_sum"] += embedding
+        cluster["embedding_sum"] = self._candidate_weighted_embedding_sum(
+            cluster["members"]
+        )
         # cluster能否进入专家
         if cluster["active_expert_id"] is not None:
             return True, cluster_id, None, candidate_route
@@ -8463,7 +9478,10 @@ class DynamicExpertManager:
         if self.representative_mode == "historical_quality":
             representative = max(
                 cluster["members"],
-                key=lambda member: member["quality"],
+                key=lambda member: (
+                    member["quality"]
+                    * float(member.get("member_reliability", 1.0))
+                ),
             )
         else:
             representative = cluster["members"][-1]
@@ -8518,6 +9536,23 @@ class DynamicExpertManager:
             "admission_ttl_mode": self.admission_ttl_mode,
             "admission_route": candidate_route,
         }
+        if self.candidate_reliability_enabled:
+            expert["member_reliability"] = float(
+                representative.get("member_reliability", 1.0)
+            )
+            expert["scoring_patch_reliabilities"] = [
+                float(value)
+                for value in torch.as_tensor(
+                    representative["patch_reliabilities"],
+                    dtype=torch.float32,
+                ).tolist()
+            ]
+            expert["reference_reliability_penalty"] = float(
+                self.reference_reliability_penalty
+            )
+            expert["reliability_audit"] = dict(
+                representative.get("reliability_audit", {})
+            )
 
         cluster["active_expert_id"] = self.next_expert_id
         self.active_experts.append(expert)
@@ -8548,6 +9583,7 @@ class DynamicExpertManager:
         lab_feature=None,
         lab_drift_profile=None,
         current_expert_supports=None,
+        patch_reliabilities=None,
     ):
     # 连续性
         self.state_lifecycle_events = []
@@ -8600,6 +9636,26 @@ class DynamicExpertManager:
                 for patch_id in memory_patch_ids
             ):
                 raise ValueError("memory_patch_ids contains an invalid patch")
+        if patch_reliabilities is not None:
+            patch_reliabilities = torch.as_tensor(
+                patch_reliabilities,
+                dtype=torch.float32,
+            ).detach().cpu()
+            if patch_reliabilities.shape != (dino_patch_features.shape[0],):
+                raise ValueError(
+                    "patch_reliabilities must contain one value per patch"
+                )
+            if not torch.isfinite(patch_reliabilities).all():
+                raise ValueError(
+                    "patch_reliabilities contain non-finite values"
+                )
+            if (
+                (patch_reliabilities <= 0.0)
+                | (patch_reliabilities > 1.0)
+            ).any():
+                raise ValueError(
+                    "patch_reliabilities must be within (0, 1]"
+                )
 
         self._decay_temporary_states(step)
 
@@ -8684,6 +9740,7 @@ class DynamicExpertManager:
                     lab_feature,
                     lab_drift_profile,
                     current_expert_supports=(current_expert_supports or {}),
+                    patch_reliabilities=patch_reliabilities,
                 )
             else:
                 (
@@ -8708,6 +9765,7 @@ class DynamicExpertManager:
                     lab_feature,
                     lab_drift_profile,
                     current_expert_supports=(current_expert_supports or {}),
+                    patch_reliabilities=patch_reliabilities,
                 )
                 has_non_bootstrap_expert = any(
                     expert.get("admission_route")
@@ -8792,6 +9850,7 @@ class DynamicExpertManager:
                 lab_feature,
                 lab_drift_profile,
                 current_expert_supports=(current_expert_supports or {}),
+                patch_reliabilities=patch_reliabilities,
             )
 
         if self.last_budget_replacement is not None:

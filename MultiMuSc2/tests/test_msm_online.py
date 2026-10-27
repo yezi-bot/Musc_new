@@ -117,6 +117,51 @@ class OnlineMSMTest(unittest.TestCase):
         self.assertEqual(patch_score.shape, (2,))
         self.assertIsNone(audit["clip_distance"])
 
+    def test_patch_reliability_changes_selection_not_distance_scale(self):
+        current = torch.tensor([[0.0, 0.0]])
+        references = torch.tensor([[[0.0, 0.0], [0.4, 0.0]]])
+        baseline = aggregate_reference_distances(current, references)
+        weighted, audit = aggregate_reference_distances(
+            current,
+            references,
+            reference_patch_reliabilities=torch.tensor([[0.1, 1.0]]),
+            reliability_penalty=1.0,
+            return_reliability_audit=True,
+        )
+
+        self.assertGreater(float(weighted), float(baseline))
+        self.assertAlmostEqual(float(weighted), 0.4)
+        self.assertAlmostEqual(audit["reference_reliability_mean"], 1.0)
+        self.assertEqual(audit["raw_reference_weight"], 1)
+        self.assertAlmostEqual(audit["selection_changed_fraction"], 1.0)
+        self.assertGreater(float(audit["score_shift"]), 0.0)
+
+    def test_all_one_patch_reliability_preserves_baseline(self):
+        current = torch.randn(3, 4)
+        references = torch.randn(2, 3, 4)
+        baseline = aggregate_reference_distances(current, references)
+        weighted = aggregate_reference_distances(
+            current,
+            references,
+            reference_patch_reliabilities=torch.ones(2, 3),
+            reliability_penalty=2.0,
+        )
+
+        self.assertTrue(torch.allclose(weighted, baseline))
+
+    def test_uniform_low_reliability_preserves_baseline(self):
+        current = torch.randn(3, 4)
+        references = torch.randn(2, 3, 4)
+        baseline = aggregate_reference_distances(current, references)
+        weighted = aggregate_reference_distances(
+            current,
+            references,
+            reference_patch_reliabilities=torch.full((2, 3), 0.2),
+            reliability_penalty=2.0,
+        )
+
+        self.assertTrue(torch.allclose(weighted, baseline))
+
     def test_clip_only_returns_clip_distance(self):
         current = torch.zeros(2, 2)
         expert_dino = torch.full((1, 2, 2), 2.0)
@@ -165,6 +210,39 @@ class OnlineMSMTest(unittest.TestCase):
                 member_steps=[2, 5],
                 current_step=5,
             )
+
+    def test_causal_training_preserves_uniform_reference_reliability(self):
+        dino = torch.tensor(
+            [
+                [[0.0, 0.0], [0.0, 1.0]],
+                [[2.0, 0.0], [4.0, 0.0]],
+            ]
+        )
+        baseline = build_causal_fuser_training_data(
+            dino,
+            dino,
+            image_ids=[10, 11],
+            member_steps=[1, 2],
+            current_step=3,
+        )
+        weighted = build_causal_fuser_training_data(
+            dino,
+            dino,
+            image_ids=[10, 11],
+            member_steps=[1, 2],
+            current_step=3,
+            training_dino_patch_reliabilities=torch.tensor(
+                [[1.0, 1.0], [0.25, 0.25]]
+            ),
+        )
+
+        self.assertTrue(weighted["available"])
+        self.assertTrue(
+            torch.allclose(
+                baseline["train_pairs"],
+                weighted["train_pairs"],
+            )
+        )
 
     def test_fuser_fit_reports_insufficient_and_degenerate_history(self):
         fuser = ConstantFuser(1.0)

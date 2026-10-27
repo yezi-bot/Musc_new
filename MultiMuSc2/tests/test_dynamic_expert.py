@@ -37,6 +37,134 @@ class DynamicExpertManagerTest(unittest.TestCase):
             "provisional_channel_support": float(channel_support),
         }
 
+    @staticmethod
+    def reliability_member(manager, image_id, features):
+        base = torch.ones(features.shape[0])
+        return {
+            "step": int(image_id),
+            "image_id": int(image_id),
+            "embedding": torch.nn.functional.normalize(
+                features.mean(dim=0), dim=0
+            ),
+            "ms_score": 0.5,
+            "historical_ms_threshold": 1.0,
+            "base_patch_reliabilities": base,
+            "patch_reliabilities": base.clone(),
+            "reliability_patch_bank": manager._candidate_patch_bank(
+                features, base
+            ),
+        }
+
+    def test_bidirectional_support_is_stronger_than_one_way_support(self):
+        manager = DynamicExpertManager(
+            candidate_reliability_enabled=True,
+            budget_patch_prototype_count=4,
+            candidate_reliability_position_radius=1,
+            candidate_unidirectional_weight=0.25,
+        )
+        left_features = torch.eye(4)
+        mutual_members = [
+            self.reliability_member(manager, 0, left_features),
+            self.reliability_member(manager, 1, left_features.clone()),
+        ]
+        manager._refresh_candidate_reliabilities(mutual_members)
+        mutual_reliability = mutual_members[0]["member_reliability"]
+
+        one_way_features = torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0]] * 4,
+            dtype=torch.float32,
+        )
+        one_way_members = [
+            self.reliability_member(manager, 0, left_features),
+            self.reliability_member(manager, 1, one_way_features),
+        ]
+        manager._refresh_candidate_reliabilities(one_way_members)
+
+        self.assertGreater(
+            mutual_reliability,
+            one_way_members[0]["member_reliability"],
+        )
+        self.assertGreater(
+            mutual_members[0]["reliability_audit"]["bidirectional_support"],
+            one_way_members[0]["reliability_audit"]["bidirectional_support"],
+        )
+        self.assertTrue(
+            torch.all(one_way_members[0]["patch_reliabilities"] > 0.0)
+        )
+
+    def test_bidirectional_support_uses_local_neighborhood_on_real_grid(self):
+        manager = DynamicExpertManager(
+            candidate_reliability_enabled=True,
+            budget_patch_prototype_count=32,
+            candidate_reliability_position_radius=1,
+            candidate_unidirectional_weight=0.25,
+        )
+        grid_size = 37
+        patch_count = grid_size * grid_size
+        base = torch.zeros(patch_count, 4)
+        base[:, 0] = 1.0
+        shifted = base.clone()
+        shifted[grid_size + 1 :, 1] = 1.0
+        left = self.reliability_member(manager, 0, base)
+        right = self.reliability_member(manager, 1, shifted)
+        _, _, audit = manager._bidirectional_member_support(left, right)
+
+        self.assertGreater(audit["mutual_fraction"], 0.0)
+        self.assertLess(audit["mutual_fraction"], 1.0)
+
+    def test_soft_candidate_keeps_members_without_memory_patch_ids(self):
+        manager = DynamicExpertManager(
+            candidate_reliability_enabled=True,
+            novel_memory_keep_fraction=0.5,
+        )
+        members = [
+            {
+                "image_id": 0,
+                "step": 0,
+                "ms_short_score": 0.2,
+                "memory_patch_ids": [],
+                "member_reliability": 0.8,
+            },
+            {
+                "image_id": 1,
+                "step": 1,
+                "ms_short_score": 0.3,
+                "memory_patch_ids": [],
+                "member_reliability": 0.7,
+            },
+        ]
+
+        selected = manager._select_irbank_members(members, min_keep=1)
+
+        self.assertEqual(
+            [item["image_id"] for item in selected],
+            [0, 1],
+        )
+
+    def test_member_reliability_weights_lab_state_update(self):
+        manager = DynamicExpertManager(
+            candidate_reliability_enabled=True,
+            cold_start_lab_enabled=True,
+        )
+        members = [
+            {
+                "step": 0,
+                "image_id": 0,
+                "lab_feature": np.zeros(6),
+                "member_reliability": 0.9,
+            },
+            {
+                "step": 1,
+                "image_id": 1,
+                "lab_feature": np.full(6, 100.0),
+                "member_reliability": 0.1,
+            },
+        ]
+
+        state = manager._build_lab_state(members, step=1)
+
+        np.testing.assert_allclose(state["center"], np.full(6, 10.0))
+
     def test_denstream_temporary_uses_effective_support_not_event_count(self):
         manager = DynamicExpertManager(
             photometric_state_distribution_enabled=True,
@@ -3022,6 +3150,391 @@ class DynamicExpertManagerTest(unittest.TestCase):
             profiles[0]["coverage_objective"],
             "patch_kcenter_max_cosine_distance",
         )
+
+    def test_patch_kcenter_does_not_evict_semantically_unique_expert(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            budget_patch_coverage_enabled=True,
+            budget_patch_victim_selection_enabled=True,
+            budget_patch_kcenter_victim_selection_enabled=True,
+        )
+        first = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        second = manager._quarantine_member(
+            step=1,
+            image_id=1,
+            dino_patch_features=patch_features(0.0, 1.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        manager._admit_quarantined_member(first, 0, admission_route="legacy")
+        manager._admit_quarantined_member(second, 1, admission_route="legacy")
+        manager.active_experts[0]["last_supported_step"] = -10
+        manager.active_experts[1]["last_supported_step"] = 2
+        manager._expert_coverage_profiles = lambda: {
+            0: {
+                "observed_count": 18,
+                "covered_count": 17,
+                "unique_count": 15,
+                "redundant_count": 2,
+                "coverage_fraction": 17 / 18,
+                "unique_fraction": 15 / 18,
+                "redundant_fraction": 2 / 18,
+            },
+            1: {
+                "observed_count": 8,
+                "covered_count": 2,
+                "unique_count": 0,
+                "redundant_count": 2,
+                "coverage_fraction": 0.25,
+                "unique_fraction": 0.0,
+                "redundant_fraction": 0.25,
+            },
+        }
+        manager._expert_lab_uniqueness_profiles = lambda: {
+            0: {
+                "has_lab_state": True,
+                "nearest_relative_distance": None,
+                "photometrically_redundant": False,
+            },
+            1: {
+                "has_lab_state": False,
+                "nearest_relative_distance": None,
+                "photometrically_redundant": False,
+            },
+        }
+        manager._patch_kcenter_eviction_profiles = (
+            lambda candidate_members, support_threshold: {
+                0: {"eviction_loss": 0.0},
+                1: {"eviction_loss": 0.1},
+                "candidate": {"eviction_loss": 0.2},
+            }
+        )
+        manager._candidate_expert_lab_distance_audit = lambda members: {
+            "expert_lab_distances": [
+                {
+                    "l_novelty_threshold": 1.0,
+                    "ab_novelty_threshold": 1.0,
+                    "l_distance": 1.0,
+                    "ab_distance": 1.0,
+                }
+            ],
+        }
+        manager._candidate_lab_novelty = lambda evaluation: {
+            "lab_novel_to_all_experts": False,
+        }
+        candidates = [
+            {
+                **first,
+                "step": 3,
+                "image_id": 3,
+                "current_expert_supports": {0: 0.1, 1: 0.1},
+            }
+        ]
+
+        victim_id, _ = manager._select_budget_replacement(
+            candidates,
+            support_threshold=0.5,
+            admission_route="photometric_drift_channel_gate",
+            candidate_evidence={
+                "new_coverage_fraction": 0.5,
+                "new_coverage_count": 1,
+                "candidate_observation_count": 2,
+            },
+        )
+
+        self.assertEqual(victim_id, 1)
+        evaluation = manager.last_budget_replacement_evaluation
+        semantic_losses = [
+            profile["total_loss"]
+            for profile in evaluation[
+                "semantic_replacement_losses"
+            ].values()
+        ]
+        self.assertGreater(
+            max(semantic_losses),
+            min(semantic_losses),
+        )
+        self.assertEqual(
+            evaluation["coverage_selection_mode"],
+            "patch_kcenter_minimum_victim_loss",
+        )
+        self.assertEqual(
+            evaluation["semantic_selection_mode"],
+            "minimum_uncovered_channel_lab_loss",
+        )
+
+    def test_virtual_swap_rejects_when_all_victims_harm_trusted_history(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            budget_patch_victim_selection_enabled=True,
+            budget_virtual_swap_enabled=True,
+        )
+        first = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        second = manager._quarantine_member(
+            step=1,
+            image_id=1,
+            dino_patch_features=patch_features(0.0, 1.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        manager._admit_quarantined_member(first, 0, admission_route="legacy")
+        manager._admit_quarantined_member(second, 1, admission_route="legacy")
+        manager._expert_coverage_profiles = lambda: {
+            expert_id: {
+                "observed_count": 2,
+                "covered_count": 2,
+                "unique_count": 0,
+                "redundant_count": 2,
+                "coverage_fraction": 1.0,
+                "unique_fraction": 0.0,
+                "redundant_fraction": 1.0,
+            }
+            for expert_id in (0, 1)
+        }
+        manager._expert_lab_uniqueness_profiles = lambda: {
+            expert_id: {
+                "has_lab_state": False,
+                "nearest_relative_distance": None,
+                "photometrically_redundant": False,
+            }
+            for expert_id in (0, 1)
+        }
+        manager._candidate_expert_lab_distance_audit = lambda members: {}
+        manager._candidate_lab_novelty = lambda evaluation: {
+            "lab_novel_to_all_experts": False,
+        }
+        manager._virtual_swap_profiles = lambda *args, **kwargs: {
+            0: {"safe": False, "median_normal_score_shift": 0.2},
+            1: {"safe": False, "median_normal_score_shift": 0.3},
+        }
+        candidates = [
+            {
+                **first,
+                "step": 3,
+                "image_id": 3,
+                "current_expert_supports": {0: 0.1, 1: 0.1},
+            }
+        ]
+
+        victim_id, replacement = manager._select_budget_replacement(
+            candidates,
+            support_threshold=0.5,
+            admission_route="photometric_drift_channel_gate",
+            candidate_evidence={
+                "new_coverage_fraction": 0.5,
+                "new_coverage_count": 1,
+                "candidate_observation_count": 2,
+            },
+        )
+
+        self.assertIsNone(victim_id)
+        self.assertIsNone(replacement)
+        self.assertEqual(
+            manager.last_budget_replacement_evaluation["outcome"],
+            "virtual_swap_rejected",
+        )
+
+    def test_virtual_swap_treats_lab_novelty_as_task_new_coverage(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            budget_virtual_swap_enabled=True,
+            photometric_budget_admission_mode="channel_or_lab",
+        )
+        first = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        second = manager._quarantine_member(
+            step=1,
+            image_id=1,
+            dino_patch_features=patch_features(0.0, 1.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        manager._admit_quarantined_member(first, 0, admission_route="legacy")
+        manager._admit_quarantined_member(second, 1, admission_route="legacy")
+        manager._candidate_expert_lab_distance_audit = lambda members: {}
+        manager._candidate_lab_novelty = lambda evaluation: {
+            "lab_novel_to_all_experts": True,
+        }
+        manager._expert_coverage_profiles = lambda: {
+            expert_id: {
+                "observed_count": 2,
+                "covered_count": 2,
+                "unique_count": 0,
+                "redundant_count": 2,
+                "coverage_fraction": 1.0,
+                "unique_fraction": 0.0,
+                "redundant_fraction": 1.0,
+            }
+            for expert_id in (0, 1)
+        }
+        manager._expert_lab_uniqueness_profiles = lambda: {
+            expert_id: {
+                "has_lab_state": True,
+                "nearest_relative_distance": 0.0,
+                "photometrically_redundant": True,
+            }
+            for expert_id in (0, 1)
+        }
+        manager._virtual_swap_profiles = lambda *args, **kwargs: {
+            expert_id: {
+                "safe": True,
+                "mean_normal_score_shift": 0.0,
+                "normal_score_iqr_increase": 0.0,
+                "current_state_support_loss": 0.0,
+                "recurrent_state_loss": 0.0,
+                "net_task_gain": 1.0,
+            }
+            for expert_id in (0, 1)
+        }
+
+        victim_id, replacement = manager._select_budget_replacement(
+            [
+                {
+                    **first,
+                    "step": 2,
+                    "image_id": 2,
+                    "current_expert_supports": {0: 0.9, 1: 0.9},
+                }
+            ],
+            support_threshold=0.5,
+            admission_route="photometric_drift_channel_gate",
+            candidate_evidence={
+                "new_coverage_fraction": 0.0,
+                "new_coverage_count": 0,
+                "candidate_observation_count": 1,
+            },
+        )
+
+        self.assertIsNotNone(victim_id)
+        self.assertIsNotNone(replacement)
+        self.assertTrue(
+            manager.last_budget_replacement_evaluation[
+                "task_new_coverage"
+            ]
+        )
+
+    def test_virtual_swap_rejects_without_trusted_history(self):
+        manager = DynamicExpertManager(
+            committee_cap=2,
+            budget_virtual_swap_enabled=True,
+        )
+        first = manager._quarantine_member(
+            step=0,
+            image_id=0,
+            dino_patch_features=patch_features(1.0, 0.0),
+            ms_score=0.1,
+            ms_short_score=0.1,
+            ms_short_ratio=0.8,
+            channel_support=0.8,
+            provisional_channel_support=0.5,
+            historical_ms_threshold=0.5,
+        )
+        second = {
+            **first,
+            "step": 1,
+            "image_id": 1,
+            "embedding": manager._image_embedding(
+                patch_features(0.0, 1.0)
+            ),
+        }
+        manager._admit_quarantined_member(first, 0, admission_route="legacy")
+        manager._admit_quarantined_member(second, 1, admission_route="legacy")
+        manager._candidate_expert_lab_distance_audit = lambda members: {}
+        manager._candidate_lab_novelty = lambda evaluation: {
+            "lab_novel_to_all_experts": False,
+        }
+
+        victim_id, replacement = manager._select_budget_replacement(
+            [
+                {
+                    **first,
+                    "step": 2,
+                    "image_id": 2,
+                    "current_expert_supports": {0: 0.1, 1: 0.1},
+                }
+            ],
+            support_threshold=0.5,
+            admission_route="photometric_drift_channel_gate",
+            candidate_evidence={
+                "new_coverage_fraction": 1.0,
+                "new_coverage_count": 1,
+                "candidate_observation_count": 1,
+            },
+        )
+
+        self.assertIsNone(victim_id)
+        self.assertIsNone(replacement)
+        self.assertEqual(
+            manager.last_budget_replacement_evaluation["outcome"],
+            "virtual_swap_insufficient_history",
+        )
+
+    def test_virtual_scoring_support_uses_dino_before_lab(self):
+        manager = DynamicExpertManager()
+        record = {
+            "support_threshold": 0.5,
+            "supports": {},
+            "embedding": torch.tensor([1.0, 0.0]),
+            "patch_prototypes": torch.tensor([[1.0, 0.0]]),
+            "lab_feature": np.asarray(
+                [10.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float64
+            ),
+        }
+        entity = {
+            "expert_id": None,
+            "embedding": torch.tensor([1.0, 0.0]),
+            "patch_prototypes": torch.tensor([[1.0, 0.0]]),
+            "lab_center": np.asarray(
+                [90.0, 9.0, 9.0, 9.0, 9.0, 9.0], dtype=np.float64
+            ),
+            "lab_l_scale": 0.01,
+            "lab_ab_scale": 0.01,
+        }
+
+        support = manager._virtual_entity_support(record, entity)
+
+        self.assertAlmostEqual(support, 1.0)
 
     def test_legacy_admission_replaces_redundant_expert_at_cap(self):
         manager = DynamicExpertManager(committee_cap=2)

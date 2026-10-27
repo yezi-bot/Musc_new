@@ -511,6 +511,9 @@ def build_dynamic_committee_timeline(
         )
         channel_ids, _ = memory.patch_associations(current, grid_size)
         _, reliability = memory.patch_reliability(current, grid_size)
+        soft_reliability = (
+            reliability_alpha + (1.0 - reliability_alpha) * reliability
+        )
         memory_patch_ids = torch.nonzero(
             (channel_ids >= 0)
             & (reliability >= memory_reliability_threshold),
@@ -616,6 +619,7 @@ def build_dynamic_committee_timeline(
             ms_short_score=ms_short,
             ms_short_ratio=ms_short_ratio,
             memory_patch_ids=memory_patch_ids,
+            patch_reliabilities=soft_reliability,
             lab_feature=current_lab,
             lab_drift_profile=lab_drift_profile,
         )
@@ -640,7 +644,6 @@ def build_dynamic_committee_timeline(
             finite = current_distances[torch.isfinite(current_distances)]
             distance_history.extend(finite.tolist())
 
-        soft_reliability = reliability_alpha + (1.0 - reliability_alpha) * reliability
         memory.update(
             current,
             image_id=step,
@@ -860,6 +863,47 @@ def _distance_audit(score_audit):
         else:
             result["dino_clip_correlation"] = None
             result["dino_clip_z_disagreement"] = None
+    reliability = score_audit.get("reference_reliability")
+    if reliability is not None:
+        score_shift = reliability["score_shift"]
+        result.update(
+            {
+                "reference_reliability_mean": reliability[
+                    "reference_reliability_mean"
+                ],
+                "reference_reliability_min": reliability[
+                    "reference_reliability_min"
+                ],
+                "low_reliability_patch_fraction": reliability[
+                    "low_reliability_fraction"
+                ],
+                "effective_reference_weight": reliability[
+                    "effective_reference_weight"
+                ],
+                "raw_reference_weight": reliability[
+                    "raw_reference_weight"
+                ],
+                "effective_reference_weight_ratio": float(
+                    reliability["effective_reference_weight"]
+                    / max(reliability["raw_reference_weight"], 1)
+                ),
+                "reliability_score_shift_mean": float(
+                    score_shift.mean()
+                ),
+                "reliability_score_shift_max": float(
+                    score_shift.max()
+                ),
+                "reliability_selection_changed_fraction": reliability[
+                    "selection_changed_fraction"
+                ],
+                "reference_bank_reliability_mean": reliability[
+                    "bank_reliability_mean"
+                ],
+                "reference_bank_reliability_min": reliability[
+                    "bank_reliability_min"
+                ],
+            }
+        )
     return result
 
 
@@ -959,6 +1003,38 @@ def score_dynamic_msm2_layer(
             float(expert.get("scoring_weight", 1.0))
             for expert in active
         ]
+        active_expert_patch_reliabilities = [
+            expert.get("scoring_patch_reliabilities")
+            for expert in active
+        ]
+        reference_reliability_penalty = max(
+            [
+                float(expert.get("reference_reliability_penalty", 1.0))
+                for expert in active
+            ],
+            default=1.0,
+        )
+        active_patch_reliability_tensor = None
+        if any(
+            values is not None
+            for values in active_expert_patch_reliabilities
+        ):
+            active_patch_reliability_tensor = torch.stack(
+                [
+                    torch.as_tensor(
+                        values,
+                        device=current_dino.device,
+                        dtype=current_dino.dtype,
+                    )
+                    if values is not None
+                    else torch.ones(
+                        current_dino.shape[0],
+                        device=current_dino.device,
+                        dtype=current_dino.dtype,
+                    )
+                    for values in active_expert_patch_reliabilities
+                ]
+            )
         active_committee_confidence = (
             max(active_expert_scoring_weights)
             if active_expert_scoring_weights
@@ -1009,21 +1085,31 @@ def score_dynamic_msm2_layer(
                 )
                 effective_mode = "dino_fallback"
         elif fusion_mode == "dino_only":
-            full_expert_image_ids = [
-                image_id
-                for image_id, weight in zip(
-                    expert_image_ids, active_expert_scoring_weights
-                )
+            full_expert_indices = [
+                index
+                for index, weight in enumerate(active_expert_scoring_weights)
                 if weight >= 1.0
             ]
+            full_expert_image_ids = [
+                expert_image_ids[index] for index in full_expert_indices
+            ]
             confidence_experts = [
-                (image_id, weight)
-                for image_id, weight in zip(
-                    expert_image_ids, active_expert_scoring_weights
-                )
+                (index, expert_image_ids[index], weight)
+                for index, weight in enumerate(active_expert_scoring_weights)
                 if weight < 1.0
             ]
             if full_expert_image_ids:
+                full_patch_reliabilities = (
+                    active_patch_reliability_tensor.index_select(
+                        0,
+                        torch.as_tensor(
+                            full_expert_indices,
+                            device=active_patch_reliability_tensor.device,
+                        ),
+                    )
+                    if active_patch_reliability_tensor is not None
+                    else None
+                )
                 patch_score, score_audit = MSM2_online(
                     current_dino,
                     None,
@@ -1032,6 +1118,8 @@ def score_dynamic_msm2_layer(
                     fusion_mode="dino_only",
                     topmin_min=topmin_min,
                     topmin_max=topmin_max,
+                    dino_patch_reliabilities=full_patch_reliabilities,
+                    reliability_penalty=reference_reliability_penalty,
                 )
             else:
                 patch_score, fallback_reason = (
@@ -1040,7 +1128,18 @@ def score_dynamic_msm2_layer(
                         dino_features[history_start:step],
                     )
                 )
-            for confidence_image_id, confidence_weight in confidence_experts:
+            for (
+                confidence_index,
+                confidence_image_id,
+                confidence_weight,
+            ) in confidence_experts:
+                confidence_patch_reliabilities = (
+                    active_patch_reliability_tensor[
+                        confidence_index : confidence_index + 1
+                    ]
+                    if active_patch_reliability_tensor is not None
+                    else None
+                )
                 confidence_score, _ = MSM2_online(
                     current_dino,
                     None,
@@ -1049,6 +1148,10 @@ def score_dynamic_msm2_layer(
                     fusion_mode="dino_only",
                     topmin_min=topmin_min,
                     topmin_max=topmin_max,
+                    dino_patch_reliabilities=(
+                        confidence_patch_reliabilities
+                    ),
+                    reliability_penalty=reference_reliability_penalty,
                 )
                 patch_score = (
                     patch_score
@@ -1114,6 +1217,25 @@ def score_dynamic_msm2_layer(
                     or not cached_training.get("fitted", False)
                 )
             if should_recompute:
+                training_patch_reliabilities = None
+                if training_source == "active_committee":
+                    training_patch_reliabilities = (
+                        active_patch_reliability_tensor
+                    )
+                elif members:
+                    training_patch_reliabilities = torch.stack(
+                        [
+                            torch.as_tensor(
+                                member.get(
+                                    "patch_reliabilities",
+                                    torch.ones(current_dino.shape[0]),
+                                ),
+                                device=current_dino.device,
+                                dtype=current_dino.dtype,
+                            )
+                            for member in members
+                        ]
+                    )
                 if fusion_mode == "fixed":
                     cached_training = build_causal_fuser_training_data(
                         dino_features[member_ids],
@@ -1125,6 +1247,9 @@ def score_dynamic_msm2_layer(
                         clip_weight=clip_weight,
                         topmin_min=topmin_min,
                         topmin_max=topmin_max,
+                        training_dino_patch_reliabilities=(
+                            training_patch_reliabilities
+                        ),
                     )
                     cached_training["fitted"] = False
                 else:
@@ -1144,6 +1269,9 @@ def score_dynamic_msm2_layer(
                         clip_weight=clip_weight,
                         topmin_min=topmin_min,
                         topmin_max=topmin_max,
+                        training_dino_patch_reliabilities=(
+                            training_patch_reliabilities
+                        ),
                     )
                 cached_signature = signature
                 training_recomputed = True
@@ -1176,6 +1304,10 @@ def score_dynamic_msm2_layer(
                     epsilon=epsilon,
                     topmin_min=topmin_min,
                     topmin_max=topmin_max,
+                    dino_patch_reliabilities=(
+                        active_patch_reliability_tensor
+                    ),
+                    reliability_penalty=reference_reliability_penalty,
                 )
             elif (
                 committee_allowed
@@ -1195,6 +1327,10 @@ def score_dynamic_msm2_layer(
                     epsilon=epsilon,
                     topmin_min=topmin_min,
                     topmin_max=topmin_max,
+                    dino_patch_reliabilities=(
+                        active_patch_reliability_tensor
+                    ),
+                    reliability_penalty=reference_reliability_penalty,
                 )
                 effective_mode = "fixed" if fusion_mode == "fixed" else "fixed_fallback"
                 fallback_reason = cached_training["reason"]
@@ -1208,6 +1344,10 @@ def score_dynamic_msm2_layer(
                         fusion_mode="dino_only",
                         topmin_min=topmin_min,
                         topmin_max=topmin_max,
+                        dino_patch_reliabilities=(
+                            active_patch_reliability_tensor
+                        ),
+                        reliability_penalty=reference_reliability_penalty,
                     )
                     fallback_reason = gate_reason
                     effective_mode = "dino_gate"
@@ -1415,6 +1555,18 @@ def score_dynamic_msm2_layer(
             "active_expert_ids": [expert["expert_id"] for expert in active],
             "expert_image_ids": expert_image_ids,
             "active_expert_scoring_weights": active_expert_scoring_weights,
+            "active_expert_member_reliabilities": [
+                float(expert.get("member_reliability", 1.0))
+                for expert in active
+            ],
+            "active_expert_patch_reliability_means": [
+                (
+                    float(np.mean(values))
+                    if values is not None
+                    else 1.0
+                )
+                for values in active_expert_patch_reliabilities
+            ],
             "active_committee_confidence": active_committee_confidence,
             "provisional_expert_image_id": (
                 int(provisional["image_id"])

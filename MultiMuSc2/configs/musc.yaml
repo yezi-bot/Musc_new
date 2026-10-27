@@ -55,6 +55,10 @@ models:
     budget_patch_prototype_count: 32
     budget_patch_victim_selection_enabled: false
     budget_patch_kcenter_victim_selection_enabled: false
+    budget_virtual_swap_enabled: false
+    budget_virtual_swap_max_normal_score_shift: 0.05
+    budget_virtual_swap_max_iqr_increase: 0.05
+    budget_virtual_swap_history_size: 32
     budget_coverage_channel_weight: 1.0
     budget_coverage_lab_weight: 1.0
     budget_coverage_dino_weight: 1.0

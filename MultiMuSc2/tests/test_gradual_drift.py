@@ -22,6 +22,7 @@ from MultiMuSc2.examples.ablate_gradual_drift import (
     expert_metrics,
     lab_metrics,
     select_stream_source_records,
+    state_member_contamination_metrics,
 )
 from MultiMuSc2.examples.ablate_multistage_drift import (
     _repeated_state_metrics,
@@ -29,6 +30,27 @@ from MultiMuSc2.examples.ablate_multistage_drift import (
 
 
 class GradualDriftLabAuditTest(unittest.TestCase):
+    def test_state_audit_detects_anomalous_member_with_normal_representative(self):
+        timeline = [{"step": 2, "active_experts_before": [{
+            "image_id": 0,
+            "state_member_image_ids": [0, 1],
+            "state_member_weights": [0.7, 0.3],
+        }]}]
+        result = state_member_contamination_metrics(timeline, [0, 1, 0])
+        self.assertAlmostEqual(result["state_member_anomaly_mass_mean"], 0.3)
+        self.assertEqual(result["state_member_weight_valid_snapshot_count"], 1)
+
+    def test_state_audit_does_not_report_missing_or_future_members_as_clean(self):
+        timeline = [{"step": 2, "active_experts_before": [
+            {"image_id": 0},
+            {"state_member_image_ids": [2], "state_member_weights": [1.0]},
+            {"state_member_image_ids": [0], "state_member_weights": [float("nan")]},
+        ]}]
+        result = state_member_contamination_metrics(timeline, [0, 1, 0])
+        self.assertIsNone(result["state_member_anomaly_mass_mean"])
+        self.assertEqual(result["state_member_weight_missing_snapshot_count"], 1)
+        self.assertEqual(result["state_member_weight_invalid_snapshot_count"], 2)
+
     def test_dual_replace_variants_use_real_two_vs_three_confirmation(self):
         confirm_three = VARIANTS[
             "photometric_multistage_cap2_dual_replace"

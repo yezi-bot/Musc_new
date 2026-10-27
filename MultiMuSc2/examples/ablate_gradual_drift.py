@@ -373,6 +373,21 @@ VARIANTS["priority4_patch_kcenter_victim"] = {
     **VARIANTS["priority4_patch_victim"],
     "budget_patch_kcenter_victim_selection_enabled": True,
 }
+VARIANTS["priority5_task_aware_virtual_swap"] = {
+    **VARIANTS["priority4_patch_kcenter_victim"],
+    "budget_virtual_swap_enabled": True,
+    "budget_virtual_swap_max_normal_score_shift": 0.05,
+    "budget_virtual_swap_max_iqr_increase": 0.05,
+    "budget_virtual_swap_history_size": 32,
+}
+VARIANTS["priority5_task_aware_soft_reliability"] = {
+    **VARIANTS["priority5_task_aware_virtual_swap"],
+    "candidate_reliability_enabled": True,
+    "candidate_reliability_floor": 0.1,
+    "candidate_unidirectional_weight": 0.25,
+    "candidate_reliability_position_radius": 1,
+    "reference_reliability_penalty": 1.0,
+}
 VARIANTS["photometric_multistage_cap2_state_distribution_only"] = {
     **VARIANTS["photometric_multistage_cap2_dual_replace_history_reentry"],
     "photometric_state_distribution_enabled": True,
@@ -789,6 +804,33 @@ def configure_variant(
     )
     committee["budget_patch_kcenter_victim_selection_enabled"] = bool(
         variant.get("budget_patch_kcenter_victim_selection_enabled", False)
+    )
+    committee["budget_virtual_swap_enabled"] = bool(
+        variant.get("budget_virtual_swap_enabled", False)
+    )
+    committee["budget_virtual_swap_max_normal_score_shift"] = float(
+        variant.get("budget_virtual_swap_max_normal_score_shift", 0.05)
+    )
+    committee["budget_virtual_swap_max_iqr_increase"] = float(
+        variant.get("budget_virtual_swap_max_iqr_increase", 0.05)
+    )
+    committee["budget_virtual_swap_history_size"] = int(
+        variant.get("budget_virtual_swap_history_size", 32)
+    )
+    committee["candidate_reliability_enabled"] = bool(
+        variant.get("candidate_reliability_enabled", False)
+    )
+    committee["candidate_reliability_floor"] = float(
+        variant.get("candidate_reliability_floor", 0.1)
+    )
+    committee["candidate_unidirectional_weight"] = float(
+        variant.get("candidate_unidirectional_weight", 0.25)
+    )
+    committee["candidate_reliability_position_radius"] = int(
+        variant.get("candidate_reliability_position_radius", 1)
+    )
+    committee["reference_reliability_penalty"] = float(
+        variant.get("reference_reliability_penalty", 1.0)
     )
     committee["minimum_active_experts"] = int(
         variant.get("minimum_active_experts", 0)
@@ -1712,7 +1754,66 @@ def phase_metrics(
     return result
 
 
-def expert_metrics(timeline, labels, scoring=None):
+def state_member_contamination_metrics(timeline, labels):
+    labels = np.asarray(labels)
+    masses = []
+    raw_fractions = []
+    missing = 0
+    invalid = 0
+    for record in timeline:
+        step = record.get("step")
+        for expert in record.get("active_experts_before", []):
+            ids = expert.get("state_member_image_ids")
+            weights = expert.get("state_member_weights")
+            if ids is None or weights is None:
+                missing += 1
+                continue
+            if step is None:
+                invalid += 1
+                continue
+            ids = np.asarray(ids)
+            weights = np.asarray(weights, dtype=np.float64)
+            if (
+                ids.ndim != 1
+                or weights.ndim != 1
+                or len(ids) == 0
+                or len(ids) != len(weights)
+                or not np.issubdtype(ids.dtype, np.integer)
+                or np.any(ids < 0)
+                or np.any(ids >= min(int(step), len(labels)))
+                or not np.isfinite(weights).all()
+                or np.any(weights < 0.0)
+                or not np.isclose(weights.sum(), 1.0)
+            ):
+                invalid += 1
+                continue
+            anomaly_mask = labels[ids].astype(bool)
+            masses.append(float(weights[anomaly_mask].sum()))
+            raw_fractions.append(float(np.mean(anomaly_mask)))
+    return {
+        "state_member_weight_valid_snapshot_count": len(masses),
+        "state_member_weight_missing_snapshot_count": missing,
+        "state_member_weight_invalid_snapshot_count": invalid,
+        "state_member_anomaly_mass_mean": (
+            float(np.mean(masses)) if masses else None
+        ),
+        "state_member_anomaly_mass_max": (
+            float(np.max(masses)) if masses else None
+        ),
+        "state_member_anomaly_raw_fraction_mean": (
+            float(np.mean(raw_fractions)) if raw_fractions else None
+        ),
+        "state_member_anomaly_weight_reduction_mean": (
+            float(np.mean(np.asarray(raw_fractions) - np.asarray(masses)))
+            if masses
+            else None
+        ),
+    }
+
+
+def expert_metrics(
+    timeline, labels, scoring=None, virtual_swap_enabled=False
+):
     labels = np.asarray(labels)
 
     max_active_experts = 0
@@ -2132,6 +2233,14 @@ def expert_metrics(timeline, labels, scoring=None):
     bootstrap_confidence_member_anomaly_exposure = None
     bootstrap_confidence_member_anomaly_scoring_step_count = None
     bootstrap_reference_first_weighted_scoring_step = None
+    mean_reliability_score_shift = None
+    effective_reference_weight_ratio = None
+    polluted_effective_reference_weight = 0.0
+    polluted_raw_reference_weight = 0.0
+    polluted_effective_reference_weight_ratio = None
+    polluted_reference_score_shift_mean = None
+    polluted_reference_normal_score_shift_mean = None
+    polluted_reference_anomaly_score_shift_mean = None
     if scoring is not None:
         polluted_scoring_steps = set()
         polluted_anomaly_steps = set()
@@ -2176,6 +2285,14 @@ def expert_metrics(timeline, labels, scoring=None):
         bootstrap_confidence_anomaly_exposure = 0.0
         bootstrap_confidence_member_anomaly_exposure = 0.0
         member_anomaly_scoring_steps = 0
+        reliability_score_shifts = []
+        effective_reference_weights = []
+        raw_reference_weights = []
+        polluted_effective_reference_weight = 0.0
+        polluted_raw_reference_weight = 0.0
+        polluted_reference_score_shifts = []
+        polluted_reference_normal_score_shifts = []
+        polluted_reference_anomaly_score_shifts = []
         for scoring_record in scoring:
             expert_ids = scoring_record.get("active_expert_ids", [])
             image_ids = scoring_record.get("expert_image_ids", [])
@@ -2191,6 +2308,47 @@ def expert_metrics(timeline, labels, scoring=None):
                 "active_expert_member_weights",
                 [[] for _ in expert_ids],
             )
+            score_shift = scoring_record.get(
+                "reliability_score_shift_mean"
+            )
+            if score_shift is not None:
+                reliability_score_shifts.append(float(score_shift))
+                scoring_step = int(scoring_record.get("step", 0))
+                has_polluted_reference = any(
+                    int(expert_id) in polluted_expert_ids
+                    and scoring_step
+                    > expert_birth_steps.get(int(expert_id), scoring_step)
+                    for expert_id in expert_ids
+                )
+                if has_polluted_reference:
+                    polluted_reference_score_shifts.append(
+                        float(score_shift)
+                    )
+                    if 0 <= scoring_step < len(labels):
+                        target = (
+                            polluted_reference_anomaly_score_shifts
+                            if bool(labels[scoring_step])
+                            else polluted_reference_normal_score_shifts
+                        )
+                        target.append(float(score_shift))
+            effective_weight = scoring_record.get(
+                "effective_reference_weight"
+            )
+            raw_weight = scoring_record.get("raw_reference_weight")
+            if effective_weight is not None and raw_weight is not None:
+                effective_reference_weights.append(float(effective_weight))
+                raw_reference_weights.append(float(raw_weight))
+            patch_reliability_means = scoring_record.get(
+                "active_expert_patch_reliability_means",
+                [1.0] * len(expert_ids),
+            )
+            for expert_id, patch_mean in zip(
+                expert_ids,
+                patch_reliability_means,
+            ):
+                if int(expert_id) in polluted_expert_ids:
+                    polluted_effective_reference_weight += float(patch_mean)
+                    polluted_raw_reference_weight += 1.0
             if bootstrap_reference_first_weighted_scoring_step is None:
                 if any(
                     int(expert_id) in bootstrap_confidence_expert_ids
@@ -2237,8 +2395,45 @@ def expert_metrics(timeline, labels, scoring=None):
         bootstrap_confidence_member_anomaly_scoring_step_count = (
             member_anomaly_scoring_steps
         )
+        mean_reliability_score_shift = (
+            float(np.mean(reliability_score_shifts))
+            if reliability_score_shifts
+            else None
+        )
+        effective_reference_weight_ratio = (
+            float(
+                np.sum(effective_reference_weights)
+                / max(np.sum(raw_reference_weights), 1e-12)
+            )
+            if raw_reference_weights
+            else None
+        )
+        polluted_effective_reference_weight_ratio = (
+            float(
+                polluted_effective_reference_weight
+                / polluted_raw_reference_weight
+            )
+            if polluted_raw_reference_weight > 0.0
+            else None
+        )
+        polluted_reference_score_shift_mean = (
+            float(np.mean(polluted_reference_score_shifts))
+            if polluted_reference_score_shifts
+            else None
+        )
+        polluted_reference_normal_score_shift_mean = (
+            float(np.mean(polluted_reference_normal_score_shifts))
+            if polluted_reference_normal_score_shifts
+            else None
+        )
+        polluted_reference_anomaly_score_shift_mean = (
+            float(np.mean(polluted_reference_anomaly_score_shifts))
+            if polluted_reference_anomaly_score_shifts
+            else None
+        )
 
     return {
+        **state_member_contamination_metrics(timeline, labels),
         "max_active_experts": (
             max_active_experts
         ),
@@ -2291,6 +2486,26 @@ def expert_metrics(timeline, labels, scoring=None):
         ),
         "fitness_history_event_count": len(
             fitness_history_effective_sizes
+        ),
+        "mean_reliability_score_shift": mean_reliability_score_shift,
+        "effective_reference_weight_ratio": (
+            effective_reference_weight_ratio
+        ),
+        "polluted_effective_reference_weight": (
+            polluted_effective_reference_weight
+        ),
+        "polluted_raw_reference_weight": polluted_raw_reference_weight,
+        "polluted_effective_reference_weight_ratio": (
+            polluted_effective_reference_weight_ratio
+        ),
+        "polluted_reference_score_shift_mean": (
+            polluted_reference_score_shift_mean
+        ),
+        "polluted_reference_normal_score_shift_mean": (
+            polluted_reference_normal_score_shift_mean
+        ),
+        "polluted_reference_anomaly_score_shift_mean": (
+            polluted_reference_anomaly_score_shift_mean
         ),
         "fitness_history_available_mean": (
             float(np.mean(fitness_history_available_counts))
@@ -2374,6 +2589,24 @@ def expert_metrics(timeline, labels, scoring=None):
         "budget_replacement_candidate_evicted_count": (
             budget_replacement_evaluation_outcomes.get(
                 "candidate_evicted_minimum_coverage_loss", 0
+            )
+        ),
+        "budget_virtual_swap_enabled": bool(
+            virtual_swap_enabled
+        ),
+        "budget_virtual_swap_rejected_count": (
+            budget_replacement_evaluation_outcomes.get(
+                "virtual_swap_rejected", 0
+            )
+        ),
+        "budget_virtual_swap_insufficient_history_count": (
+            budget_replacement_evaluation_outcomes.get(
+                "virtual_swap_insufficient_history", 0
+            )
+        ),
+        "budget_virtual_swap_no_positive_task_gain_count": (
+            budget_replacement_evaluation_outcomes.get(
+                "virtual_swap_no_positive_task_gain", 0
             )
         ),
         "budget_replacement_coverage_removal_loss_median": (
@@ -3530,6 +3763,43 @@ def run_variant(
                 "budget_patch_kcenter_victim_selection_enabled", False
             )
         ),
+        "budget_virtual_swap_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "budget_virtual_swap_enabled", False
+            )
+        ),
+        "budget_virtual_swap_max_normal_score_shift": float(
+            cfg["models"]["dynamic_committee"].get(
+                "budget_virtual_swap_max_normal_score_shift", 0.05
+            )
+        ),
+        "budget_virtual_swap_max_iqr_increase": float(
+            cfg["models"]["dynamic_committee"].get(
+                "budget_virtual_swap_max_iqr_increase", 0.05
+            )
+        ),
+        "budget_virtual_swap_history_size": int(
+            cfg["models"]["dynamic_committee"].get(
+                "budget_virtual_swap_history_size", 32
+            )
+        ),
+        "candidate_reliability_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "candidate_reliability_enabled", False
+            )
+        ),
+        "candidate_reliability_floor": cfg["models"][
+            "dynamic_committee"
+        ].get("candidate_reliability_floor"),
+        "candidate_unidirectional_weight": cfg["models"][
+            "dynamic_committee"
+        ].get("candidate_unidirectional_weight"),
+        "candidate_reliability_position_radius": cfg["models"][
+            "dynamic_committee"
+        ].get("candidate_reliability_position_radius"),
+        "reference_reliability_penalty": cfg["models"][
+            "dynamic_committee"
+        ].get("reference_reliability_penalty"),
         "photometric_history_min": cfg["models"][
             "dynamic_committee"
         ].get("photometric_history_min"),
@@ -3619,6 +3889,11 @@ def run_variant(
             timeline=timeline,
             labels=labels,
             scoring=audit.get("scoring"),
+            virtual_swap_enabled=bool(
+                VARIANTS[variant_name].get(
+                    "budget_virtual_swap_enabled", False
+                )
+            ),
         )
     )
 

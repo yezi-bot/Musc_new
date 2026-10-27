@@ -779,6 +779,53 @@ class MuSc():
                                     False,
                                 )
                             ),
+                            'budget_virtual_swap_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_virtual_swap_enabled', False
+                                )
+                            ),
+                            'budget_virtual_swap_max_normal_score_shift': float(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_virtual_swap_max_normal_score_shift',
+                                    0.05,
+                                )
+                            ),
+                            'budget_virtual_swap_max_iqr_increase': float(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_virtual_swap_max_iqr_increase',
+                                    0.05,
+                                )
+                            ),
+                            'budget_virtual_swap_history_size': int(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_virtual_swap_history_size', 32
+                                )
+                            ),
+                            'candidate_reliability_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'candidate_reliability_enabled', False
+                                )
+                            ),
+                            'candidate_reliability_floor': float(
+                                self.dynamic_committee_cfg.get(
+                                    'candidate_reliability_floor', 0.1
+                                )
+                            ),
+                            'candidate_unidirectional_weight': float(
+                                self.dynamic_committee_cfg.get(
+                                    'candidate_unidirectional_weight', 0.25
+                                )
+                            ),
+                            'candidate_reliability_position_radius': int(
+                                self.dynamic_committee_cfg.get(
+                                    'candidate_reliability_position_radius', 1
+                                )
+                            ),
+                            'reference_reliability_penalty': float(
+                                self.dynamic_committee_cfg.get(
+                                    'reference_reliability_penalty', 1.0
+                                )
+                            ),
                             'budget_coverage_channel_weight': float(
                                 self.dynamic_committee_cfg.get(
                                     'budget_coverage_channel_weight', 1.0
