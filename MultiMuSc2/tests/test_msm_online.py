@@ -10,6 +10,7 @@ from MultiMuSc2.models.modules._MSM import (
     compute_scores_fast,
     fit_causal_detect_fuser,
     safe_topmin_counts,
+    score_dino_reference_committee,
 )
 
 
@@ -28,6 +29,79 @@ class ConstantFuser:
 
 
 class OnlineMSMTest(unittest.TestCase):
+    def test_shared_committee_score_matches_msm_with_patch_reliability(self):
+        query = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        references = torch.tensor(
+            [
+                [[1.0, 0.0], [0.5, 0.5]],
+                [[0.0, 1.0], [0.5, 0.5]],
+            ]
+        )
+        reliabilities = torch.tensor([[1.0, 0.25], [0.5, 1.0]])
+
+        shared, _, _, _ = score_dino_reference_committee(
+            query,
+            references,
+            [1.0, 1.0],
+            patch_reliabilities=reliabilities,
+            reference_member_ids=[10, 11],
+        )
+        direct, _ = MSM2_online(
+            query,
+            None,
+            references,
+            None,
+            fusion_mode="dino_only",
+            topmin_min=0.02,
+            topmin_max=0.3,
+            dino_patch_reliabilities=reliabilities,
+            dino_reference_member_ids=[10, 11],
+        )
+
+        self.assertTrue(torch.allclose(shared, direct, atol=1e-6))
+
+    def test_shared_committee_score_matches_confidence_blend(self):
+        query = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        references = torch.tensor(
+            [
+                [[1.0, 0.0], [1.0, 0.0]],
+                [[0.0, 1.0], [0.0, 1.0]],
+            ]
+        )
+
+        shared, _, audits, _ = score_dino_reference_committee(
+            query, references, [1.0, 0.25]
+        )
+        base, _ = MSM2_online(
+            query,
+            None,
+            references[:1],
+            None,
+            fusion_mode="dino_only",
+            topmin_min=0.02,
+            topmin_max=0.3,
+            dino_reference_member_ids=[0],
+        )
+        confidence, _ = MSM2_online(
+            query,
+            None,
+            references[1:],
+            None,
+            fusion_mode="dino_only",
+            topmin_min=0.02,
+            topmin_max=0.3,
+            dino_reference_member_ids=[1],
+        )
+
+        self.assertTrue(
+            torch.allclose(
+                shared,
+                base + 0.25 * (confidence - base),
+                atol=1e-6,
+            )
+        )
+        self.assertEqual(len(audits), 1)
+
     def test_nearest_thirty_percent_is_safe_for_small_committees(self):
         query = torch.zeros(3, 2)
         for expert_count in range(1, 6):
@@ -180,12 +254,51 @@ class OnlineMSMTest(unittest.TestCase):
             reference_patch_reliabilities=reliabilities,
             reliability_penalty=0.0,
             return_reliability_audit=True,
+            return_selection_details=True,
         )
 
         self.assertEqual(audit["selected_reference_raw_counts"], [1, 1])
         np.testing.assert_allclose(
             audit["selected_reference_effective_weights"],
             [0.5, 0.8],
+        )
+        self.assertEqual(
+            audit["contributing_reference_indices_per_query"],
+            [[0], [1]],
+        )
+        np.testing.assert_allclose(
+            audit["contributing_reliabilities_per_query"],
+            [[0.5], [0.8]],
+        )
+
+    def test_member_audit_is_available_without_soft_reliability(self):
+        current = torch.tensor([[0.0, 0.0], [10.0, 0.0]])
+        references = torch.tensor(
+            [
+                [[0.0, 0.0], [0.0, 1.0]],
+                [[10.0, 0.0], [10.0, 1.0]],
+            ]
+        )
+
+        expected = aggregate_reference_distances(current, references)
+        baseline, audit = aggregate_reference_distances(
+            current,
+            references,
+            reference_member_ids=[7, 9],
+            reliability_penalty=0.0,
+            return_reliability_audit=True,
+        )
+
+        self.assertTrue(torch.equal(baseline, expected))
+        self.assertTrue(torch.isfinite(baseline).all())
+        self.assertEqual(audit["reference_member_ids"], [7, 9])
+        self.assertEqual(
+            audit["selected_reference_member_raw_counts"],
+            {"7": 1, "9": 1},
+        )
+        self.assertEqual(
+            audit["selected_reference_member_effective_weights"],
+            {"7": 1.0, "9": 1.0},
         )
 
     def test_clip_only_returns_clip_distance(self):

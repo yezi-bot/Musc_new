@@ -741,6 +741,12 @@ class MuSc():
                                     False,
                                 )
                             ),
+                            'photometric_fitness_adaptive_evidence_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_fitness_adaptive_evidence_enabled',
+                                    False,
+                                )
+                            ),
                             'budget_coverage_loss_enabled': bool(
                                 self.dynamic_committee_cfg.get(
                                     'budget_coverage_loss_enabled', False
@@ -799,6 +805,23 @@ class MuSc():
                             'budget_virtual_swap_history_size': int(
                                 self.dynamic_committee_cfg.get(
                                     'budget_virtual_swap_history_size', 32
+                                )
+                            ),
+                            'budget_unified_delta_j_shadow_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_unified_delta_j_shadow_enabled',
+                                    False,
+                                )
+                            ),
+                            'budget_unified_delta_j_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_unified_delta_j_enabled', False
+                                )
+                            ),
+                            'budget_unified_delta_j_dino_score_enabled': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'budget_unified_delta_j_dino_score_enabled',
+                                    False,
                                 )
                             ),
                             'candidate_reliability_enabled': bool(
@@ -899,6 +922,12 @@ class MuSc():
                                 self.dynamic_committee_cfg.get(
                                     'photometric_history_reentry_members',
                                     2,
+                                )
+                            ),
+                            'photometric_history_reentry_continuous_evidence': bool(
+                                self.dynamic_committee_cfg.get(
+                                    'photometric_history_reentry_continuous_evidence',
+                                    False,
                                 )
                             ),
                             'photometric_history_median_risk_max': float(
@@ -1015,6 +1044,16 @@ class MuSc():
                                 'reset_at_category_boundaries', False
                             )
                             else None
+                        ),
+                        contamination_injections=(
+                            self.dynamic_committee_cfg.get(
+                                'contamination_injections', {}
+                            )
+                        ),
+                        controlled_history_evictions=(
+                            self.dynamic_committee_cfg.get(
+                                'controlled_history_evictions', {}
+                            )
                         ),
                     )
                 lowest_indices = None
@@ -1183,6 +1222,13 @@ class MuSc():
                             committee_retrain_cooldown=int(
                                 self.dynamic_fusion_cfg.get(
                                     'committee_retrain_cooldown', 5
+                                )
+                            ),
+                            image_score_size=self.image_size,
+                            hierarchical_reliability_enabled=bool(
+                                self.dynamic_committee_cfg.get(
+                                    'hierarchical_reliability_enabled',
+                                    False,
                                 )
                             ),
                         )

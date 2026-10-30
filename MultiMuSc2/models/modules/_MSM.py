@@ -60,8 +60,10 @@ def aggregate_reference_distances(
     topmin_min=0,
     topmin_max=0.3,
     reference_patch_reliabilities=None,
+    reference_member_ids=None,
     reliability_penalty=1.0,
     return_reliability_audit=False,
+    return_selection_details=False,
 ):
     if query.ndim != 2:
         raise ValueError("query must have shape [patch_count, feature_dim]")
@@ -78,6 +80,12 @@ def aggregate_reference_distances(
 
     patch_count = query.shape[0]
     reference_count, reference_patch_count, feature_dim = references.shape
+    if reference_member_ids is not None:
+        reference_member_ids = [int(value) for value in reference_member_ids]
+        if len(reference_member_ids) != reference_count:
+            raise ValueError(
+                "reference_member_ids must match reference count"
+            )
     distances = torch.cdist(
         query.unsqueeze(0),
         references.reshape(-1, feature_dim),
@@ -93,15 +101,19 @@ def aggregate_reference_distances(
         topmin_max,
     )
     if reference_patch_reliabilities is None:
-        if return_reliability_audit:
-            return unweighted_score, None
-        return unweighted_score
-
-    reliabilities = torch.as_tensor(
-        reference_patch_reliabilities,
-        device=distances.device,
-        dtype=distances.dtype,
-    )
+        if not return_reliability_audit:
+            return unweighted_score
+        reliabilities = torch.ones(
+            (reference_count, reference_patch_count),
+            device=distances.device,
+            dtype=distances.dtype,
+        )
+    else:
+        reliabilities = torch.as_tensor(
+            reference_patch_reliabilities,
+            device=distances.device,
+            dtype=distances.dtype,
+        )
     if reliabilities.shape != (reference_count, reference_patch_count):
         raise ValueError(
             "reference_patch_reliabilities must match reference patch shape"
@@ -171,7 +183,28 @@ def aggregate_reference_distances(
         contributing_reference_indices.reshape(-1),
         contributing_reliabilities.reshape(-1),
     )
-    return weighted_score, {
+    selected_reference_member_ids = (
+        list(reference_member_ids)
+        if reference_member_ids is not None
+        else list(range(reference_count))
+    )
+    selected_member_raw_counts = {
+        str(member_id): int(raw_count)
+        for member_id, raw_count in zip(
+            selected_reference_member_ids,
+            selected_reference_raw_counts.tolist(),
+        )
+        if raw_count
+    }
+    selected_member_effective_weights = {
+        str(member_id): float(weight)
+        for member_id, weight in zip(
+            selected_reference_member_ids,
+            selected_reference_effective_weights.tolist(),
+        )
+        if weight
+    }
+    audit = {
         "unweighted_distance": unweighted_score,
         "score_shift": weighted_score - unweighted_score,
         "reference_reliability_mean": float(selected_reliabilities.mean()),
@@ -191,9 +224,124 @@ def aggregate_reference_distances(
             float(value)
             for value in selected_reference_effective_weights.tolist()
         ],
+        "selected_reference_member_raw_counts": selected_member_raw_counts,
+        "selected_reference_member_effective_weights": (
+            selected_member_effective_weights
+        ),
+        "reference_member_ids": selected_reference_member_ids,
         "bank_reliability_mean": float(reliabilities.mean()),
         "bank_reliability_min": float(reliabilities.min()),
     }
+    if return_selection_details:
+        audit["contributing_reference_indices_per_query"] = [
+            [int(value) for value in row]
+            for row in contributing_reference_indices.tolist()
+        ]
+        audit["contributing_reliabilities_per_query"] = [
+            [float(value) for value in row]
+            for row in contributing_reliabilities.tolist()
+        ]
+    return weighted_score, audit
+
+
+def score_dino_reference_committee(
+    query,
+    references,
+    scoring_weights,
+    *,
+    fallback_references=None,
+    patch_reliabilities=None,
+    reference_member_ids=None,
+    topmin_min=0.02,
+    topmin_max=0.3,
+    reliability_penalty=1.0,
+):
+    reference_count = int(references.shape[0]) if references is not None else 0
+    if reference_count != len(scoring_weights):
+        raise ValueError("scoring_weights must match reference count")
+    if reference_member_ids is None:
+        reference_member_ids = list(range(reference_count))
+    if len(reference_member_ids) != reference_count:
+        raise ValueError("reference_member_ids must match reference count")
+    if patch_reliabilities is not None and (
+        int(patch_reliabilities.shape[0]) != reference_count
+    ):
+        raise ValueError("patch_reliabilities must match reference count")
+
+    full_indices = [
+        index
+        for index, weight in enumerate(scoring_weights)
+        if float(weight) >= 1.0
+    ]
+    confidence_indices = [
+        index
+        for index, weight in enumerate(scoring_weights)
+        if float(weight) < 1.0
+    ]
+    base_audit = None
+    fallback_reason = None
+    if full_indices:
+        index_tensor = torch.as_tensor(
+            full_indices,
+            device=references.device,
+            dtype=torch.long,
+        )
+        patch_score, base_audit = MSM2_online(
+            query,
+            None,
+            references.index_select(0, index_tensor),
+            None,
+            fusion_mode="dino_only",
+            topmin_min=topmin_min,
+            topmin_max=topmin_max,
+            dino_patch_reliabilities=(
+                patch_reliabilities.index_select(0, index_tensor)
+                if patch_reliabilities is not None
+                else None
+            ),
+            dino_reference_member_ids=[
+                reference_member_ids[index] for index in full_indices
+            ],
+            reliability_penalty=reliability_penalty,
+        )
+    elif fallback_references is not None and fallback_references.shape[0] > 0:
+        patch_score = aggregate_reference_distances(
+            query,
+            fallback_references,
+            topmin_min=0.0,
+            topmin_max=0.3,
+        )
+        fallback_reason = "strict_history_dino"
+    else:
+        patch_score = torch.zeros(
+            query.shape[0], device=query.device, dtype=torch.float32
+        )
+        fallback_reason = "first_image_unavailable"
+
+    confidence_audits = []
+    for index in confidence_indices:
+        confidence_score, confidence_audit = MSM2_online(
+            query,
+            None,
+            references[index : index + 1],
+            None,
+            fusion_mode="dino_only",
+            topmin_min=topmin_min,
+            topmin_max=topmin_max,
+            dino_patch_reliabilities=(
+                patch_reliabilities[index : index + 1]
+                if patch_reliabilities is not None
+                else None
+            ),
+            dino_reference_member_ids=[reference_member_ids[index]],
+            reliability_penalty=reliability_penalty,
+        )
+        weight = float(scoring_weights[index])
+        patch_score = patch_score + weight * (
+            confidence_score - patch_score
+        )
+        confidence_audits.append((index, weight, confidence_audit))
+    return patch_score, base_audit, confidence_audits, fallback_reason
 
 
 def MSM2_online(
@@ -211,7 +359,9 @@ def MSM2_online(
     topmin_min=0,
     topmin_max=0.3,
     dino_patch_reliabilities=None,
+    dino_reference_member_ids=None,
     reliability_penalty=1.0,
+    return_selection_details=False,
 ):
     dino_result = aggregate_reference_distances(
         current_dino,
@@ -219,10 +369,18 @@ def MSM2_online(
         topmin_min,
         topmin_max,
         reference_patch_reliabilities=dino_patch_reliabilities,
+        reference_member_ids=dino_reference_member_ids,
         reliability_penalty=reliability_penalty,
-        return_reliability_audit=dino_patch_reliabilities is not None,
+        return_reliability_audit=(
+            dino_patch_reliabilities is not None
+            or dino_reference_member_ids is not None
+        ),
+        return_selection_details=return_selection_details,
     )
-    if dino_patch_reliabilities is None:
+    if (
+        dino_patch_reliabilities is None
+        and dino_reference_member_ids is None
+    ):
         dino_distance = dino_result
         reliability_audit = None
     else:

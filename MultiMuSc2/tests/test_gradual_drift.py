@@ -15,21 +15,196 @@ from MultiMuSc2.datasets.gradual_drift import (
 )
 from MultiMuSc2.examples.ablate_gradual_drift import (
     VARIANTS,
+    apply_controlled_contamination_replays,
     build_lab_audit_profiles,
     build_lab_ewma_profiles,
     drift_candidate_audit_metrics,
     expert_lab_metrics,
     expert_metrics,
     lab_metrics,
+    phase_metrics,
+    prepare_controlled_contamination_stream,
     select_stream_source_records,
     state_member_contamination_metrics,
 )
 from MultiMuSc2.examples.ablate_multistage_drift import (
     _repeated_state_metrics,
 )
+from MultiMuSc2.examples.run_priority5_contamination_matrix import (
+    VARIANTS as CONTAMINATION_VARIANTS,
+    completed as contamination_matrix_completed,
+)
 
 
 class GradualDriftLabAuditTest(unittest.TestCase):
+    def test_phase_metrics_reports_worst_normal_state_offline(self):
+        metrics = phase_metrics(
+            labels=np.asarray([0, 0, 0, 1]),
+            raw_scores=np.asarray([0.1, 0.3, 0.8, 0.9]),
+            schedule=[
+                {"phase": "cold_start", "segment_id": "a"},
+                {"phase": "cold_start", "segment_id": "a"},
+                {"phase": "plateau", "segment_id": "b"},
+                {"phase": "plateau", "segment_id": "b"},
+            ],
+        )
+
+        self.assertAlmostEqual(metrics["worst_state_normal_score"], 0.8)
+        self.assertEqual(
+            json.loads(metrics["state_normal_score_means"]),
+            {"a": 0.2, "b": 0.8},
+        )
+
+    def test_expert_metrics_reports_offline_coverage_and_reentry_regret(self):
+        timeline = [
+            {
+                "step": 0,
+                "active_experts_before": [{"expert_id": 0}],
+                "active_experts_after": [{"expert_id": 0, "image_id": 0}],
+                "support_threshold": 0.5,
+                "current_expert_supports": {0: 0.8},
+            },
+            {
+                "step": 1,
+                "active_experts_before": [
+                    {"expert_id": 0},
+                    {"expert_id": 1},
+                ],
+                "active_experts_after": [
+                    {"expert_id": 0, "image_id": 0},
+                    {"expert_id": 1, "image_id": 1},
+                ],
+                "support_threshold": 0.5,
+                "current_expert_supports": {0: 0.8, 1: 0.7},
+            },
+            {
+                "step": 2,
+                "active_experts_before": [
+                    {"expert_id": 0},
+                    {"expert_id": 1},
+                ],
+                "active_experts_after": [
+                    {"expert_id": 0, "image_id": 0},
+                    {"expert_id": 1, "image_id": 1},
+                ],
+                "support_threshold": 0.5,
+                "current_expert_supports": {0: 0.1, 1: 0.1},
+            },
+        ]
+        scoring = [
+            {"step": 0},
+            {
+                "step": 1,
+                "reentry_counterfactual_score": 0.4,
+                "reentry_score_regret": -0.1,
+            },
+            {"step": 2},
+        ]
+
+        metrics = expert_metrics(
+            timeline,
+            labels=np.asarray([0, 0, 1]),
+            scoring=scoring,
+        )
+
+        self.assertEqual(metrics["normal_state_observation_count"], 2)
+        self.assertEqual(metrics["normal_state_covered_count"], 2)
+        self.assertEqual(metrics["state_coverage_rate"], 1.0)
+        self.assertEqual(metrics["active_expert_redundancy"], 0.5)
+        self.assertEqual(metrics["reentry_counterfactual_score"], 0.4)
+        self.assertEqual(metrics["reentry_score_regret"], -0.1)
+        self.assertEqual(metrics["reentry_score_regret_abs_mean"], 0.1)
+
+    def test_contamination_matrix_resume_requires_every_paired_run(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            runs = [
+                {
+                    "drift_type": drift_type,
+                    "drift_level": "strong",
+                    "seed": 0,
+                    "variant": variant,
+                }
+                for drift_type in ("brightness", "color")
+                for variant in CONTAMINATION_VARIANTS
+            ]
+            summary_path = output_dir / "gradual_drift_summary.json"
+            summary_path.write_text(
+                json.dumps({"runs": runs}),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(
+                contamination_matrix_completed(
+                    output_dir,
+                    ["brightness", "color"],
+                    ["strong"],
+                    [0],
+                )
+            )
+            summary_path.write_text(
+                json.dumps({"runs": runs[:-1]}),
+                encoding="utf-8",
+            )
+            self.assertFalse(
+                contamination_matrix_completed(
+                    output_dir,
+                    ["brightness", "color"],
+                    ["strong"],
+                    [0],
+                )
+            )
+
+    def test_controlled_contamination_stream_starts_clean_before_injection(self):
+        anomaly_first = [
+            ("bottle", "broken_large", "anomaly-0.png", "mask-0.png"),
+            ("bottle", "good", "good-0.png", None),
+            ("bottle", "broken_small", "anomaly-1.png", "mask-1.png"),
+        ]
+
+        prepared, contamination_step, fixture_applied = (
+            prepare_controlled_contamination_stream(anomaly_first)
+        )
+
+        self.assertEqual(prepared[0][1], "good")
+        self.assertEqual(contamination_step, 1)
+        self.assertNotEqual(prepared[contamination_step][1], "good")
+        self.assertTrue(fixture_applied)
+
+    def test_controlled_contamination_stream_preserves_clean_first_order(self):
+        clean_first = [
+            ("bottle", "good", "good-0.png", None),
+            ("bottle", "good", "good-1.png", None),
+            ("bottle", "broken_large", "anomaly-0.png", "mask-0.png"),
+        ]
+
+        prepared, contamination_step, fixture_applied = (
+            prepare_controlled_contamination_stream(clean_first)
+        )
+
+        self.assertEqual(prepared, clean_first)
+        self.assertEqual(contamination_step, 2)
+        self.assertFalse(fixture_applied)
+
+    def test_controlled_contamination_replay_is_post_injection_and_auditable(self):
+        records = [
+            ("bottle", "good", "good-0.png", None),
+            ("bottle", "broken_large", "anomaly-0.png", "mask-0.png"),
+            ("bottle", "good", "good-1.png", None),
+            ("bottle", "broken_small", "anomaly-1.png", "mask-1.png"),
+        ]
+
+        prepared, replay_steps = apply_controlled_contamination_replays(
+            records,
+            contamination_step=1,
+            replay_count=1,
+        )
+
+        self.assertEqual(replay_steps, [2])
+        self.assertEqual(prepared[2], records[1])
+        self.assertEqual(prepared[0], records[0])
+        self.assertEqual(prepared[1], records[1])
+
     def test_state_audit_detects_anomalous_member_with_normal_representative(self):
         timeline = [{"step": 2, "active_experts_before": [{
             "image_id": 0,
@@ -80,6 +255,147 @@ class GradualDriftLabAuditTest(unittest.TestCase):
         self.assertEqual(
             history_reentry["photometric_history_reentry_members"], 2
         )
+
+    def test_priority6_variants_separate_disabled_hard_two_and_continuous(self):
+        disabled = VARIANTS["priority6_cross_patch_no_reentry"]
+        hard_two = VARIANTS[
+            "priority6_cross_patch_history_reentry_hard_two"
+        ]
+        enabled = VARIANTS["priority6_cross_patch_history_reentry"]
+        self.assertFalse(disabled["photometric_history_reentry_enabled"])
+        self.assertTrue(hard_two["photometric_history_reentry_enabled"])
+        self.assertFalse(
+            hard_two["photometric_history_reentry_continuous_evidence"]
+        )
+        self.assertTrue(enabled["photometric_history_reentry_enabled"])
+        self.assertTrue(
+            enabled["photometric_history_reentry_continuous_evidence"]
+        )
+        self.assertEqual(enabled["photometric_history_reentry_members"], 2)
+        ignored = {
+            "photometric_history_reentry_enabled",
+            "photometric_history_reentry_members",
+            "photometric_history_reentry_continuous_evidence",
+        }
+        self.assertEqual(
+            {key: value for key, value in disabled.items() if key not in ignored},
+            {key: value for key, value in hard_two.items() if key not in ignored},
+        )
+        self.assertEqual(
+            {key: value for key, value in hard_two.items() if key not in ignored},
+            {key: value for key, value in enabled.items() if key not in ignored},
+        )
+        self.assertEqual(
+            enabled["candidate_patch_reliability_mode"],
+            "cross_patch_robust",
+        )
+
+    def test_priority6_delta_j_shadow_only_changes_audit_flag(self):
+        online = VARIANTS["priority6_cross_patch_history_reentry"]
+        shadow = VARIANTS[
+            "priority6_cross_patch_history_reentry_delta_j_shadow"
+        ]
+        ignored = {"budget_unified_delta_j_shadow_enabled"}
+        self.assertFalse(
+            online.get("budget_unified_delta_j_shadow_enabled", False)
+        )
+        self.assertTrue(shadow["budget_unified_delta_j_shadow_enabled"])
+        self.assertEqual(
+            {key: value for key, value in online.items() if key not in ignored},
+            {key: value for key, value in shadow.items() if key not in ignored},
+        )
+
+    def test_priority6_delta_j_control_only_enables_control_flag(self):
+        shadow = VARIANTS[
+            "priority6_cross_patch_history_reentry_delta_j_shadow"
+        ]
+        control = VARIANTS[
+            "priority6_cross_patch_history_reentry_delta_j_control"
+        ]
+        ignored = {"budget_unified_delta_j_enabled"}
+        self.assertFalse(shadow.get("budget_unified_delta_j_enabled", False))
+        self.assertTrue(control["budget_unified_delta_j_enabled"])
+        self.assertTrue(control["budget_unified_delta_j_shadow_enabled"])
+        self.assertEqual(
+            {key: value for key, value in shadow.items() if key not in ignored},
+            {key: value for key, value in control.items() if key not in ignored},
+        )
+
+    def test_priority6_dino_delta_j_control_only_enables_dino_flag(self):
+        proxy = VARIANTS["priority6_delta_j_factorial_fitness_only"]
+        dino = VARIANTS[
+            "priority6_dino_delta_j_factorial_fitness_only"
+        ]
+        ignored = {
+            "budget_unified_delta_j_dino_score_enabled",
+            "photometric_fitness_adaptive_evidence_enabled",
+        }
+        self.assertFalse(
+            proxy.get("budget_unified_delta_j_dino_score_enabled", False)
+        )
+        self.assertTrue(dino["budget_unified_delta_j_dino_score_enabled"])
+        self.assertFalse(
+            proxy.get("photometric_fitness_adaptive_evidence_enabled", False)
+        )
+        self.assertTrue(
+            dino["photometric_fitness_adaptive_evidence_enabled"]
+        )
+        self.assertEqual(
+            {key: value for key, value in proxy.items() if key not in ignored},
+            {key: value for key, value in dino.items() if key not in ignored},
+        )
+
+    def test_priority6_factorial_only_toggles_denstream_and_fitness(self):
+        ignored = {
+            "photometric_denstream_support_enabled",
+            "photometric_fitness_history_enabled",
+            "photometric_candidate_window_mode",
+        }
+        for names in (
+            (
+                "priority6_factorial_neither",
+                "priority6_factorial_denstream_only",
+                "priority6_factorial_fitness_only",
+                "priority6_factorial_denstream_fitness",
+            ),
+            (
+                "priority6_delta_j_factorial_neither",
+                "priority6_delta_j_factorial_denstream_only",
+                "priority6_delta_j_factorial_fitness_only",
+                "priority6_delta_j_factorial_denstream_fitness",
+            ),
+            (
+                "priority6_dino_delta_j_factorial_neither",
+                "priority6_dino_delta_j_factorial_denstream_only",
+                "priority6_dino_delta_j_factorial_fitness_only",
+                "priority6_dino_delta_j_factorial_denstream_fitness",
+            ),
+        ):
+            neither, denstream, fitness, both = [
+                VARIANTS[name] for name in names
+            ]
+            self.assertFalse(neither["photometric_denstream_support_enabled"])
+            self.assertFalse(neither["photometric_fitness_history_enabled"])
+            self.assertTrue(denstream["photometric_denstream_support_enabled"])
+            self.assertFalse(denstream["photometric_fitness_history_enabled"])
+            self.assertFalse(fitness["photometric_denstream_support_enabled"])
+            self.assertTrue(fitness["photometric_fitness_history_enabled"])
+            self.assertTrue(both["photometric_denstream_support_enabled"])
+            self.assertTrue(both["photometric_fitness_history_enabled"])
+            common = {
+                key: value
+                for key, value in neither.items()
+                if key not in ignored
+            }
+            for variant in (denstream, fitness, both):
+                self.assertEqual(
+                    common,
+                    {
+                        key: value
+                        for key, value in variant.items()
+                        if key not in ignored
+                    },
+                )
 
     def test_priority5_cross_patch_variant_preserves_legacy_comparator(self):
         legacy = VARIANTS["priority5_task_aware_soft_reliability"]
@@ -333,6 +649,39 @@ class GradualDriftLabAuditTest(unittest.TestCase):
                 "budget_replacement_coverage_eviction_loss_median"
             ],
             0.0,
+        )
+
+    def test_expert_metrics_reports_unified_delta_j_shadow(self):
+        timeline = [
+            {
+                "step": 0,
+                "active_experts_after": [],
+                "expert_slots_after": [],
+                "budget_replacement_evaluation": {
+                    "outcome": "accepted",
+                    "unified_delta_j_shadow": {
+                        "recommended_victim_expert_id": 1,
+                        "agrees_with_existing_decision": True,
+                        "victim_profiles": {
+                            0: {"delta_j": -0.2},
+                            1: {"delta_j": 0.4},
+                        },
+                    },
+                },
+            }
+        ]
+
+        metrics = expert_metrics(timeline, labels=np.asarray([0]))
+
+        self.assertEqual(metrics["unified_delta_j_shadow_count"], 1)
+        self.assertEqual(
+            metrics["unified_delta_j_shadow_recommendation_count"], 1
+        )
+        self.assertEqual(
+            metrics["unified_delta_j_shadow_agreement_rate"], 1.0
+        )
+        self.assertAlmostEqual(
+            metrics["unified_delta_j_shadow_value_median"], 0.1
         )
 
     def test_expert_metrics_counts_photometric_state_only_from_timeline(self):
@@ -643,6 +992,42 @@ class GradualDriftLabAuditTest(unittest.TestCase):
         self.assertEqual(
             metrics["polluted_expert_future_anomaly_scoring_count"], 1
         )
+
+    def test_expert_metrics_reports_clean_counterfactual_auroc(self):
+        timeline = [
+            {
+                "step": step,
+                "active_experts_after": [],
+                "expert_slots_after": [],
+                "deleted_expert_ids": [],
+                "admitted_expert_id": None,
+            }
+            for step in range(4)
+        ]
+        scoring = [
+            {
+                "step": step,
+                "active_expert_ids": [],
+                "expert_image_ids": [],
+                "score_without_contaminated_reference": (
+                    0.2 if step == 2 else None
+                ),
+            }
+            for step in range(4)
+        ]
+
+        metrics = expert_metrics(
+            timeline,
+            labels=np.asarray([0, 0, 1, 1]),
+            scoring=scoring,
+            raw_scores=np.asarray([0.1, 0.4, 0.8, 0.9]),
+        )
+
+        self.assertAlmostEqual(
+            metrics["counterfactual_without_contamination_image_auroc"],
+            0.75,
+        )
+        self.assertEqual(metrics["counterfactual_score_count"], 1)
 
     def test_multistage_schedule_has_distinct_absolute_states(self):
         schedule = build_multistage_drift_schedule()

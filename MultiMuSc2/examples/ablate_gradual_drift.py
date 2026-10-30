@@ -1,6 +1,7 @@
 import argparse
 import copy
 import csv
+import hashlib
 import json
 import sys
 import time
@@ -392,6 +393,93 @@ VARIANTS["priority5_task_aware_cross_patch_reliability"] = {
     **VARIANTS["priority5_task_aware_soft_reliability"],
     "candidate_patch_reliability_mode": "cross_patch_robust",
 }
+VARIANTS["priority6_cross_patch_no_reentry"] = {
+    **VARIANTS["priority5_task_aware_cross_patch_reliability"],
+    "photometric_history_reentry_enabled": False,
+}
+VARIANTS["priority6_cross_patch_history_reentry_hard_two"] = {
+    **VARIANTS["priority5_task_aware_cross_patch_reliability"],
+    "photometric_history_reentry_enabled": True,
+    "photometric_history_reentry_members": 2,
+    "photometric_history_reentry_continuous_evidence": False,
+}
+VARIANTS["priority6_cross_patch_history_reentry"] = {
+    **VARIANTS["priority5_task_aware_cross_patch_reliability"],
+    "photometric_history_reentry_enabled": True,
+    "photometric_history_reentry_members": 2,
+    "photometric_history_reentry_continuous_evidence": True,
+}
+VARIANTS["priority6_cross_patch_history_reentry_delta_j_shadow"] = {
+    **VARIANTS["priority6_cross_patch_history_reentry"],
+    "budget_unified_delta_j_shadow_enabled": True,
+}
+VARIANTS["priority6_cross_patch_history_reentry_delta_j_control"] = {
+    **VARIANTS["priority6_cross_patch_history_reentry_delta_j_shadow"],
+    "budget_unified_delta_j_enabled": True,
+}
+VARIANTS["priority6_factorial_neither"] = {
+    **VARIANTS["priority6_cross_patch_history_reentry"],
+    "photometric_denstream_support_enabled": False,
+    "photometric_fitness_history_enabled": False,
+    "photometric_candidate_window_mode": "dynamic_low_risk",
+}
+VARIANTS["priority6_factorial_denstream_only"] = {
+    **VARIANTS["priority6_factorial_neither"],
+    "photometric_denstream_support_enabled": True,
+}
+VARIANTS["priority6_factorial_fitness_only"] = {
+    **VARIANTS["priority6_factorial_neither"],
+    "photometric_fitness_history_enabled": True,
+    "photometric_candidate_window_mode": "history",
+}
+VARIANTS["priority6_factorial_denstream_fitness"] = {
+    **VARIANTS["priority6_factorial_fitness_only"],
+    "photometric_denstream_support_enabled": True,
+}
+VARIANTS["priority6_delta_j_factorial_neither"] = {
+    **VARIANTS["priority6_cross_patch_history_reentry_delta_j_control"],
+    "photometric_denstream_support_enabled": False,
+    "photometric_fitness_history_enabled": False,
+    "photometric_candidate_window_mode": "dynamic_low_risk",
+}
+VARIANTS["priority6_delta_j_factorial_denstream_only"] = {
+    **VARIANTS["priority6_delta_j_factorial_neither"],
+    "photometric_denstream_support_enabled": True,
+}
+VARIANTS["priority6_delta_j_factorial_fitness_only"] = {
+    **VARIANTS["priority6_delta_j_factorial_neither"],
+    "photometric_fitness_history_enabled": True,
+    "photometric_candidate_window_mode": "history",
+}
+VARIANTS["priority6_delta_j_factorial_denstream_fitness"] = {
+    **VARIANTS["priority6_delta_j_factorial_fitness_only"],
+    "photometric_denstream_support_enabled": True,
+}
+VARIANTS["priority6_dino_delta_j_factorial_neither"] = {
+    **VARIANTS["priority6_delta_j_factorial_neither"],
+    "budget_unified_delta_j_dino_score_enabled": True,
+    "photometric_fitness_adaptive_evidence_enabled": True,
+}
+VARIANTS["priority6_dino_delta_j_factorial_denstream_only"] = {
+    **VARIANTS["priority6_delta_j_factorial_denstream_only"],
+    "budget_unified_delta_j_dino_score_enabled": True,
+    "photometric_fitness_adaptive_evidence_enabled": True,
+}
+VARIANTS["priority6_dino_delta_j_factorial_fitness_only"] = {
+    **VARIANTS["priority6_delta_j_factorial_fitness_only"],
+    "budget_unified_delta_j_dino_score_enabled": True,
+    "photometric_fitness_adaptive_evidence_enabled": True,
+}
+VARIANTS["priority6_dino_delta_j_factorial_denstream_fitness"] = {
+    **VARIANTS["priority6_delta_j_factorial_denstream_fitness"],
+    "budget_unified_delta_j_dino_score_enabled": True,
+    "photometric_fitness_adaptive_evidence_enabled": True,
+}
+VARIANTS["priority5_task_aware_hierarchical_reliability"] = {
+    **VARIANTS["priority5_task_aware_cross_patch_reliability"],
+    "candidate_patch_reliability_mode": "hierarchical_global_local",
+    "hierarchical_reliability_enabled": True,
+}
 VARIANTS["photometric_multistage_cap2_state_distribution_only"] = {
     **VARIANTS["photometric_multistage_cap2_dual_replace_history_reentry"],
     "photometric_state_distribution_enabled": True,
@@ -730,6 +818,9 @@ def configure_variant(
     committee["photometric_fitness_history_enabled"] = bool(
         variant.get("photometric_fitness_history_enabled", False)
     )
+    committee["photometric_fitness_adaptive_evidence_enabled"] = bool(
+        variant.get("photometric_fitness_adaptive_evidence_enabled", False)
+    )
     committee["photometric_history_min"] = 3
     committee["photometric_history_max"] = 16
     state_registry_cap = variant.get("photometric_state_registry_cap")
@@ -745,6 +836,11 @@ def configure_variant(
     )
     committee["photometric_history_reentry_members"] = int(
         variant.get("photometric_history_reentry_members", 2)
+    )
+    committee["photometric_history_reentry_continuous_evidence"] = bool(
+        variant.get(
+            "photometric_history_reentry_continuous_evidence", False
+        )
     )
     committee["photometric_history_median_risk_max"] = float(
         variant.get("photometric_history_median_risk_max", 1.25)
@@ -821,6 +917,15 @@ def configure_variant(
     committee["budget_virtual_swap_history_size"] = int(
         variant.get("budget_virtual_swap_history_size", 32)
     )
+    committee["budget_unified_delta_j_shadow_enabled"] = bool(
+        variant.get("budget_unified_delta_j_shadow_enabled", False)
+    )
+    committee["budget_unified_delta_j_enabled"] = bool(
+        variant.get("budget_unified_delta_j_enabled", False)
+    )
+    committee["budget_unified_delta_j_dino_score_enabled"] = bool(
+        variant.get("budget_unified_delta_j_dino_score_enabled", False)
+    )
     committee["candidate_reliability_enabled"] = bool(
         variant.get("candidate_reliability_enabled", False)
     )
@@ -841,6 +946,9 @@ def configure_variant(
     )
     committee["reference_reliability_penalty"] = float(
         variant.get("reference_reliability_penalty", 1.0)
+    )
+    committee["hierarchical_reliability_enabled"] = bool(
+        variant.get("hierarchical_reliability_enabled", False)
     )
     committee["minimum_active_experts"] = int(
         variant.get("minimum_active_experts", 0)
@@ -1727,6 +1835,14 @@ def phase_metrics(
     raw_scores = np.asarray(raw_scores)
 
     result = {}
+    state_normal_scores = {}
+    for index, drift in enumerate(schedule):
+        if bool(labels[index]):
+            continue
+        state_id = str(drift.get("segment_id", drift["phase"]))
+        state_normal_scores.setdefault(state_id, []).append(
+            float(raw_scores[index])
+        )
 
     for phase in PHASES:
         indices = [
@@ -1760,6 +1876,22 @@ def phase_metrics(
             if normal_scores.size > 0
             else None
         )
+
+    state_normal_score_means = {
+        state_id: float(np.mean(scores))
+        for state_id, scores in state_normal_scores.items()
+        if scores
+    }
+    result["worst_state_normal_score"] = (
+        max(state_normal_score_means.values())
+        if state_normal_score_means
+        else None
+    )
+    result["state_normal_score_means"] = json.dumps(
+        state_normal_score_means,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
     return result
 
@@ -1822,7 +1954,11 @@ def state_member_contamination_metrics(timeline, labels):
 
 
 def expert_metrics(
-    timeline, labels, scoring=None, virtual_swap_enabled=False
+    timeline,
+    labels,
+    scoring=None,
+    virtual_swap_enabled=False,
+    raw_scores=None,
 ):
     labels = np.asarray(labels)
 
@@ -1870,6 +2006,13 @@ def expert_metrics(
     evaluated_coverage_removal_losses = []
     evaluated_coverage_swap_gains = []
     evaluated_coverage_eviction_losses = []
+    unified_delta_j_shadow_count = 0
+    unified_delta_j_shadow_recommendation_count = 0
+    unified_delta_j_shadow_agreement_count = 0
+    unified_delta_j_shadow_values = []
+    unified_delta_j_dino_score_shadow_events = []
+    unified_delta_j_dino_score_penalties = []
+    unified_delta_j_controlled_count = 0
     max_expert_slots = 0
     final_expert_slots = 0
     dormant_transition_count = 0
@@ -1906,8 +2049,101 @@ def expert_metrics(
     fitness_history_available_counts = []
     fitness_history_selected_counts = []
     fitness_history_effective_sizes = []
+    controlled_contamination_expert_ids = set()
+    controlled_contamination_steps = []
+    controlled_history_eviction_steps = []
+    controlled_history_evicted_expert_ids = []
+    online_state_coverage_rates = []
+    online_active_expert_redundancies = []
+    online_effective_redundancies = []
+    online_redundant_without_benefit_counts = []
+    online_exclusive_coverage_counts = []
+    online_coverage_removal_losses = []
+    online_dino_coverage_removal_losses = []
+    normal_state_observation_count = 0
+    normal_state_covered_count = 0
+    normal_state_redundantly_covered_count = 0
 
     for record in timeline:
+        diversity_audit = record.get("diversity_audit_before") or {}
+        if diversity_audit.get("state_coverage_rate") is not None:
+            online_state_coverage_rates.append(
+                float(diversity_audit["state_coverage_rate"])
+            )
+        if diversity_audit.get("active_expert_redundancy") is not None:
+            online_active_expert_redundancies.append(
+                float(diversity_audit["active_expert_redundancy"])
+            )
+        if diversity_audit.get("effective_redundancy") is not None:
+            online_effective_redundancies.append(
+                float(diversity_audit["effective_redundancy"])
+            )
+        online_redundant_without_benefit_counts.append(
+            int(diversity_audit.get("redundant_without_benefit_count", 0))
+        )
+        expert_coverage_profiles = (
+            diversity_audit.get("expert_coverage_profiles") or {}
+        )
+        online_exclusive_coverage_counts.append(
+            sum(
+                int(profile.get("exclusive_coverage_count", 0))
+                for profile in expert_coverage_profiles.values()
+            )
+        )
+        online_coverage_removal_losses.extend(
+            float(profile.get("coverage_removal_loss", 0.0))
+            for profile in expert_coverage_profiles.values()
+        )
+        online_dino_coverage_removal_losses.extend(
+            float(profile["dino_coverage_removal_loss"])
+            for profile in expert_coverage_profiles.values()
+            if profile.get("dino_coverage_removal_loss") is not None
+        )
+        record_step = int(record.get("step", -1))
+        active_ids = {
+            int(expert["expert_id"])
+            for expert in record.get("active_experts_before", [])
+        }
+        support_threshold = record.get("support_threshold")
+        current_supports = record.get("current_expert_supports") or {}
+        if (
+            0 <= record_step < len(labels)
+            and not bool(labels[record_step])
+            and active_ids
+            and support_threshold is not None
+        ):
+            supported_count = sum(
+                float(support) >= float(support_threshold)
+                for expert_id, support in current_supports.items()
+                if int(expert_id) in active_ids and support is not None
+            )
+            normal_state_observation_count += 1
+            normal_state_covered_count += int(supported_count >= 1)
+            normal_state_redundantly_covered_count += int(
+                supported_count >= 2
+            )
+        controlled_history_eviction = record.get(
+            "controlled_history_eviction"
+        ) or {}
+        if controlled_history_eviction.get("evicted"):
+            controlled_history_eviction_steps.append(
+                int(controlled_history_eviction["step"])
+            )
+            controlled_history_evicted_expert_ids.append(
+                int(controlled_history_eviction["target_expert_id"])
+            )
+        controlled_contamination = record.get(
+            "controlled_contamination"
+        ) or {}
+        if controlled_contamination.get("injected"):
+            injected_expert_id = controlled_contamination.get(
+                "injected_expert_id"
+            )
+            if injected_expert_id is not None:
+                controlled_contamination_expert_ids.add(
+                    int(injected_expert_id)
+                )
+                controlled_contamination_steps.append(int(record.get("step", 0)))
         active_after = record.get(
             "active_experts_after",
             [],
@@ -2138,6 +2374,11 @@ def expert_metrics(
             budget_replacement_evaluation_outcomes[outcome] = (
                 budget_replacement_evaluation_outcomes.get(outcome, 0) + 1
             )
+            unified_delta_j_controlled_count += int(
+                replacement_evaluation.get(
+                    "unified_delta_j_controlled", False
+                )
+            )
             evaluated_fraction = replacement_evaluation.get(
                 "new_coverage_fraction"
             )
@@ -2162,6 +2403,96 @@ def expert_metrics(
                 evaluated_coverage_eviction_losses.append(
                     float(eviction_loss)
                 )
+            delta_j_shadow = replacement_evaluation.get(
+                "unified_delta_j_shadow"
+            ) or {}
+            if delta_j_shadow:
+                unified_delta_j_shadow_count += 1
+                recommended_victim = delta_j_shadow.get(
+                    "recommended_victim_expert_id"
+                )
+                unified_delta_j_shadow_recommendation_count += int(
+                    recommended_victim is not None
+                )
+                agreement = delta_j_shadow.get(
+                    "agrees_with_existing_decision"
+                )
+                unified_delta_j_shadow_agreement_count += int(
+                    agreement is True
+                )
+                for victim_profile in (
+                    delta_j_shadow.get("victim_profiles") or {}
+                ).values():
+                    if victim_profile.get("delta_j") is not None:
+                        unified_delta_j_shadow_values.append(
+                            float(victim_profile["delta_j"])
+                        )
+                selected_victim = delta_j_shadow.get(
+                    "existing_selected_victim_expert_id"
+                )
+                victim_profiles = delta_j_shadow.get("victim_profiles") or {}
+                selected_profile = (
+                    victim_profiles.get(selected_victim)
+                    or victim_profiles.get(str(selected_victim))
+                    if selected_victim is not None
+                    else None
+                )
+                dino_shadow = (
+                    (selected_profile or {}).get("dino_normal_score_shadow")
+                    or delta_j_shadow.get("dino_normal_score_shadow")
+                    or {}
+                )
+                if dino_shadow.get("available", False):
+                    penalty = float(dino_shadow["normal_score_penalty"])
+                    unified_delta_j_dino_score_penalties.append(penalty)
+                    unified_delta_j_dino_score_shadow_events.append(
+                        {
+                            "step": int(record.get("step", 0)),
+                            "formal_change_type": delta_j_shadow.get(
+                                "formal_change_type"
+                            ),
+                            "actual_decision": delta_j_shadow.get(
+                                "actual_decision"
+                            ),
+                            "selected_victim_expert_id": selected_victim,
+                            "recommended_victim_expert_id": (
+                                recommended_victim
+                            ),
+                            "dino_score_recommended_victim_expert_id": (
+                                delta_j_shadow.get(
+                                    "dino_score_recommended_victim_expert_id"
+                                )
+                            ),
+                            "dino_score_would_accept": delta_j_shadow.get(
+                                "dino_score_would_accept"
+                            ),
+                            "dino_score_delta_j": delta_j_shadow.get(
+                                "dino_score_delta_j"
+                            ),
+                            "dino_score_recommended_scoring_weight": (
+                                delta_j_shadow.get(
+                                    "dino_score_recommended_scoring_weight"
+                                )
+                            ),
+                            "confidence_weight_profiles": (
+                                delta_j_shadow.get(
+                                    "confidence_weight_profiles", {}
+                                )
+                            ),
+                            "history_count": int(
+                                dino_shadow.get("history_count", 0)
+                            ),
+                            "normal_score_penalty": penalty,
+                            "max_normal_score_shift": float(
+                                dino_shadow.get("max_normal_score_shift", 0.0)
+                            ),
+                            "normal_score_iqr_increase": float(
+                                dino_shadow.get(
+                                    "normal_score_iqr_increase", 0.0
+                                )
+                            ),
+                        }
+                    )
 
         admitted_expert_id = record.get(
             "admitted_expert_id"
@@ -2253,6 +2584,24 @@ def expert_metrics(
     polluted_reference_score_shift_mean = None
     polluted_reference_normal_score_shift_mean = None
     polluted_reference_anomaly_score_shift_mean = None
+    contaminated_reference_selection_rate = None
+    normal_reference_selection_rate = None
+    contaminated_raw_weight_ratio = None
+    contaminated_effective_weight_ratio = None
+    contaminated_blend_contribution_ratio = None
+    contaminated_effective_to_raw_ratio = None
+    contaminated_global_to_raw_ratio = None
+    contaminated_global_to_local_ratio = None
+    pollution_score_shift_abs_mean = None
+    pollution_score_shift_abs_p95 = None
+    pollution_score_shift_abs_max = None
+    pollution_score_shift_normal_abs_mean = None
+    pollution_score_shift_anomaly_abs_mean = None
+    counterfactual_without_contamination_image_auroc = None
+    counterfactual_score_count = 0
+    causal_reference_violation_count = 0
+    reentry_counterfactual_scores = []
+    reentry_score_regrets = []
     if scoring is not None:
         polluted_scoring_steps = set()
         polluted_anomaly_steps = set()
@@ -2260,6 +2609,13 @@ def expert_metrics(
             expert_id
             for expert_id, is_anomaly in expert_source_labels.items()
             if is_anomaly
+        }
+        polluted_expert_ids.update(controlled_contamination_expert_ids)
+        contaminated_member_image_ids = {
+            int((record.get("controlled_contamination") or {}).get("source_image_id"))
+            for record in timeline
+            if (record.get("controlled_contamination") or {}).get("injected")
+            and (record.get("controlled_contamination") or {}).get("source_image_id") is not None
         }
         for scoring_index, scoring_record in enumerate(scoring):
             scoring_step = int(
@@ -2307,7 +2663,44 @@ def expert_metrics(
         polluted_reference_score_shifts = []
         polluted_reference_normal_score_shifts = []
         polluted_reference_anomaly_score_shifts = []
+        total_selected_reference_steps = 0
+        contaminated_selected_reference_steps = 0
+        normal_selected_reference_steps = 0
+        total_raw_reference_weight = 0.0
+        total_effective_reference_weight = 0.0
+        total_blend_contribution = 0.0
+        contaminated_blend_contribution = 0.0
+        contaminated_raw_weight = 0.0
+        contaminated_effective_weight = 0.0
+        pollution_score_shifts = []
+        pollution_score_shifts_normal = []
+        pollution_score_shifts_anomaly = []
         for scoring_record in scoring:
+            scoring_step = int(scoring_record.get("step", 0))
+            reentry_counterfactual = scoring_record.get(
+                "reentry_counterfactual_score"
+            )
+            reentry_regret = scoring_record.get("reentry_score_regret")
+            if reentry_counterfactual is not None:
+                reentry_counterfactual_scores.append(
+                    float(reentry_counterfactual)
+                )
+            if reentry_regret is not None:
+                reentry_score_regrets.append(float(reentry_regret))
+            causal_reference_violation_count += sum(
+                int(image_id) >= scoring_step
+                for image_id in scoring_record.get("expert_image_ids", [])
+            )
+            pollution_shift = scoring_record.get("pollution_score_shift")
+            if pollution_shift is not None:
+                absolute_shift = abs(float(pollution_shift))
+                pollution_score_shifts.append(absolute_shift)
+                if 0 <= scoring_step < len(labels) and bool(
+                    labels[scoring_step]
+                ):
+                    pollution_score_shifts_anomaly.append(absolute_shift)
+                else:
+                    pollution_score_shifts_normal.append(absolute_shift)
             expert_ids = scoring_record.get("active_expert_ids", [])
             image_ids = scoring_record.get("expert_image_ids", [])
             weights = scoring_record.get(
@@ -2356,8 +2749,55 @@ def expert_metrics(
                 "selected_reference_contributions", []
             )
             if reference_contributions:
+                total_selected_reference_steps += 1
                 polluted_actual_selection_step_count += 1
+                step_has_contaminated_reference = False
+                step_has_normal_reference = False
                 for contribution in reference_contributions:
+                    member_image_id = contribution.get("member_image_id")
+                    member_is_contaminated = (
+                        member_image_id is not None
+                        and int(member_image_id) in contaminated_member_image_ids
+                    )
+                    if (
+                        member_image_id is not None
+                        and int(member_image_id) >= scoring_step
+                    ):
+                        causal_reference_violation_count += 1
+                    contribution["member_is_contaminated"] = bool(
+                        member_is_contaminated
+                    )
+                    raw_contribution = float(
+                        contribution.get(
+                            "raw_contribution",
+                            contribution.get("raw_weight", 0.0),
+                        )
+                    )
+                    effective_contribution = float(
+                        contribution.get(
+                            "local_effective_contribution",
+                            contribution.get("effective_weight", 0.0),
+                        )
+                    )
+                    blend_contribution = float(
+                        contribution.get(
+                            "global_blend_contribution",
+                            contribution.get(
+                                "blend_contribution",
+                                effective_contribution,
+                            ),
+                        )
+                    )
+                    total_raw_reference_weight += raw_contribution
+                    total_effective_reference_weight += effective_contribution
+                    total_blend_contribution += blend_contribution
+                    if member_is_contaminated and raw_contribution > 0.0:
+                        step_has_contaminated_reference = True
+                        contaminated_raw_weight += raw_contribution
+                        contaminated_effective_weight += effective_contribution
+                        contaminated_blend_contribution += blend_contribution
+                    elif not member_is_contaminated and raw_contribution > 0.0:
+                        step_has_normal_reference = True
                     if (
                         int(contribution["expert_id"])
                         in polluted_expert_ids
@@ -2368,6 +2808,10 @@ def expert_metrics(
                         polluted_raw_reference_weight += float(
                             contribution["raw_weight"]
                         )
+                if step_has_contaminated_reference:
+                    contaminated_selected_reference_steps += 1
+                if step_has_normal_reference:
+                    normal_selected_reference_steps += 1
             else:
                 polluted_reference_bank_fallback_step_count += 1
                 patch_reliability_means = scoring_record.get(
@@ -2465,6 +2909,90 @@ def expert_metrics(
             if polluted_reference_anomaly_score_shifts
             else None
         )
+        contaminated_reference_selection_rate = (
+            float(
+                contaminated_selected_reference_steps
+                / total_selected_reference_steps
+            )
+            if total_selected_reference_steps
+            else None
+        )
+        normal_reference_selection_rate = (
+            float(normal_selected_reference_steps / total_selected_reference_steps)
+            if total_selected_reference_steps
+            else None
+        )
+        contaminated_raw_weight_ratio = (
+            float(contaminated_raw_weight / total_raw_reference_weight)
+            if total_raw_reference_weight > 0.0
+            else None
+        )
+        contaminated_effective_weight_ratio = (
+            float(contaminated_effective_weight / total_effective_reference_weight)
+            if total_effective_reference_weight > 0.0
+            else None
+        )
+        contaminated_blend_contribution_ratio = (
+            float(contaminated_blend_contribution / total_blend_contribution)
+            if total_blend_contribution > 0.0
+            else None
+        )
+        contaminated_effective_to_raw_ratio = (
+            float(contaminated_effective_weight / contaminated_raw_weight)
+            if contaminated_raw_weight > 0.0
+            else None
+        )
+        contaminated_global_to_raw_ratio = (
+            float(contaminated_blend_contribution / contaminated_raw_weight)
+            if contaminated_raw_weight > 0.0
+            else None
+        )
+        contaminated_global_to_local_ratio = (
+            float(
+                contaminated_blend_contribution
+                / contaminated_effective_weight
+            )
+            if contaminated_effective_weight > 0.0
+            else None
+        )
+        if pollution_score_shifts:
+            pollution_score_shift_abs_mean = float(
+                np.mean(pollution_score_shifts)
+            )
+            pollution_score_shift_abs_p95 = float(
+                np.quantile(pollution_score_shifts, 0.95)
+            )
+            pollution_score_shift_abs_max = float(
+                np.max(pollution_score_shifts)
+            )
+        pollution_score_shift_normal_abs_mean = (
+            float(np.mean(pollution_score_shifts_normal))
+            if pollution_score_shifts_normal
+            else None
+        )
+        pollution_score_shift_anomaly_abs_mean = (
+            float(np.mean(pollution_score_shifts_anomaly))
+            if pollution_score_shifts_anomaly
+            else None
+        )
+        if raw_scores is not None and len(raw_scores) == len(labels):
+            counterfactual_scores = np.asarray(raw_scores, dtype=float).copy()
+            for scoring_index, scoring_record in enumerate(scoring):
+                counterfactual_score = scoring_record.get(
+                    "score_without_contaminated_reference"
+                )
+                if counterfactual_score is None:
+                    continue
+                scoring_step = int(scoring_record.get("step", scoring_index))
+                if 0 <= scoring_step < len(counterfactual_scores):
+                    counterfactual_scores[scoring_step] = float(
+                        counterfactual_score
+                    )
+                    counterfactual_score_count += 1
+            counterfactual_without_contamination_image_auroc = safe_auroc(
+                labels,
+                counterfactual_scores,
+            )
 
     return {
         **state_member_contamination_metrics(timeline, labels),
@@ -2497,6 +3025,69 @@ def expert_metrics(
         "history_reentry_rejected_count": history_reentry_rejected_count,
         "max_historical_state_count": max_historical_state_count,
         "final_historical_state_count": final_historical_state_count,
+        "state_coverage_rate": (
+            float(
+                normal_state_covered_count
+                / normal_state_observation_count
+            )
+            if normal_state_observation_count
+            else None
+        ),
+        "active_expert_redundancy": (
+            float(
+                normal_state_redundantly_covered_count
+                / normal_state_covered_count
+            )
+            if normal_state_covered_count
+            else None
+        ),
+        "normal_state_observation_count": normal_state_observation_count,
+        "normal_state_covered_count": normal_state_covered_count,
+        "online_coverage_history_state_coverage_rate": (
+            float(np.mean(online_state_coverage_rates))
+            if online_state_coverage_rates
+            else None
+        ),
+        "online_coverage_history_active_expert_redundancy": (
+            float(np.mean(online_active_expert_redundancies))
+            if online_active_expert_redundancies
+            else None
+        ),
+        "online_coverage_history_effective_redundancy": (
+            float(np.mean(online_effective_redundancies))
+            if online_effective_redundancies
+            else None
+        ),
+        "online_redundant_without_benefit_count_max": (
+            max(online_redundant_without_benefit_counts, default=0)
+        ),
+        "online_exclusive_coverage_count_max": (
+            max(online_exclusive_coverage_counts, default=0)
+        ),
+        "online_coverage_removal_loss_max": (
+            max(online_coverage_removal_losses, default=0.0)
+        ),
+        "online_dino_coverage_removal_loss_max": (
+            max(online_dino_coverage_removal_losses, default=0.0)
+        ),
+        "reentry_counterfactual_score": (
+            float(np.mean(reentry_counterfactual_scores))
+            if reentry_counterfactual_scores
+            else None
+        ),
+        "reentry_score_regret": (
+            float(np.mean(reentry_score_regrets))
+            if reentry_score_regrets
+            else None
+        ),
+        "reentry_score_regret_abs_mean": (
+            float(np.mean(np.abs(reentry_score_regrets)))
+            if reentry_score_regrets
+            else None
+        ),
+        "reentry_counterfactual_step_count": len(
+            reentry_counterfactual_scores
+        ),
         "historical_state_created_count": state_lifecycle_counts["create"],
         "historical_state_matched_count": state_lifecycle_counts["match"],
         "historical_state_updated_count": state_lifecycle_counts["update"],
@@ -2546,6 +3137,42 @@ def expert_metrics(
         ),
         "polluted_reference_anomaly_score_shift_mean": (
             polluted_reference_anomaly_score_shift_mean
+        ),
+        "contaminated_reference_selection_rate": (
+            contaminated_reference_selection_rate
+        ),
+        "normal_reference_selection_rate": normal_reference_selection_rate,
+        "contaminated_raw_weight_ratio": contaminated_raw_weight_ratio,
+        "contaminated_effective_weight_ratio": (
+            contaminated_effective_weight_ratio
+        ),
+        "contaminated_blend_contribution_ratio": (
+            contaminated_blend_contribution_ratio
+        ),
+        "contaminated_effective_to_raw_ratio": (
+            contaminated_effective_to_raw_ratio
+        ),
+        "contaminated_global_to_raw_ratio": (
+            contaminated_global_to_raw_ratio
+        ),
+        "contaminated_global_to_local_ratio": (
+            contaminated_global_to_local_ratio
+        ),
+        "pollution_score_shift_abs_mean": pollution_score_shift_abs_mean,
+        "pollution_score_shift_abs_p95": pollution_score_shift_abs_p95,
+        "pollution_score_shift_abs_max": pollution_score_shift_abs_max,
+        "pollution_score_shift_normal_abs_mean": (
+            pollution_score_shift_normal_abs_mean
+        ),
+        "pollution_score_shift_anomaly_abs_mean": (
+            pollution_score_shift_anomaly_abs_mean
+        ),
+        "counterfactual_without_contamination_image_auroc": (
+            counterfactual_without_contamination_image_auroc
+        ),
+        "counterfactual_score_count": counterfactual_score_count,
+        "causal_reference_violation_count": (
+            causal_reference_violation_count
         ),
         "fitness_history_available_mean": (
             float(np.mean(fitness_history_available_counts))
@@ -2597,6 +3224,48 @@ def expert_metrics(
         ),
         "budget_replacement_attempt_count": (
             budget_replacement_attempt_count
+        ),
+        "unified_delta_j_shadow_count": unified_delta_j_shadow_count,
+        "unified_delta_j_shadow_recommendation_count": (
+            unified_delta_j_shadow_recommendation_count
+        ),
+        "unified_delta_j_shadow_agreement_rate": (
+            float(
+                unified_delta_j_shadow_agreement_count
+                / unified_delta_j_shadow_count
+            )
+            if unified_delta_j_shadow_count
+            else None
+        ),
+        "unified_delta_j_shadow_value_median": (
+            float(np.median(unified_delta_j_shadow_values))
+            if unified_delta_j_shadow_values
+            else None
+        ),
+        "unified_delta_j_dino_score_shadow_count": len(
+            unified_delta_j_dino_score_shadow_events
+        ),
+        "unified_delta_j_dino_score_penalty_median": (
+            float(np.median(unified_delta_j_dino_score_penalties))
+            if unified_delta_j_dino_score_penalties
+            else None
+        ),
+        "unified_delta_j_dino_score_penalty_max": (
+            max(unified_delta_j_dino_score_penalties)
+            if unified_delta_j_dino_score_penalties
+            else None
+        ),
+        "unified_delta_j_dino_score_shadow_events": json.dumps(
+            unified_delta_j_dino_score_shadow_events,
+            ensure_ascii=False,
+        ),
+        "unified_delta_j_controlled_count": (
+            unified_delta_j_controlled_count
+        ),
+        "unified_delta_j_rejected_count": (
+            budget_replacement_evaluation_outcomes.get(
+                "unified_delta_j_rejected", 0
+            )
         ),
         "budget_replacement_accepted_count": (
             budget_replacement_evaluation_outcomes.get("accepted", 0)
@@ -2674,6 +3343,24 @@ def expert_metrics(
         ),
         "polluted_expert_admissions": (
             polluted_expert_admissions
+        ),
+        "controlled_contamination_expert_count": len(
+            controlled_contamination_expert_ids
+        ),
+        "controlled_contamination_steps": json.dumps(
+            controlled_contamination_steps,
+            ensure_ascii=False,
+        ),
+        "controlled_history_eviction_count": len(
+            controlled_history_eviction_steps
+        ),
+        "controlled_history_eviction_steps": json.dumps(
+            controlled_history_eviction_steps,
+            ensure_ascii=False,
+        ),
+        "controlled_history_evicted_expert_ids": json.dumps(
+            controlled_history_evicted_expert_ids,
+            ensure_ascii=False,
         ),
         "polluted_admission_fraction": (
             polluted_fraction
@@ -3354,6 +4041,186 @@ def write_step_diagnostics(
         writer.writerows(rows)
 
 
+def write_contamination_reference_audit(output_path, audit):
+    timeline = audit.get("timeline", [])
+    scoring = audit.get("scoring", [])
+    rows = []
+    contaminated_image_ids = set()
+    for index, scoring_record in enumerate(scoring):
+        step = int(scoring_record.get("step", index))
+        for previous_record in timeline[:step]:
+            injection = previous_record.get("controlled_contamination") or {}
+            if injection.get("injected"):
+                contaminated_image_ids.add(int(injection["source_image_id"]))
+        for contribution in scoring_record.get(
+            "selected_reference_contributions", []
+        ):
+            member_image_id = int(contribution["member_image_id"])
+            raw_contribution = float(contribution.get("raw_weight", 0.0))
+            effective_contribution = float(
+                contribution.get("effective_weight", 0.0)
+            )
+            raw_contribution = float(
+                contribution.get("raw_contribution", raw_contribution)
+            )
+            local_effective_contribution = float(
+                contribution.get(
+                    "local_effective_contribution",
+                    effective_contribution,
+                )
+            )
+            global_blend_contribution = float(
+                contribution.get(
+                    "global_blend_contribution",
+                    contribution.get(
+                        "blend_contribution",
+                        local_effective_contribution,
+                    ),
+                )
+            )
+            row = {
+                "step": step,
+                "expert_id": int(contribution["expert_id"]),
+                "member_image_id": member_image_id,
+                "member_is_contaminated": (
+                    member_image_id in contaminated_image_ids
+                ),
+                "selected_patch_count": int(
+                    contribution.get("selected_patch_count", 0)
+                ),
+                "raw_contribution": raw_contribution,
+                "local_effective_contribution": (
+                    local_effective_contribution
+                ),
+                "global_blend_contribution": global_blend_contribution,
+                "effective_contribution": local_effective_contribution,
+                "blend_contribution": global_blend_contribution,
+                "blend_weight": float(
+                    contribution.get("blend_weight", 1.0)
+                ),
+                "effective_to_raw_ratio": (
+                    local_effective_contribution / raw_contribution
+                    if raw_contribution > 0.0
+                    else None
+                ),
+                "global_to_local_ratio": (
+                    global_blend_contribution
+                    / local_effective_contribution
+                    if local_effective_contribution > 0.0
+                    else None
+                ),
+                "patch_reliability": (
+                    local_effective_contribution / raw_contribution
+                    if raw_contribution > 0.0
+                    else None
+                ),
+                "score_all": scoring_record.get("score_all"),
+                "score_without_contaminated_reference": scoring_record.get(
+                    "score_without_contaminated_reference"
+                ),
+                "pollution_score_shift": scoring_record.get(
+                    "pollution_score_shift"
+                ),
+            }
+            contribution["member_is_contaminated"] = row[
+                "member_is_contaminated"
+            ]
+            rows.append(row)
+    fieldnames = [
+        "step",
+        "expert_id",
+        "member_image_id",
+        "member_is_contaminated",
+        "selected_patch_count",
+        "raw_contribution",
+        "local_effective_contribution",
+        "global_blend_contribution",
+        "effective_contribution",
+        "blend_contribution",
+        "blend_weight",
+        "effective_to_raw_ratio",
+        "global_to_local_ratio",
+        "patch_reliability",
+        "score_all",
+        "score_without_contaminated_reference",
+        "pollution_score_shift",
+    ]
+    output_path = Path(output_path)
+    with output_path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    output_path.with_suffix(".json").write_text(
+        json.dumps(rows, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def prepare_controlled_contamination_stream(records):
+    prepared = list(records)
+    if not prepared:
+        raise ValueError("controlled contamination requires a non-empty stream")
+
+    fixture_applied = False
+    if prepared[0][1] != "good":
+        first_good = next(
+            (
+                index
+                for index, record in enumerate(prepared[1:], start=1)
+                if record[1] == "good"
+            ),
+            None,
+        )
+        if first_good is None:
+            raise ValueError(
+                "controlled contamination requires at least one good record"
+            )
+        prepared[0], prepared[first_good] = prepared[first_good], prepared[0]
+        fixture_applied = True
+
+    contamination_step = next(
+        (
+            index
+            for index, record in enumerate(prepared[1:], start=1)
+            if record[1] != "good"
+        ),
+        None,
+    )
+    if contamination_step is None:
+        raise ValueError(
+            "controlled contamination requires an anomaly after a clean record"
+        )
+    return prepared, contamination_step, fixture_applied
+
+
+def apply_controlled_contamination_replays(
+    records,
+    contamination_step,
+    replay_count,
+):
+    prepared = list(records)
+    replay_count = int(replay_count)
+    if replay_count < 0:
+        raise ValueError("contamination replay count must be non-negative")
+    if replay_count == 0:
+        return prepared, []
+    contamination_step = int(contamination_step)
+    last_replay_step = contamination_step + replay_count
+    if last_replay_step >= len(prepared):
+        raise ValueError(
+            "contamination replays must fit after the injection step"
+        )
+    source_record = prepared[contamination_step]
+    if source_record[1] == "good":
+        raise ValueError("contamination replay source must be anomalous")
+    replay_steps = list(
+        range(contamination_step + 1, last_replay_step + 1)
+    )
+    for replay_step in replay_steps:
+        prepared[replay_step] = source_record
+    return prepared, replay_steps
+
+
 def run_variant(
     base_config,
     args,
@@ -3455,6 +4322,86 @@ def run_variant(
             ),
         )
 
+    contamination_injections = {}
+    contamination_step = getattr(args, "contamination_step", None)
+    contamination_fixture_applied = False
+    contamination_replay_steps = []
+    if getattr(args, "controlled_contamination", False):
+        if contamination_step is None:
+            (
+                stream_records,
+                contamination_step,
+                contamination_fixture_applied,
+            ) = prepare_controlled_contamination_stream(
+                stream_records
+            )
+        if not 0 <= int(contamination_step) < len(stream_records):
+            raise ValueError("contamination-step must be inside the stream")
+        contamination_record = stream_records[int(contamination_step)]
+        if contamination_record[1] == "good":
+            raise ValueError(
+                "contamination-step must point to a real anomaly record"
+            )
+        replay_count = int(
+            getattr(args, "contamination_replay_count", 0)
+        )
+        if replay_count and str(
+            getattr(args, "contamination_mode", "member")
+        ) != "mixed":
+            raise ValueError(
+                "contamination replays are only valid for mixed mode"
+            )
+        stream_records, contamination_replay_steps = (
+            apply_controlled_contamination_replays(
+                stream_records,
+                contamination_step,
+                replay_count,
+            )
+        )
+        contamination_injections[int(contamination_step)] = {
+            "source_label": str(contamination_record[1]),
+            "source_path": str(contamination_record[2]),
+            "mode": str(getattr(args, "contamination_mode", "member")),
+            "patch_ratio": float(
+                getattr(args, "contamination_patch_ratio", 0.3)
+            ),
+            "replay_steps": list(contamination_replay_steps),
+        }
+    model.dynamic_committee_cfg["contamination_injections"] = (
+        contamination_injections
+    )
+    controlled_history_eviction_step = getattr(
+        args,
+        "controlled_history_eviction_step",
+        None,
+    )
+    controlled_history_evictions = {}
+    if controlled_history_eviction_step is not None:
+        controlled_history_evictions[
+            int(controlled_history_eviction_step)
+        ] = {
+            "expert_id": int(
+                getattr(args, "controlled_history_eviction_expert_id", 0)
+            )
+        }
+    model.dynamic_committee_cfg["controlled_history_evictions"] = (
+        controlled_history_evictions
+    )
+
+    stream_fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "records": [
+                    [str(record[1]), str(record[2])]
+                    for record in stream_records
+                ],
+                "schedule": schedule,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
     drift_dataset = GradualDriftDataset(
         records=stream_records,
         transform_img=(
@@ -3513,6 +4460,10 @@ def run_variant(
         seed=seed,
     )
     timeline = audit["timeline"]
+    write_contamination_reference_audit(
+        run_output / "contamination_reference_audit.csv",
+        audit,
+    )
 
     if len(timeline) != len(
         stream_records
@@ -3563,11 +4514,40 @@ def run_variant(
         "drift_scale": drift_scale,
         "seed": seed,
         "variant": variant_name,
+        "stream_fingerprint": stream_fingerprint,
         "stream_samples": (
             args.stream_samples
         ),
         "anomaly_ratio": (
             args.anomaly_ratio
+        ),
+        "controlled_contamination": bool(
+            getattr(args, "controlled_contamination", False)
+        ),
+        "controlled_history_eviction_step": (
+            int(controlled_history_eviction_step)
+            if controlled_history_eviction_step is not None
+            else None
+        ),
+        "controlled_history_eviction_expert_id": (
+            int(getattr(args, "controlled_history_eviction_expert_id", 0))
+            if controlled_history_eviction_step is not None
+            else None
+        ),
+        "contamination_step": (
+            int(contamination_step)
+            if contamination_step is not None
+            else None
+        ),
+        "contamination_fixture_applied": contamination_fixture_applied,
+        "contamination_replay_steps": json.dumps(
+            contamination_replay_steps
+        ),
+        "contamination_mode": str(
+            getattr(args, "contamination_mode", "member")
+        ),
+        "contamination_patch_ratio": float(
+            getattr(args, "contamination_patch_ratio", 0.3)
         ),
         "allow_record_reuse": bool(
             getattr(args, "allow_record_reuse", False)
@@ -3768,6 +4748,11 @@ def run_variant(
                 "photometric_fitness_history_enabled", False
             )
         ),
+        "photometric_fitness_adaptive_evidence_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "photometric_fitness_adaptive_evidence_enabled", False
+            )
+        ),
         "budget_coverage_loss_enabled": bool(
             cfg["models"]["dynamic_committee"].get(
                 "budget_coverage_loss_enabled", False
@@ -3884,6 +4869,26 @@ def run_variant(
         "photometric_history_reentry_members": cfg["models"][
             "dynamic_committee"
         ].get("photometric_history_reentry_members"),
+        "photometric_history_reentry_continuous_evidence": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "photometric_history_reentry_continuous_evidence", False
+            )
+        ),
+        "budget_unified_delta_j_shadow_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "budget_unified_delta_j_shadow_enabled", False
+            )
+        ),
+        "budget_unified_delta_j_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "budget_unified_delta_j_enabled", False
+            )
+        ),
+        "budget_unified_delta_j_dino_score_enabled": bool(
+            cfg["models"]["dynamic_committee"].get(
+                "budget_unified_delta_j_dino_score_enabled", False
+            )
+        ),
         "photometric_adaptive_candidate_evidence": bool(
             cfg["models"]["dynamic_committee"].get(
                 "photometric_adaptive_candidate_evidence", False
@@ -3932,6 +4937,7 @@ def run_variant(
             timeline=timeline,
             labels=labels,
             scoring=audit.get("scoring"),
+            raw_scores=raw_scores,
             virtual_swap_enabled=bool(
                 VARIANTS[variant_name].get(
                     "budget_virtual_swap_enabled", False
@@ -4311,6 +5317,41 @@ def parse_args():
         "--anomaly-ratio",
         type=float,
         default=(1.0 / 3.0),
+    )
+    parser.add_argument(
+        "--controlled-contamination",
+        action="store_true",
+        help="在评分后将指定真实 anomaly 注入为受控污染专家",
+    )
+    parser.add_argument(
+        "--contamination-step",
+        type=int,
+        default=None,
+        help="受控污染注入的 step；该 step 必须是 anomaly 图像",
+    )
+    parser.add_argument(
+        "--contamination-mode",
+        choices=["member", "patch", "mixed"],
+        default="member",
+        help=(
+            "注入完整异常成员、仅局部 patch 污染，或同时检验局部和"
+            "全局可靠性的 mixed 污染"
+        ),
+    )
+    parser.add_argument(
+        "--contamination-patch-ratio",
+        type=float,
+        default=0.3,
+        help="patch 污染模式下替换的 patch 比例",
+    )
+    parser.add_argument(
+        "--contamination-replay-count",
+        type=int,
+        default=0,
+        help=(
+            "mixed 污染注入后重放同一真实异常的次数；用于让局部和"
+            "全局可靠性都获得可辨识的评分压力"
+        ),
     )
     parser.add_argument(
         "--brightness-delta",

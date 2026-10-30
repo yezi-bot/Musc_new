@@ -3,12 +3,32 @@ import unittest
 import torch
 
 from MultiMuSc2.models.modules._DYNAMIC_PIPELINE import (
+    _controlled_contamination_patch_ids,
+    _hierarchical_dino_score,
     _image_msm_score,
     _positioned_memory_scores,
     _strict_history_fallback,
     build_dynamic_committee_timeline,
     score_dynamic_msm2_layer,
 )
+
+
+class ControlledContaminationPatchSelectionTest(unittest.TestCase):
+    def test_patch_mode_selects_only_largest_distances(self):
+        selected = _controlled_contamination_patch_ids(
+            torch.arange(6, dtype=torch.float32),
+            patch_count=4,
+            contamination_mode="patch",
+        )
+        self.assertEqual(selected, [5, 4, 3, 2])
+
+    def test_mixed_mode_alternates_large_and_locally_plausible_patches(self):
+        selected = _controlled_contamination_patch_ids(
+            torch.arange(6, dtype=torch.float32),
+            patch_count=4,
+            contamination_mode="mixed",
+        )
+        self.assertEqual(selected, [5, 0, 4, 1])
 from MultiMuSc2.models.modules._MSM import (
     MSM2_online,
     aggregate_reference_distances,
@@ -63,6 +83,61 @@ def scoring_timeline(image_count=4):
 
 
 class DynamicPipelineTest(unittest.TestCase):
+    def test_reentry_counterfactual_audit_does_not_change_scores(self):
+        dino = synthetic_features(4)
+        timeline = scoring_timeline(4)
+        timeline[3]["active_experts_before"] = [
+            {
+                "expert_id": 0,
+                "image_id": 0,
+                "cluster_id": 0,
+                "admission_step": 1,
+            },
+            {
+                "expert_id": 1,
+                "image_id": 1,
+                "cluster_id": 1,
+                "admission_step": 2,
+                "admission_route": "history_reentry_observer_channel_gate",
+            },
+        ]
+        baseline_timeline = [
+            {
+                **record,
+                "active_experts_before": [
+                    {
+                        key: value
+                        for key, value in expert.items()
+                        if key != "admission_route"
+                    }
+                    for expert in record["active_experts_before"]
+                ],
+            }
+            for record in timeline
+        ]
+
+        audited_scores, audits = score_dynamic_msm2_layer(
+            dino,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+        )
+        baseline_scores, _ = score_dynamic_msm2_layer(
+            dino,
+            None,
+            baseline_timeline,
+            fusion_mode="dino_only",
+        )
+
+        self.assertTrue(torch.equal(audited_scores, baseline_scores))
+        self.assertEqual(audits[3]["reentry_expert_image_ids"], [1])
+        self.assertIsNotNone(audits[3]["reentry_counterfactual_score"])
+        self.assertAlmostEqual(
+            audits[3]["reentry_score_regret"],
+            audits[3]["score_all"]
+            - audits[3]["reentry_counterfactual_score"],
+        )
+
     def test_confidence_expert_blends_with_strict_history(self):
         dino = synthetic_features(3)
         timeline = scoring_timeline(3)
@@ -142,6 +217,120 @@ class DynamicPipelineTest(unittest.TestCase):
             [item["effective_weight"] for item in contributions],
             [3.0, 0.5],
         )
+
+    def test_hierarchical_all_one_global_reliability_matches_cross_patch(self):
+        dino = synthetic_features(3)
+        timeline = scoring_timeline(3)
+        timeline[2]["active_experts_before"] = [
+            {
+                "expert_id": 10,
+                "image_id": 0,
+                "scoring_weight": 1.0,
+                "global_member_reliability": 1.0,
+                "scoring_patch_reliabilities": [1.0, 0.5, 1.0, 1.0],
+            },
+            {
+                "expert_id": 11,
+                "image_id": 1,
+                "scoring_weight": 1.0,
+                "global_member_reliability": 1.0,
+                "scoring_patch_reliabilities": [0.8, 1.0, 1.0, 0.7],
+            },
+        ]
+
+        cross_scores, _ = score_dynamic_msm2_layer(
+            dino,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+        )
+        hierarchical_scores, audits = score_dynamic_msm2_layer(
+            dino,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+            hierarchical_reliability_enabled=True,
+        )
+
+        self.assertTrue(torch.equal(cross_scores[2], hierarchical_scores[2]))
+        self.assertEqual(
+            audits[2]["effective_mode"],
+            "dino_hierarchical_reliability",
+        )
+
+    def test_hierarchical_global_reliability_shrinks_to_history(self):
+        dino = synthetic_features(3)
+        history_score, _ = _strict_history_fallback(
+            dino[2],
+            dino[:2],
+            reason="test",
+        )
+        expert_score, _ = MSM2_online(
+            dino[2],
+            None,
+            dino[[0]],
+            None,
+            fusion_mode="dino_only",
+            dino_patch_reliabilities=torch.ones(1, 4),
+        )
+        for reliability in (0.0, 0.5, 1.0):
+            score, _, _ = _hierarchical_dino_score(
+                current_dino=dino[2],
+                expert_dino=dino[0:1],
+                expert_patch_reliabilities=torch.ones(1, 4),
+                expert_global_reliabilities=[reliability],
+                expert_ids=[10],
+                expert_image_ids=[0],
+                history_score=history_score,
+                topmin_min=0.0,
+                topmin_max=0.3,
+                reliability_penalty=1.0,
+            )
+            expected = history_score + reliability * (
+                expert_score - history_score
+            )
+            self.assertTrue(torch.allclose(score, expected))
+
+    def test_hierarchical_scoring_is_expert_order_invariant(self):
+        dino = synthetic_features(3)
+        experts = [
+            {
+                "expert_id": 10,
+                "image_id": 0,
+                "global_member_reliability": 0.4,
+                "scoring_patch_reliabilities": [1.0, 0.5, 1.0, 1.0],
+            },
+            {
+                "expert_id": 11,
+                "image_id": 1,
+                "global_member_reliability": 0.8,
+                "scoring_patch_reliabilities": [0.8, 1.0, 1.0, 0.7],
+            },
+        ]
+        scores = []
+        for active in (experts, list(reversed(experts))):
+            timeline = scoring_timeline(3)
+            timeline[2]["active_experts_before"] = active
+            result, audits = score_dynamic_msm2_layer(
+                dino,
+                None,
+                timeline,
+                fusion_mode="dino_only",
+                hierarchical_reliability_enabled=True,
+            )
+            scores.append(result[2])
+            for contribution in audits[2][
+                "selected_reference_contributions"
+            ]:
+                self.assertLessEqual(
+                    contribution["global_blend_contribution"],
+                    contribution["local_effective_contribution"],
+                )
+                self.assertLessEqual(
+                    contribution["local_effective_contribution"],
+                    contribution["raw_contribution"],
+                )
+        self.assertTrue(torch.allclose(scores[0], scores[1]))
 
     def test_confidence_state_is_strictly_historical_during_scoring(self):
         dino = synthetic_features(4)
@@ -777,6 +966,327 @@ class DynamicPipelineTest(unittest.TestCase):
                     for member in record["fuser_training_members_before"]
                 )
             )
+
+    def test_controlled_history_eviction_is_post_update_and_causal(self):
+        timeline = build_dynamic_committee_timeline(
+            synthetic_features(5),
+            device="cpu",
+            manager_kwargs={
+                "cold_start_mode": "confidence",
+                "cold_start_confidence_history": 16,
+                "min_cluster_support": 10,
+                "committee_cap": 2,
+            },
+            controlled_history_evictions={
+                1: {"expert_id": 0},
+            },
+        )
+
+        eviction = timeline[1]["controlled_history_eviction"]
+        self.assertTrue(eviction["evicted"])
+        self.assertEqual(eviction["target_expert_id"], 0)
+        self.assertTrue(
+            all(
+                expert["expert_id"] != 0
+                for expert in timeline[2]["active_experts_before"]
+            )
+        )
+        for record in timeline:
+            self.assertTrue(
+                all(
+                    expert["image_id"] < record["step"]
+                    for expert in record["active_experts_before"]
+                )
+            )
+
+    def test_empty_contamination_config_preserves_baseline(self):
+        features = synthetic_features(5)
+        manager_kwargs = {
+            "cold_start_mode": "confidence",
+            "candidate_reliability_enabled": True,
+            "candidate_patch_reliability_mode": "cross_patch_robust",
+            "min_cluster_support": 2,
+            "committee_cap": 2,
+        }
+        baseline_timeline = build_dynamic_committee_timeline(
+            features,
+            device="cpu",
+            manager_kwargs=manager_kwargs,
+        )
+        disabled_timeline = build_dynamic_committee_timeline(
+            features,
+            device="cpu",
+            manager_kwargs=manager_kwargs,
+            contamination_injections={},
+        )
+
+        def timeline_projection(timeline):
+            return [
+                {
+                    "step": record["step"],
+                    "active_before": [
+                        (
+                            expert["expert_id"],
+                            expert["image_id"],
+                            expert.get("scoring_weight", 1.0),
+                            expert.get("scoring_patch_reliabilities"),
+                        )
+                        for expert in record["active_experts_before"]
+                    ],
+                    "active_after": [
+                        (expert["expert_id"], expert["image_id"])
+                        for expert in record["active_experts_after"]
+                    ],
+                    "training_members": [
+                        (member["step"], member["image_id"])
+                        for member in record[
+                            "fuser_training_members_before"
+                        ]
+                    ],
+                    "controlled_contamination": record[
+                        "controlled_contamination"
+                    ],
+                }
+                for record in timeline
+            ]
+
+        self.assertEqual(
+            timeline_projection(disabled_timeline),
+            timeline_projection(baseline_timeline),
+        )
+        baseline_scores, baseline_audits = score_dynamic_msm2_layer(
+            features,
+            None,
+            baseline_timeline,
+            fusion_mode="dino_only",
+        )
+        disabled_scores, disabled_audits = score_dynamic_msm2_layer(
+            features,
+            None,
+            disabled_timeline,
+            fusion_mode="dino_only",
+        )
+        self.assertEqual(len(disabled_scores), len(baseline_scores))
+        for disabled, baseline in zip(disabled_scores, baseline_scores):
+            self.assertTrue(torch.equal(disabled, baseline))
+        self.assertEqual(
+            [audit["expert_image_ids"] for audit in disabled_audits],
+            [audit["expert_image_ids"] for audit in baseline_audits],
+        )
+
+    def test_controlled_contamination_is_admitted_after_scoring(self):
+        features = synthetic_features(4)
+        features[1, 0] = torch.tensor([8.0, 8.0])
+        timeline = build_dynamic_committee_timeline(
+            features,
+            device="cpu",
+            manager_kwargs={
+                "cold_start_mode": "confidence",
+                "candidate_reliability_enabled": True,
+                "candidate_patch_reliability_mode": "cross_patch_robust",
+                "min_cluster_support": 10,
+                "committee_cap": 2,
+            },
+            contamination_injections={
+                1: {
+                    "source_label": "defect",
+                    "source_path": "controlled-defect.png",
+                }
+            },
+        )
+
+        injection = timeline[1]["controlled_contamination"]
+        self.assertTrue(injection["injected"])
+        self.assertEqual(injection["source_image_id"], 1)
+        self.assertEqual(injection["reliability_context_count"], 1)
+        self.assertNotIn(
+            injection["injected_expert_id"],
+            [
+                expert["expert_id"]
+                for expert in timeline[1]["active_experts_before"]
+            ],
+        )
+        self.assertIn(
+            injection["injected_expert_id"],
+            [
+                expert["expert_id"]
+                for expert in timeline[2]["active_experts_before"]
+            ],
+        )
+        self.assertIn(
+            0,
+            [
+                expert["image_id"]
+                for expert in timeline[2]["active_experts_before"]
+                if expert["expert_id"]
+                != injection["injected_expert_id"]
+            ],
+        )
+
+        scores, audits = score_dynamic_msm2_layer(
+            features,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+            image_score_size=3,
+        )
+        self.assertIsNotNone(
+            audits[2]["score_without_contaminated_reference"]
+        )
+        expected_score = float(
+            torch.nn.functional.interpolate(
+                scores[2].reshape(1, 1, 2, 2),
+                size=3,
+                mode="bilinear",
+                align_corners=True,
+            ).max()
+        )
+        self.assertAlmostEqual(audits[2]["score_all"], expected_score)
+        self.assertEqual(audits[2]["image_score_size"], 3)
+        for audit in audits:
+            self.assertTrue(
+                all(
+                    int(image_id) < int(audit["step"])
+                    for image_id in audit["expert_image_ids"]
+                )
+            )
+
+    def test_hierarchical_patch_and_mixed_injections_are_causal(self):
+        features = synthetic_features(4)
+        features[1, 0] = torch.tensor([8.0, 8.0])
+        for mode in ("patch", "mixed"):
+            timeline = build_dynamic_committee_timeline(
+                features,
+                device="cpu",
+                manager_kwargs={
+                    "cold_start_mode": "confidence",
+                    "candidate_reliability_enabled": True,
+                    "candidate_patch_reliability_mode": (
+                        "hierarchical_global_local"
+                    ),
+                    "min_cluster_support": 10,
+                    "committee_cap": 2,
+                },
+                contamination_injections={
+                    1: {
+                        "mode": mode,
+                        "patch_ratio": 0.25,
+                        "source_label": "defect",
+                    }
+                },
+            )
+            injection = timeline[1]["controlled_contamination"]
+            injected_id = injection["injected_expert_id"]
+            self.assertTrue(injection["injected"])
+            self.assertEqual(injection["contamination_mode"], mode)
+            self.assertEqual(
+                injection["base_patch_reliability_source"],
+                "feature_provenance_hybrid",
+            )
+            self.assertNotIn(
+                injected_id,
+                [
+                    expert["expert_id"]
+                    for expert in timeline[1]["active_experts_before"]
+                ],
+            )
+            injected = next(
+                expert
+                for expert in timeline[2]["active_experts_before"]
+                if int(expert["expert_id"]) == int(injected_id)
+            )
+            self.assertEqual(injected["controlled_contamination_mode"], mode)
+            self.assertIn("local_patch_reliabilities", injected)
+            self.assertIn("global_member_reliability", injected)
+            self.assertLessEqual(
+                injection["base_patch_reliability_mean"],
+                1.0,
+            )
+            self.assertGreater(
+                injection["base_patch_reliability_min"],
+                0.0,
+            )
+            if mode == "patch":
+                self.assertEqual(
+                    injected["reliability_audit"][
+                        "controlled_global_context"
+                    ],
+                    "step_start_clean_expert",
+                )
+
+            _, audits = score_dynamic_msm2_layer(
+                features,
+                None,
+                timeline,
+                fusion_mode="dino_only",
+                hierarchical_reliability_enabled=True,
+            )
+            for audit in audits:
+                self.assertTrue(
+                    all(
+                        int(image_id) < int(audit["step"])
+                        for image_id in audit["expert_image_ids"]
+                    )
+                )
+
+    def test_mixed_replay_scores_the_causal_hybrid_feature(self):
+        features = synthetic_features(4)
+        features[1, 0] = torch.tensor([8.0, 8.0])
+        timeline = build_dynamic_committee_timeline(
+            features,
+            device="cpu",
+            manager_kwargs={
+                "cold_start_mode": "confidence",
+                "candidate_reliability_enabled": True,
+                "candidate_patch_reliability_mode": (
+                    "hierarchical_global_local"
+                ),
+                "min_cluster_support": 10,
+                "committee_cap": 2,
+            },
+            contamination_injections={
+                1: {
+                    "mode": "mixed",
+                    "patch_ratio": 0.25,
+                    "source_label": "defect",
+                    "replay_steps": [2],
+                }
+            },
+        )
+        replay = timeline[2]["controlled_contamination_replay"]
+        self.assertEqual(replay["source_image_id"], 1)
+        self.assertEqual(replay["clean_image_id"], 0)
+        self.assertLess(replay["source_image_id"], 2)
+        self.assertLess(replay["clean_image_id"], 2)
+
+        replay_scores, _ = score_dynamic_msm2_layer(
+            features,
+            None,
+            timeline,
+            fusion_mode="dino_only",
+            hierarchical_reliability_enabled=True,
+        )
+        manual_features = features.clone()
+        patch_ids = torch.as_tensor(replay["patch_ids"], dtype=torch.long)
+        manual_features[2] = manual_features[replay["clean_image_id"]]
+        manual_features[2].index_copy_(
+            0,
+            patch_ids,
+            manual_features[replay["source_image_id"]].index_select(
+                0,
+                patch_ids,
+            ),
+        )
+        manual_timeline = [dict(record) for record in timeline]
+        manual_timeline[2].pop("controlled_contamination_replay")
+        manual_scores, _ = score_dynamic_msm2_layer(
+            manual_features,
+            None,
+            manual_timeline,
+            fusion_mode="dino_only",
+            hierarchical_reliability_enabled=True,
+        )
+        self.assertTrue(torch.equal(replay_scores[2], manual_scores[2]))
 
     def test_short_ms_uses_only_recent_strict_history(self):
         features = synthetic_features(6)

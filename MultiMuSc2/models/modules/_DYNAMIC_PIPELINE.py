@@ -12,6 +12,8 @@ from ._MSM import (
     build_causal_fuser_training_data,
     fit_causal_detect_fuser,
     interval_average,
+    safe_topmin_counts,
+    score_dino_reference_committee,
 )
 from ._ROBUST_SHIFT import (
     pairwise_window_sinkhorn_profile,
@@ -19,6 +21,32 @@ from ._ROBUST_SHIFT import (
     robust_window_sinkhorn_profile,
     uniformly_sample_patch_ids,
 )
+
+
+def _controlled_contamination_patch_ids(
+    patch_distances,
+    patch_count,
+    contamination_mode,
+):
+    patch_count = int(patch_count)
+    if not 0 < patch_count <= int(patch_distances.numel()):
+        raise ValueError("controlled patch count is out of range")
+    ordered = torch.argsort(patch_distances)
+    if contamination_mode == "patch":
+        return ordered[-patch_count:].flip(0).tolist()
+    if contamination_mode != "mixed":
+        raise ValueError("patch selection requires patch or mixed mode")
+    selected = []
+    low = 0
+    high = int(ordered.numel()) - 1
+    for index in range(patch_count):
+        if index % 2 == 0:
+            selected.append(int(ordered[high]))
+            high -= 1
+        else:
+            selected.append(int(ordered[low]))
+            low += 1
+    return selected
 
 
 def _patch_to_history_image_distances(
@@ -395,6 +423,8 @@ def build_dynamic_committee_timeline(
     robust_shift_position_radius=1,
     manager_kwargs=None,
     reset_steps=None,
+    contamination_injections=None,
+    controlled_history_evictions=None,
 ):
     if committee_features.ndim != 3:
         raise ValueError("committee_features must have shape [image, patch, feature]")
@@ -431,6 +461,32 @@ def build_dynamic_committee_timeline(
         raise ValueError("committee patch count must form a square grid")
 
     reset_steps = set(reset_steps or [])
+    contamination_injections = {
+        int(step): dict(spec)
+        for step, spec in (contamination_injections or {}).items()
+    }
+    controlled_history_evictions = {
+        int(step): dict(spec)
+        for step, spec in (controlled_history_evictions or {}).items()
+    }
+    invalid_contamination_steps = [
+        step
+        for step in contamination_injections
+        if step < 0 or step >= committee_features.shape[0]
+    ]
+    if invalid_contamination_steps:
+        raise ValueError(
+            "contamination injection steps must be inside the feature stream"
+        )
+    invalid_eviction_steps = [
+        step
+        for step in controlled_history_evictions
+        if step < 0 or step >= committee_features.shape[0] - 1
+    ]
+    if invalid_eviction_steps:
+        raise ValueError(
+            "controlled history eviction steps must leave a future sample"
+        )
     invalid_reset_steps = [
         step
         for step in reset_steps
@@ -456,6 +512,8 @@ def build_dynamic_committee_timeline(
     segment_start = 0
     robust_window_members = []
     fixed_reference_expert = None
+    controlled_clean_expert_ids = set()
+    controlled_replay_specs = {}
 
     for step in range(committee_features.shape[0]):
         state_reset_before = step in reset_steps
@@ -469,8 +527,42 @@ def build_dynamic_committee_timeline(
             distance_history = []
             robust_window_members = []
             fixed_reference_expert = None
+            controlled_clean_expert_ids = set()
             segment_start = step
+        for expert in manager.active_experts:
+            if int(expert["expert_id"]) in controlled_clean_expert_ids:
+                expert["scoring_weight"] = 1.0
+                expert["member_reliability"] = 1.0
+                if expert.get("scoring_patch_reliabilities") is not None:
+                    expert["scoring_patch_reliabilities"] = [
+                        1.0
+                        for _ in expert["scoring_patch_reliabilities"]
+                    ]
         current = committee_features[step]
+        controlled_replay = controlled_replay_specs.get(step)
+        if controlled_replay is not None:
+            source_image_id = int(
+                controlled_replay["source_image_id"]
+            )
+            clean_image_id = int(controlled_replay["clean_image_id"])
+            if source_image_id >= step or clean_image_id >= step:
+                raise ValueError(
+                    "controlled replay references must be historical"
+                )
+            replay_patch_ids = torch.as_tensor(
+                controlled_replay["patch_ids"],
+                device=committee_features.device,
+                dtype=torch.long,
+            )
+            current = committee_features[clean_image_id].clone()
+            current.index_copy_(
+                0,
+                replay_patch_ids,
+                committee_features[source_image_id].index_select(
+                    0,
+                    replay_patch_ids,
+                ),
+            )
         current_lab = (
             lab_features[step]
             if lab_features is not None
@@ -478,6 +570,7 @@ def build_dynamic_committee_timeline(
         )
         active_before = manager.active_experts_before_step()
         expert_slots_before = manager.expert_slots_before_step()
+        diversity_audit_before = manager.diversity_audit_before_step()
         # 读取当前候选池状态
         provisional_before = manager.provisional_expert_before_step()
         training_members = manager.fuser_training_members(step)
@@ -650,6 +743,376 @@ def build_dynamic_committee_timeline(
             grid_size=grid_size,
             patch_reliabilities=soft_reliability,
         )
+        controlled_history_eviction = None
+        eviction = controlled_history_evictions.get(step)
+        if eviction is not None:
+            target_expert_id = int(eviction.get("expert_id", 0))
+            victim = next(
+                (
+                    expert
+                    for expert in manager.active_experts
+                    if int(expert["expert_id"]) == target_expert_id
+                ),
+                None,
+            )
+            victim_snapshot = (
+                {
+                    "expert_id": int(victim["expert_id"]),
+                    "image_id": int(victim["image_id"]),
+                    "cluster_id": int(victim["cluster_id"]),
+                    "admission_step": int(victim["admission_step"]),
+                }
+                if victim is not None
+                else None
+            )
+            evicted = manager._replace_budgeted_expert(
+                target_expert_id,
+                step,
+                {
+                    "replacement_reason": "controlled_history_eviction",
+                    "controlled_evaluation": True,
+                },
+            )
+            controlled_history_eviction = {
+                "attempted": True,
+                "evicted": bool(evicted),
+                "step": int(step),
+                "target_expert_id": target_expert_id,
+                "victim": victim_snapshot,
+                "reason": (
+                    "controlled_history_eviction"
+                    if evicted
+                    else "target_not_active"
+                ),
+            }
+        controlled_contamination = None
+        injection = contamination_injections.get(step)
+        if injection is not None:
+            step_start_experts = {
+                int(expert["expert_id"]): expert for expert in active_before
+            }
+            for expert in manager.active_experts:
+                snapshot = step_start_experts.get(int(expert["expert_id"]))
+                if snapshot is None:
+                    continue
+                expert["image_id"] = int(snapshot["image_id"])
+                expert["scoring_weight"] = 1.0
+                expert["member_reliability"] = 1.0
+                expert["global_member_reliability"] = 1.0
+                if snapshot.get("scoring_patch_reliabilities") is not None:
+                    expert["scoring_patch_reliabilities"] = [
+                        1.0
+                        for _ in snapshot["scoring_patch_reliabilities"]
+                    ]
+                    expert["local_patch_reliabilities"] = list(
+                        expert["scoring_patch_reliabilities"]
+                    )
+                expert.pop("controlled_contamination_mode", None)
+                expert.pop("controlled_clean_image_id", None)
+                expert.pop("controlled_contaminated_patch_ids", None)
+            clean_expert_ids = [
+                expert_id
+                for expert_id in step_start_experts
+                if any(
+                    int(expert["expert_id"]) == expert_id
+                    for expert in manager.active_experts
+                )
+            ]
+            contamination_mode = str(injection.get("mode", "member"))
+            if contamination_mode not in {"member", "patch", "mixed"}:
+                raise ValueError(
+                    "controlled contamination mode must be member, patch, or mixed"
+                )
+            injected_features = current
+            injected_patch_reliabilities = soft_reliability
+            contaminated_patch_ids = list(range(current.shape[0]))
+            if contamination_mode in {"patch", "mixed"}:
+                if not active_before:
+                    raise ValueError(
+                        "patch contamination requires a clean active expert"
+                    )
+                clean_image_id = int(active_before[0]["image_id"])
+                clean_features = committee_features[clean_image_id]
+                patch_ratio = float(injection.get("patch_ratio", 0.3))
+                if not 0.0 < patch_ratio <= 1.0:
+                    raise ValueError(
+                        "controlled contamination patch_ratio must be in (0, 1]"
+                    )
+                contaminated_patch_count = max(
+                    1,
+                    int(round(current.shape[0] * patch_ratio)),
+                )
+                patch_distances = torch.linalg.vector_norm(
+                    current - clean_features,
+                    dim=1,
+                )
+                contaminated_patch_ids = (
+                    _controlled_contamination_patch_ids(
+                        patch_distances,
+                        contaminated_patch_count,
+                        contamination_mode,
+                    )
+                )
+                injected_features = clean_features.clone()
+                injected_features[contaminated_patch_ids] = current[
+                    contaminated_patch_ids
+                ]
+                clean_patch_reliabilities = active_before[0].get(
+                    "scoring_patch_reliabilities"
+                )
+                if clean_patch_reliabilities is None:
+                    clean_patch_reliabilities = torch.ones_like(
+                        soft_reliability
+                    )
+                injected_patch_reliabilities = torch.as_tensor(
+                    clean_patch_reliabilities,
+                    device=soft_reliability.device,
+                    dtype=soft_reliability.dtype,
+                ).clone()
+                contaminated_patch_tensor = torch.as_tensor(
+                    contaminated_patch_ids,
+                    device=soft_reliability.device,
+                    dtype=torch.long,
+                )
+                injected_patch_reliabilities.index_copy_(
+                    0,
+                    contaminated_patch_tensor,
+                    soft_reliability.index_select(
+                        0,
+                        contaminated_patch_tensor,
+                    ),
+                )
+            member = manager._quarantine_member(
+                step=step,
+                image_id=step,
+                dino_patch_features=injected_features,
+                ms_score=ms_score,
+                ms_short_score=ms_short,
+                ms_short_ratio=ms_short_ratio,
+                channel_support=channel_support,
+                provisional_channel_support=association_profile[
+                    "recent_provisional_match_fraction"
+                ],
+                memory_patch_ids=memory_patch_ids,
+                lab_feature=current_lab,
+                candidate_route="controlled_contamination",
+                historical_ms_threshold=event.get("ms_threshold"),
+                current_expert_supports=current_expert_supports,
+                patch_reliabilities=injected_patch_reliabilities,
+            )
+            reliability_context_count = 0
+            if manager.candidate_reliability_enabled and active_before:
+                reliability_context = [member]
+                for expert in active_before:
+                    expert_image_id = int(expert["image_id"])
+                    context_patch_reliabilities = expert.get(
+                        "scoring_patch_reliabilities"
+                    )
+                    reliability_context.append(
+                        manager._quarantine_member(
+                            step=step,
+                            image_id=expert_image_id,
+                            dino_patch_features=committee_features[
+                                expert_image_id
+                            ],
+                            ms_score=None,
+                            ms_short_score=None,
+                            ms_short_ratio=None,
+                            channel_support=expert_supports.get(
+                                int(expert["expert_id"])
+                            ),
+                            provisional_channel_support=expert_supports.get(
+                                int(expert["expert_id"])
+                            ),
+                            memory_patch_ids=None,
+                            lab_feature=None,
+                            candidate_route=(
+                                "controlled_contamination_context"
+                            ),
+                            current_expert_supports=None,
+                            patch_reliabilities=(
+                                context_patch_reliabilities
+                                if context_patch_reliabilities is not None
+                                else torch.ones_like(soft_reliability)
+                            ),
+                        )
+                    )
+                manager._refresh_candidate_reliabilities(
+                    reliability_context
+                )
+                reliability_context_count = len(reliability_context) - 1
+                if (
+                    contamination_mode == "patch"
+                    and manager.candidate_patch_reliability_mode
+                    == "hierarchical_global_local"
+                ):
+                    clean_global = float(
+                        active_before[0].get(
+                            "global_member_reliability",
+                            active_before[0].get(
+                                "member_reliability",
+                                1.0,
+                            ),
+                        )
+                    )
+                    member["global_member_reliability"] = clean_global
+                    member["member_reliability"] = clean_global
+                    base = torch.as_tensor(
+                        member["base_patch_reliabilities"],
+                        dtype=torch.float32,
+                    )
+                    member["patch_reliabilities"] = (
+                        base * clean_global
+                    ).clamp(
+                        min=manager.candidate_reliability_floor,
+                        max=1.0,
+                    )
+                    patch_bank = member.get("reliability_patch_bank")
+                    if patch_bank is not None:
+                        member["patch_prototypes"] = manager._patch_coreset(
+                            patch_bank["features"],
+                            patch_reliabilities=member[
+                                "patch_reliabilities"
+                            ],
+                        )
+                    member.setdefault("reliability_audit", {})[
+                        "controlled_global_context"
+                    ] = "step_start_clean_expert"
+                    member["reliability_audit"][
+                        "global_member_reliability"
+                    ] = clean_global
+            cluster_id, injected_expert_id = manager._admit_quarantined_member(
+                member,
+                step=step,
+                cluster_members=[member],
+                admission_route="controlled_contamination",
+                support_threshold=event.get("support_threshold"),
+                candidate_evidence={
+                    "controlled_contamination": True,
+                },
+                preserve_candidate_reliability=(
+                    manager.candidate_reliability_enabled
+                    and reliability_context_count > 0
+                ),
+            )
+            if (
+                injected_expert_id is not None
+                and contamination_mode in {"patch", "mixed"}
+            ):
+                injected_expert = next(
+                    expert
+                    for expert in manager.active_experts
+                    if int(expert["expert_id"]) == int(injected_expert_id)
+                )
+                injected_expert["controlled_contamination_mode"] = (
+                    contamination_mode
+                )
+                injected_expert["controlled_clean_image_id"] = int(
+                    active_before[0]["image_id"]
+                )
+                injected_expert[
+                    "controlled_contaminated_patch_ids"
+                ] = list(contaminated_patch_ids)
+                for replay_step in injection.get("replay_steps", []):
+                    replay_step = int(replay_step)
+                    if replay_step <= step:
+                        raise ValueError(
+                            "controlled replay must occur after injection"
+                        )
+                    controlled_replay_specs[replay_step] = {
+                        "source_image_id": int(step),
+                        "clean_image_id": int(active_before[0]["image_id"]),
+                        "patch_ids": list(contaminated_patch_ids),
+                    }
+            if injection.get("promote_clean_experts", True):
+                controlled_clean_expert_ids.update(clean_expert_ids)
+                for expert in manager.active_experts:
+                    if int(expert["expert_id"]) in controlled_clean_expert_ids:
+                        expert["scoring_weight"] = 1.0
+                        expert["member_reliability"] = 1.0
+                        expert["global_member_reliability"] = 1.0
+                        if (
+                            expert.get("scoring_patch_reliabilities")
+                            is not None
+                        ):
+                            expert["scoring_patch_reliabilities"] = [
+                                1.0
+                                for _ in expert[
+                                    "scoring_patch_reliabilities"
+                                ]
+                            ]
+                            expert["local_patch_reliabilities"] = list(
+                                expert["scoring_patch_reliabilities"]
+                            )
+            controlled_contamination = {
+                "injected": injected_expert_id is not None,
+                "source_image_id": int(step),
+                "source_label": injection.get("source_label", "anomaly"),
+                "source_path": injection.get("source_path"),
+                "injected_step": int(step),
+                "injected_cluster_id": (
+                    int(cluster_id) if cluster_id is not None else None
+                ),
+                "injected_expert_id": (
+                    int(injected_expert_id)
+                    if injected_expert_id is not None
+                    else None
+                ),
+                "admission_route": "controlled_contamination",
+                "contamination_mode": contamination_mode,
+                "patch_selection_policy": (
+                    "largest_distance"
+                    if contamination_mode == "patch"
+                    else "alternating_distance_extremes"
+                ),
+                "base_patch_reliability_source": (
+                    "feature_provenance_hybrid"
+                    if contamination_mode in {"patch", "mixed"}
+                    else "source_member"
+                ),
+                "base_patch_reliability_mean": float(
+                    injected_patch_reliabilities.float().mean()
+                ),
+                "base_patch_reliability_min": float(
+                    injected_patch_reliabilities.float().min()
+                ),
+                "contaminated_patch_ids": contaminated_patch_ids,
+                "contaminated_patch_count": len(contaminated_patch_ids),
+                "contaminated_patch_ratio": (
+                    len(contaminated_patch_ids) / current.shape[0]
+                ),
+                "replay_steps": [
+                    int(replay_step)
+                    for replay_step in injection.get("replay_steps", [])
+                ],
+                "controlled_clean_expert_ids": sorted(
+                    controlled_clean_expert_ids
+                ),
+                "reliability_context_count": reliability_context_count,
+                "member_reliability": (
+                    float(member.get("member_reliability", 1.0))
+                ),
+                "scoring_patch_reliability_mean": (
+                    float(
+                        torch.as_tensor(
+                            member.get(
+                                "scoring_patch_reliabilities",
+                                torch.ones_like(soft_reliability),
+                            )
+                        ).float().mean()
+                    )
+                ),
+                "scoring_patch_reliability_min": (
+                    float(
+                        torch.as_tensor(
+                            member.get(
+                                "scoring_patch_reliabilities",
+                                torch.ones_like(soft_reliability),
+                            )
+                        ).float().min()
+                    )
+                ),
+            }
         historical_features.append(current.detach().cpu())
 
         timeline.append(
@@ -659,6 +1122,7 @@ def build_dynamic_committee_timeline(
                 "state_reset_before": state_reset_before,
                 "active_experts_before": active_before,
                 "expert_slots_before": expert_slots_before,
+                "diversity_audit_before": diversity_audit_before,
                 "provisional_expert_before": provisional_before,
                 "fuser_training_members_before": training_members,
                 "ms_score": ms_score,
@@ -694,6 +1158,15 @@ def build_dynamic_committee_timeline(
                 "bootstrap": event["bootstrap"],
                 "lab_drift_profile": lab_drift_profile,
                 "drift_candidate_audit": drift_candidate_audit,
+                "controlled_contamination": controlled_contamination,
+                "controlled_history_eviction": (
+                    controlled_history_eviction
+                ),
+                "controlled_contamination_replay": (
+                    dict(controlled_replay)
+                    if controlled_replay is not None
+                    else None
+                ),
                 "novel_support_threshold": event[
                     "novel_support_threshold"
                 ],
@@ -916,6 +1389,7 @@ def _distance_audit(score_audit):
 def _reference_contributions(
     score_audit,
     expert_ids,
+    member_image_ids=None,
     blend_weight=1.0,
 ):
     reliability = (
@@ -929,6 +1403,12 @@ def _reference_contributions(
     effective_weights = reliability.get(
         "selected_reference_effective_weights", []
     )
+    member_raw_counts = reliability.get(
+        "selected_reference_member_raw_counts", {}
+    )
+    member_effective_weights = reliability.get(
+        "selected_reference_member_effective_weights", {}
+    )
     if not (
         len(raw_counts) == len(expert_ids)
         and len(effective_weights) == len(expert_ids)
@@ -936,19 +1416,410 @@ def _reference_contributions(
         raise ValueError(
             "reference contribution audit must align with expert ids"
         )
+    if member_image_ids is None:
+        member_image_ids = reliability.get(
+            "reference_member_ids", list(expert_ids)
+        )
+    if len(member_image_ids) != len(expert_ids):
+        raise ValueError("member image ids must align with expert ids")
     return [
         {
             "expert_id": int(expert_id),
+            "member_image_id": int(member_image_id),
+            "selected_patch_count": int(
+                member_raw_counts.get(str(member_image_id), 0)
+            ),
+            "member_is_contaminated": None,
             "raw_weight": float(raw) * float(blend_weight),
             "effective_weight": float(effective) * float(blend_weight),
+            "member_raw_weight": float(
+                member_raw_counts.get(str(member_image_id), 0)
+            ) * float(blend_weight),
+            "member_effective_weight": float(
+                member_effective_weights.get(str(member_image_id), 0.0)
+            ) * float(blend_weight),
             "blend_weight": float(blend_weight),
+            "blend_contribution": float(effective) * float(blend_weight),
         }
-        for expert_id, raw, effective in zip(
+        for expert_id, member_image_id, raw, effective in zip(
             expert_ids,
+            member_image_ids,
             raw_counts,
             effective_weights,
         )
     ]
+
+
+def _counterfactual_dino_score_without_references(
+    current_dino,
+    dino_features,
+    active,
+    excluded_image_ids,
+    history_start,
+    step,
+    topmin_min,
+    topmin_max,
+    reliability_penalty,
+):
+    clean_indices = [
+        index
+        for index, expert in enumerate(active)
+        if int(expert["image_id"]) not in excluded_image_ids
+    ]
+    if not clean_indices:
+        return None
+    clean_active = [active[index] for index in clean_indices]
+    clean_image_ids = [int(expert["image_id"]) for expert in clean_active]
+    clean_weights = [
+        float(expert.get("scoring_weight", 1.0))
+        for expert in clean_active
+    ]
+    clean_reliabilities = [
+        expert.get("scoring_patch_reliabilities")
+        for expert in clean_active
+    ]
+
+    def reliability_tensor(indices):
+        if not any(clean_reliabilities[index] is not None for index in indices):
+            return None
+        return torch.stack(
+            [
+                torch.as_tensor(
+                    clean_reliabilities[index],
+                    device=current_dino.device,
+                    dtype=current_dino.dtype,
+                )
+                if clean_reliabilities[index] is not None
+                else torch.ones(
+                    current_dino.shape[0],
+                    device=current_dino.device,
+                    dtype=current_dino.dtype,
+                )
+                for index in indices
+            ]
+        )
+
+    full_indices = [
+        index for index, weight in enumerate(clean_weights) if weight >= 1.0
+    ]
+    if full_indices:
+        full_image_ids = [clean_image_ids[index] for index in full_indices]
+        counterfactual, _ = MSM2_online(
+            current_dino,
+            None,
+            dino_features[full_image_ids],
+            None,
+            fusion_mode="dino_only",
+            topmin_min=topmin_min,
+            topmin_max=topmin_max,
+            dino_patch_reliabilities=reliability_tensor(full_indices),
+            dino_reference_member_ids=full_image_ids,
+            reliability_penalty=reliability_penalty,
+        )
+    else:
+        clean_history_ids = [
+            image_id
+            for image_id in range(history_start, step)
+            if image_id not in excluded_image_ids
+        ]
+        if not clean_history_ids:
+            return None
+        counterfactual, _ = _strict_history_dino_fallback(
+            current_dino,
+            dino_features[clean_history_ids],
+        )
+
+    for index, weight in enumerate(clean_weights):
+        if weight >= 1.0:
+            continue
+        confidence_score, _ = MSM2_online(
+            current_dino,
+            None,
+            dino_features[[clean_image_ids[index]]],
+            None,
+            fusion_mode="dino_only",
+            topmin_min=topmin_min,
+            topmin_max=topmin_max,
+            dino_patch_reliabilities=reliability_tensor([index]),
+            dino_reference_member_ids=[clean_image_ids[index]],
+            reliability_penalty=reliability_penalty,
+        )
+        counterfactual = counterfactual + weight * (
+            confidence_score - counterfactual
+        )
+    return counterfactual
+
+
+def _hierarchical_dino_score(
+    current_dino,
+    expert_dino,
+    expert_patch_reliabilities,
+    expert_global_reliabilities,
+    expert_ids,
+    expert_image_ids,
+    history_score,
+    *,
+    topmin_min,
+    topmin_max,
+    reliability_penalty,
+):
+    expert_count = int(expert_dino.shape[0])
+    if not (
+        expert_count
+        == len(expert_global_reliabilities)
+        == len(expert_ids)
+        == len(expert_image_ids)
+    ):
+        raise ValueError("hierarchical expert inputs must align")
+    if expert_count < 1:
+        raise ValueError("hierarchical scoring requires an active expert")
+    global_reliabilities = torch.as_tensor(
+        expert_global_reliabilities,
+        device=current_dino.device,
+        dtype=current_dino.dtype,
+    )
+    if not torch.isfinite(global_reliabilities).all():
+        raise ValueError("global expert reliabilities contain non-finite values")
+    if (
+        (global_reliabilities < 0.0)
+        | (global_reliabilities > 1.0)
+    ).any():
+        raise ValueError("global expert reliabilities must be within [0, 1]")
+    if expert_patch_reliabilities is None:
+        expert_patch_reliabilities = torch.ones(
+            expert_dino.shape[:2],
+            device=current_dino.device,
+            dtype=current_dino.dtype,
+        )
+
+    if torch.equal(
+        global_reliabilities,
+        torch.ones_like(global_reliabilities),
+    ):
+        score, score_audit = MSM2_online(
+            current_dino,
+            None,
+            expert_dino,
+            None,
+            fusion_mode="dino_only",
+            topmin_min=topmin_min,
+            topmin_max=topmin_max,
+            dino_patch_reliabilities=expert_patch_reliabilities,
+            dino_reference_member_ids=expert_image_ids,
+            reliability_penalty=reliability_penalty,
+            return_selection_details=True,
+        )
+        reliability = score_audit["reference_reliability"]
+        raw_counts = reliability["selected_reference_raw_counts"]
+        local_weights = reliability[
+            "selected_reference_effective_weights"
+        ]
+        contributions = []
+        for expert_id, image_id, raw, local in zip(
+            expert_ids,
+            expert_image_ids,
+            raw_counts,
+            local_weights,
+        ):
+            contributions.append(
+                {
+                    "expert_id": int(expert_id),
+                    "member_image_id": int(image_id),
+                    "selected_patch_count": int(raw),
+                    "member_is_contaminated": None,
+                    "raw_weight": float(raw),
+                    "effective_weight": float(local),
+                    "member_raw_weight": float(raw),
+                    "member_effective_weight": float(local),
+                    "blend_weight": 1.0,
+                    "blend_contribution": float(local),
+                    "raw_contribution": float(raw),
+                    "local_effective_contribution": float(local),
+                    "global_blend_contribution": float(local),
+                }
+            )
+        score_audit["hierarchical_diagnostics"] = {
+            "history_mean": float(history_score.mean()),
+            "history_max": float(history_score.max()),
+            "all_global_reliabilities_one": True,
+        }
+        return score, score_audit, contributions
+
+    expert_scores = []
+    local_expert_scores = []
+    unweighted_expert_scores = []
+    expert_selected_reliabilities = []
+    for index in range(expert_count):
+        unweighted_expert_score, _ = MSM2_online(
+            current_dino,
+            None,
+            expert_dino[index : index + 1],
+            None,
+            fusion_mode="dino_only",
+            topmin_min=topmin_min,
+            topmin_max=topmin_max,
+            dino_patch_reliabilities=torch.ones_like(
+                expert_patch_reliabilities[index : index + 1]
+            ),
+            dino_reference_member_ids=[expert_image_ids[index]],
+            reliability_penalty=reliability_penalty,
+            return_selection_details=True,
+        )
+        expert_score, expert_audit = MSM2_online(
+            current_dino,
+            None,
+            expert_dino[index : index + 1],
+            None,
+            fusion_mode="dino_only",
+            topmin_min=topmin_min,
+            topmin_max=topmin_max,
+            dino_patch_reliabilities=(
+                expert_patch_reliabilities[index : index + 1]
+            ),
+            dino_reference_member_ids=[expert_image_ids[index]],
+            reliability_penalty=reliability_penalty,
+            return_selection_details=True,
+        )
+        expert_scores.append(
+            history_score
+            + global_reliabilities[index]
+            * (expert_score - history_score)
+        )
+        local_expert_scores.append(expert_score)
+        unweighted_expert_scores.append(unweighted_expert_score)
+        reliability = expert_audit["reference_reliability"]
+        per_query = reliability[
+            "contributing_reliabilities_per_query"
+        ]
+        expert_selected_reliabilities.append(
+            torch.as_tensor(
+                [values[0] for values in per_query],
+                device=current_dino.device,
+                dtype=current_dino.dtype,
+            )
+        )
+
+    distances = torch.stack(expert_scores, dim=1)
+    local_distances = torch.stack(local_expert_scores, dim=1)
+    unweighted_distances = torch.stack(
+        unweighted_expert_scores,
+        dim=1,
+    )
+    k_min, k_max, _ = safe_topmin_counts(
+        expert_count,
+        topmin_min,
+        topmin_max,
+    )
+    selected_experts = torch.topk(
+        distances.float(),
+        k_max,
+        largest=False,
+        sorted=True,
+    ).indices[:, k_min:k_max]
+    local_selected_experts = torch.topk(
+        local_distances.float(),
+        k_max,
+        largest=False,
+        sorted=True,
+    ).indices[:, k_min:k_max]
+    raw_selected_experts = torch.topk(
+        unweighted_distances.float(),
+        k_max,
+        largest=False,
+        sorted=True,
+    ).indices[:, k_min:k_max]
+    score = distances.gather(1, selected_experts).mean(dim=1)
+    local_by_expert = torch.stack(
+        expert_selected_reliabilities,
+        dim=1,
+    )
+    selected_local = local_by_expert.gather(1, selected_experts)
+    local_stage_reliabilities = local_by_expert.gather(
+        1,
+        local_selected_experts,
+    )
+    contributions = []
+    for index, (expert_id, image_id) in enumerate(
+        zip(expert_ids, expert_image_ids)
+    ):
+        global_selected_mask = selected_experts == index
+        local_selected_mask = local_selected_experts == index
+        raw_selected_mask = raw_selected_experts == index
+        raw = int(raw_selected_mask.sum())
+        local = float(
+            local_stage_reliabilities[local_selected_mask].sum()
+        )
+        global_contribution = float(global_reliabilities[index]) * float(
+            selected_local[global_selected_mask].sum()
+        )
+        contributions.append(
+            {
+                "expert_id": int(expert_id),
+                "member_image_id": int(image_id),
+                "selected_patch_count": raw,
+                "member_is_contaminated": None,
+                "raw_weight": float(raw),
+                "effective_weight": local,
+                "member_raw_weight": float(raw),
+                "member_effective_weight": local,
+                "blend_weight": float(global_reliabilities[index]),
+                "blend_contribution": global_contribution,
+                "raw_contribution": float(raw),
+                "local_effective_contribution": local,
+                "global_blend_contribution": global_contribution,
+            }
+        )
+    score_audit = {
+        "fusion_mode": "dino_only",
+        "reference_count": expert_count,
+        "dino_distance": score,
+        "clip_distance": None,
+        "fuser_score": None,
+        "reference_reliability": None,
+        "hierarchical_diagnostics": {
+            "history_mean": float(history_score.mean()),
+            "history_max": float(history_score.max()),
+            "all_global_reliabilities_one": False,
+            "experts": [
+                {
+                    "expert_id": int(expert_id),
+                    "image_id": int(image_id),
+                    "global_reliability": float(global_reliabilities[index]),
+                    "raw_distance_mean": float(
+                        unweighted_expert_scores[index].mean()
+                    ),
+                    "raw_distance_max": float(
+                        unweighted_expert_scores[index].max()
+                    ),
+                    "local_distance_mean": float(
+                        local_expert_scores[index].mean()
+                    ),
+                    "local_distance_max": float(
+                        local_expert_scores[index].max()
+                    ),
+                    "blended_distance_mean": float(
+                        expert_scores[index].mean()
+                    ),
+                    "blended_distance_max": float(
+                        expert_scores[index].max()
+                    ),
+                    "raw_selected_patch_count": int(
+                        (raw_selected_experts == index).sum()
+                    ),
+                    "local_selected_patch_count": int(
+                        (local_selected_experts == index).sum()
+                    ),
+                    "global_selected_patch_count": int(
+                        (selected_experts == index).sum()
+                    ),
+                }
+                for index, (expert_id, image_id) in enumerate(
+                    zip(expert_ids, expert_image_ids)
+                )
+            ],
+        },
+    }
+    return score, score_audit, contributions
 
 
 def score_dynamic_msm2_layer(
@@ -973,6 +1844,8 @@ def score_dynamic_msm2_layer(
     transition_fallback_evidence_window=0,
     transition_fallback_min_hits=0,
     transition_fallback_latch=False,
+    image_score_size=None,
+    hierarchical_reliability_enabled=False,
 ):
 
     if transition_fallback_evidence_window < 0:
@@ -1015,6 +1888,34 @@ def score_dynamic_msm2_layer(
         if clip_features is None or clip_features.shape[0] != dino_features.shape[0]:
             raise ValueError("DINO and CLIP image counts must match")
 
+    if any(
+        record.get("controlled_contamination_replay") is not None
+        for record in timeline
+    ):
+        dino_features = dino_features.clone()
+        for step, record in enumerate(timeline):
+            replay = record.get("controlled_contamination_replay")
+            if replay is None:
+                continue
+            source_image_id = int(replay["source_image_id"])
+            clean_image_id = int(replay["clean_image_id"])
+            if source_image_id >= step or clean_image_id >= step:
+                raise ValueError(
+                    "controlled replay references must be historical"
+                )
+            patch_ids = torch.as_tensor(
+                replay["patch_ids"],
+                device=dino_features.device,
+                dtype=torch.long,
+            )
+            replay_feature = dino_features[clean_image_id].clone()
+            replay_feature.index_copy_(
+                0,
+                patch_ids,
+                dino_features[source_image_id].index_select(0, patch_ids),
+            )
+            dino_features[step] = replay_feature
+
     scores = []
     audits = []
     cached_signature = None
@@ -1043,8 +1944,46 @@ def score_dynamic_msm2_layer(
         current_dino = dino_features[step]
         active = record["active_experts_before"]
         expert_image_ids = [expert["image_id"] for expert in active]
+        active_dino_reference_features = []
+        for expert in active:
+            reference_feature = dino_features[int(expert["image_id"])]
+            if expert.get("controlled_contamination_mode") in {
+                "patch",
+                "mixed",
+            }:
+                clean_feature = dino_features[
+                    int(expert["controlled_clean_image_id"])
+                ]
+                patch_ids = torch.as_tensor(
+                    expert.get("controlled_contaminated_patch_ids", []),
+                    device=reference_feature.device,
+                    dtype=torch.long,
+                )
+                hybrid_feature = clean_feature.clone()
+                if patch_ids.numel() > 0:
+                    hybrid_feature.index_copy_(
+                        0,
+                        patch_ids,
+                        reference_feature.index_select(0, patch_ids),
+                    )
+                reference_feature = hybrid_feature
+            active_dino_reference_features.append(reference_feature)
+        active_dino_reference_tensor = (
+            torch.stack(active_dino_reference_features)
+            if active_dino_reference_features
+            else None
+        )
         active_expert_scoring_weights = [
             float(expert.get("scoring_weight", 1.0))
+            for expert in active
+        ]
+        active_expert_global_reliabilities = [
+            float(
+                expert.get(
+                    "global_member_reliability",
+                    expert.get("member_reliability", 1.0),
+                )
+            )
             for expert in active
         ]
         active_expert_patch_reliabilities = [
@@ -1098,6 +2037,8 @@ def score_dynamic_msm2_layer(
         fallback_reason = None
         effective_mode = fusion_mode
         score_audit = None
+        hierarchical_history_score = None
+        hierarchical_history_anchor_expert_ids = []
         reference_contributions = []
         fuser_retrained = False
         training_recomputed = False
@@ -1129,6 +2070,84 @@ def score_dynamic_msm2_layer(
                     dino_features[history_start:step],
                 )
                 effective_mode = "dino_fallback"
+        elif fusion_mode == "dino_only" and hierarchical_reliability_enabled:
+            hierarchical_history_score, _ = _strict_history_dino_fallback(
+                current_dino,
+                dino_features[history_start:step],
+            )
+            if len(active) > 1:
+                maximum_global_reliability = max(
+                    active_expert_global_reliabilities
+                )
+                anchor_indices = [
+                    index
+                    for index, reliability in enumerate(
+                        active_expert_global_reliabilities
+                    )
+                    if math.isclose(
+                        reliability,
+                        maximum_global_reliability,
+                        rel_tol=1e-9,
+                        abs_tol=1e-12,
+                    )
+                ]
+                anchor_index_tensor = torch.as_tensor(
+                    anchor_indices,
+                    device=active_dino_reference_tensor.device,
+                    dtype=torch.long,
+                )
+                hierarchical_history_anchor_expert_ids = [
+                    int(active[index]["expert_id"])
+                    for index in anchor_indices
+                ]
+                hierarchical_history_score, _ = MSM2_online(
+                    current_dino,
+                    None,
+                    active_dino_reference_tensor.index_select(
+                        0,
+                        anchor_index_tensor,
+                    ),
+                    None,
+                    fusion_mode="dino_only",
+                    topmin_min=topmin_min,
+                    topmin_max=topmin_max,
+                    dino_patch_reliabilities=(
+                        active_patch_reliability_tensor.index_select(
+                            0,
+                            anchor_index_tensor,
+                        )
+                        if active_patch_reliability_tensor is not None
+                        else None
+                    ),
+                    dino_reference_member_ids=[
+                        int(expert_image_ids[index])
+                        for index in anchor_indices
+                    ],
+                    reliability_penalty=reference_reliability_penalty,
+                )
+            patch_score, score_audit, reference_contributions = (
+                _hierarchical_dino_score(
+                    current_dino=current_dino,
+                    expert_dino=active_dino_reference_tensor,
+                    expert_patch_reliabilities=(
+                        active_patch_reliability_tensor
+                    ),
+                    expert_global_reliabilities=(
+                        active_expert_global_reliabilities
+                    ),
+                    expert_ids=[
+                        int(expert["expert_id"]) for expert in active
+                    ],
+                    expert_image_ids=[
+                        int(image_id) for image_id in expert_image_ids
+                    ],
+                    history_score=hierarchical_history_score,
+                    topmin_min=topmin_min,
+                    topmin_max=topmin_max,
+                    reliability_penalty=reference_reliability_penalty,
+                )
+            )
+            effective_mode = "dino_hierarchical_reliability"
         elif fusion_mode == "dino_only":
             full_expert_indices = [
                 index
@@ -1143,73 +2162,22 @@ def score_dynamic_msm2_layer(
                 for index, weight in enumerate(active_expert_scoring_weights)
                 if weight < 1.0
             ]
-            confidence_reference_audits = []
-            if full_expert_image_ids:
-                full_patch_reliabilities = (
-                    active_patch_reliability_tensor.index_select(
-                        0,
-                        torch.as_tensor(
-                            full_expert_indices,
-                            device=active_patch_reliability_tensor.device,
-                        ),
-                    )
-                    if active_patch_reliability_tensor is not None
-                    else None
-                )
-                patch_score, score_audit = MSM2_online(
-                    current_dino,
-                    None,
-                    dino_features[full_expert_image_ids],
-                    None,
-                    fusion_mode="dino_only",
-                    topmin_min=topmin_min,
-                    topmin_max=topmin_max,
-                    dino_patch_reliabilities=full_patch_reliabilities,
-                    reliability_penalty=reference_reliability_penalty,
-                )
-            else:
-                patch_score, fallback_reason = (
-                    _strict_history_dino_fallback(
-                        current_dino,
-                        dino_features[history_start:step],
-                    )
-                )
-            for (
-                confidence_index,
-                confidence_image_id,
-                confidence_weight,
-            ) in confidence_experts:
-                confidence_patch_reliabilities = (
-                    active_patch_reliability_tensor[
-                        confidence_index : confidence_index + 1
-                    ]
-                    if active_patch_reliability_tensor is not None
-                    else None
-                )
-                confidence_score, confidence_score_audit = MSM2_online(
-                    current_dino,
-                    None,
-                    dino_features[[confidence_image_id]],
-                    None,
-                    fusion_mode="dino_only",
-                    topmin_min=topmin_min,
-                    topmin_max=topmin_max,
-                    dino_patch_reliabilities=(
-                        confidence_patch_reliabilities
-                    ),
-                    reliability_penalty=reference_reliability_penalty,
-                )
-                patch_score = (
-                    patch_score
-                    + confidence_weight * (confidence_score - patch_score)
-                )
-                confidence_reference_audits.append(
-                    (
-                        confidence_index,
-                        confidence_weight,
-                        confidence_score_audit,
-                    )
-                )
+            (
+                patch_score,
+                score_audit,
+                confidence_reference_audits,
+                fallback_reason,
+            ) = score_dino_reference_committee(
+                current_dino,
+                active_dino_reference_tensor,
+                active_expert_scoring_weights,
+                fallback_references=dino_features[history_start:step],
+                patch_reliabilities=active_patch_reliability_tensor,
+                reference_member_ids=expert_image_ids,
+                topmin_min=topmin_min,
+                topmin_max=topmin_max,
+                reliability_penalty=reference_reliability_penalty,
+            )
             remaining_blend_weight = 1.0
             confidence_contributions = []
             for (
@@ -1395,6 +2363,7 @@ def score_dynamic_msm2_layer(
                     dino_patch_reliabilities=(
                         active_patch_reliability_tensor
                     ),
+                    dino_reference_member_ids=expert_image_ids,
                     reliability_penalty=reference_reliability_penalty,
                 )
             elif (
@@ -1418,6 +2387,7 @@ def score_dynamic_msm2_layer(
                     dino_patch_reliabilities=(
                         active_patch_reliability_tensor
                     ),
+                    dino_reference_member_ids=expert_image_ids,
                     reliability_penalty=reference_reliability_penalty,
                 )
                 effective_mode = "fixed" if fusion_mode == "fixed" else "fixed_fallback"
@@ -1435,6 +2405,7 @@ def score_dynamic_msm2_layer(
                         dino_patch_reliabilities=(
                             active_patch_reliability_tensor
                         ),
+                        dino_reference_member_ids=expert_image_ids,
                         reliability_penalty=reference_reliability_penalty,
                     )
                     fallback_reason = gate_reason
@@ -1641,6 +2612,206 @@ def score_dynamic_msm2_layer(
                 effective_mode = "dino_fallback"
             fallback_reason = f"non_finite_score:{fallback_reason}"
 
+        controlled_contaminated_image_ids = {
+            int(event["source_image_id"])
+            for previous_record in timeline[:step]
+            for event in [
+                previous_record.get("controlled_contamination") or {}
+            ]
+            if event.get("injected")
+            and event.get("source_image_id") is not None
+        }
+        def image_score(score):
+            if image_score_size is None:
+                return float(score.max().detach().cpu())
+            patch_count = int(score.numel())
+            side = math.isqrt(patch_count)
+            if side * side != patch_count:
+                raise ValueError(
+                    "image_score_size requires a square patch map"
+                )
+            resized = torch.nn.functional.interpolate(
+                score.reshape(1, 1, side, side),
+                size=image_score_size,
+                mode="bilinear",
+                align_corners=True,
+            )
+            return float(resized.max().detach().cpu())
+
+        score_all = image_score(patch_score)
+        reentry_expert_image_ids = {
+            int(expert["image_id"])
+            for expert in active
+            if "history_reentry" in str(expert.get("admission_route", ""))
+        }
+        reentry_counterfactual_score = None
+        reentry_score_regret = None
+        if (
+            fusion_mode == "dino_only"
+            and provisional is None
+            and reentry_expert_image_ids
+        ):
+            reentry_counterfactual_patch_score = None
+            if hierarchical_reliability_enabled:
+                reentry_clean_indices = [
+                    index
+                    for index, image_id in enumerate(expert_image_ids)
+                    if int(image_id) not in reentry_expert_image_ids
+                ]
+                if (
+                    reentry_clean_indices
+                    and hierarchical_history_score is not None
+                ):
+                    reentry_clean_index_tensor = torch.as_tensor(
+                        reentry_clean_indices,
+                        device=active_dino_reference_tensor.device,
+                        dtype=torch.long,
+                    )
+                    reentry_counterfactual_patch_score, _, _ = (
+                        _hierarchical_dino_score(
+                            current_dino=current_dino,
+                            expert_dino=(
+                                active_dino_reference_tensor.index_select(
+                                    0, reentry_clean_index_tensor
+                                )
+                            ),
+                            expert_patch_reliabilities=(
+                                active_patch_reliability_tensor.index_select(
+                                    0, reentry_clean_index_tensor
+                                )
+                                if active_patch_reliability_tensor is not None
+                                else None
+                            ),
+                            expert_global_reliabilities=[
+                                active_expert_global_reliabilities[index]
+                                for index in reentry_clean_indices
+                            ],
+                            expert_ids=[
+                                int(active[index]["expert_id"])
+                                for index in reentry_clean_indices
+                            ],
+                            expert_image_ids=[
+                                int(expert_image_ids[index])
+                                for index in reentry_clean_indices
+                            ],
+                            history_score=hierarchical_history_score,
+                            topmin_min=topmin_min,
+                            topmin_max=topmin_max,
+                            reliability_penalty=(
+                                reference_reliability_penalty
+                            ),
+                        )
+                    )
+            else:
+                reentry_counterfactual_patch_score = (
+                    _counterfactual_dino_score_without_references(
+                    current_dino=current_dino,
+                    dino_features=dino_features,
+                    active=active,
+                    excluded_image_ids=reentry_expert_image_ids,
+                    history_start=history_start,
+                    step=step,
+                    topmin_min=topmin_min,
+                    topmin_max=topmin_max,
+                    reliability_penalty=reference_reliability_penalty,
+                    )
+                )
+            if reentry_counterfactual_patch_score is not None:
+                reentry_counterfactual_score = image_score(
+                    reentry_counterfactual_patch_score
+                )
+                reentry_score_regret = (
+                    score_all - reentry_counterfactual_score
+                )
+        score_without_contaminated_reference = None
+        pollution_score_shift = None
+        if (
+            fusion_mode == "dino_only"
+            and provisional is None
+            and controlled_contaminated_image_ids
+            and any(
+                int(image_id) in controlled_contaminated_image_ids
+                for image_id in expert_image_ids
+            )
+        ):
+            if hierarchical_reliability_enabled:
+                clean_indices = [
+                    index
+                    for index, image_id in enumerate(expert_image_ids)
+                    if int(image_id)
+                    not in controlled_contaminated_image_ids
+                ]
+                counterfactual_patch_score = None
+                if (
+                    clean_indices
+                    and hierarchical_history_score is not None
+                ):
+                    clean_index_tensor = torch.as_tensor(
+                        clean_indices,
+                        device=active_dino_reference_tensor.device,
+                        dtype=torch.long,
+                    )
+                    counterfactual_patch_score, _, _ = (
+                        _hierarchical_dino_score(
+                            current_dino=current_dino,
+                            expert_dino=(
+                                active_dino_reference_tensor.index_select(
+                                    0,
+                                    clean_index_tensor,
+                                )
+                            ),
+                            expert_patch_reliabilities=(
+                                active_patch_reliability_tensor.index_select(
+                                    0,
+                                    clean_index_tensor,
+                                )
+                                if active_patch_reliability_tensor is not None
+                                else None
+                            ),
+                            expert_global_reliabilities=[
+                                active_expert_global_reliabilities[index]
+                                for index in clean_indices
+                            ],
+                            expert_ids=[
+                                int(active[index]["expert_id"])
+                                for index in clean_indices
+                            ],
+                            expert_image_ids=[
+                                int(expert_image_ids[index])
+                                for index in clean_indices
+                            ],
+                            history_score=hierarchical_history_score,
+                            topmin_min=topmin_min,
+                            topmin_max=topmin_max,
+                            reliability_penalty=(
+                                reference_reliability_penalty
+                            ),
+                        )
+                    )
+            else:
+                counterfactual_patch_score = (
+                    _counterfactual_dino_score_without_references(
+                        current_dino=current_dino,
+                        dino_features=dino_features,
+                        active=active,
+                        excluded_image_ids=(
+                            controlled_contaminated_image_ids
+                        ),
+                        history_start=history_start,
+                        step=step,
+                        topmin_min=topmin_min,
+                        topmin_max=topmin_max,
+                        reliability_penalty=reference_reliability_penalty,
+                    )
+                )
+            if counterfactual_patch_score is not None:
+                score_without_contaminated_reference = image_score(
+                    counterfactual_patch_score
+                )
+                pollution_score_shift = (
+                    score_all - score_without_contaminated_reference
+                )
+
         audit = {
             "step": step,
             "segment_start": history_start,
@@ -1654,6 +2825,17 @@ def score_dynamic_msm2_layer(
                 float(expert.get("member_reliability", 1.0))
                 for expert in active
             ],
+            "active_expert_global_reliabilities": (
+                active_expert_global_reliabilities
+            ),
+            "hierarchical_diagnostics": (
+                score_audit.get("hierarchical_diagnostics")
+                if score_audit is not None
+                else None
+            ),
+            "hierarchical_history_anchor_expert_ids": (
+                hierarchical_history_anchor_expert_ids
+            ),
             "active_expert_patch_reliability_means": [
                 (
                     float(np.mean(values))
@@ -1667,6 +2849,21 @@ def score_dynamic_msm2_layer(
                 for item in reference_contributions
             ],
             "selected_reference_contributions": reference_contributions,
+            "controlled_contaminated_image_ids": sorted(
+                controlled_contaminated_image_ids
+            ),
+            "score_all": score_all,
+            "reentry_expert_image_ids": sorted(reentry_expert_image_ids),
+            "reentry_counterfactual_score": reentry_counterfactual_score,
+            "reentry_score_regret": reentry_score_regret,
+            "score_without_contaminated_reference": (
+                score_without_contaminated_reference
+            ),
+            "pollution_score_shift": pollution_score_shift,
+            "image_score_size": image_score_size,
+            "controlled_contamination": record.get(
+                "controlled_contamination"
+            ),
             "active_committee_confidence": active_committee_confidence,
             "provisional_expert_image_id": (
                 int(provisional["image_id"])

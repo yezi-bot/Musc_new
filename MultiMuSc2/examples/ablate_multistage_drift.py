@@ -49,6 +49,23 @@ PRESSURE_VARIANTS = (
     "priority5_task_aware_virtual_swap",
     "priority5_task_aware_soft_reliability",
     "priority5_task_aware_cross_patch_reliability",
+    "priority6_cross_patch_no_reentry",
+    "priority6_cross_patch_history_reentry_hard_two",
+    "priority6_cross_patch_history_reentry",
+    "priority6_cross_patch_history_reentry_delta_j_shadow",
+    "priority6_cross_patch_history_reentry_delta_j_control",
+    "priority6_factorial_neither",
+    "priority6_factorial_denstream_only",
+    "priority6_factorial_fitness_only",
+    "priority6_factorial_denstream_fitness",
+    "priority6_delta_j_factorial_neither",
+    "priority6_delta_j_factorial_denstream_only",
+    "priority6_delta_j_factorial_fitness_only",
+    "priority6_delta_j_factorial_denstream_fitness",
+    "priority6_dino_delta_j_factorial_neither",
+    "priority6_dino_delta_j_factorial_denstream_only",
+    "priority6_dino_delta_j_factorial_fitness_only",
+    "priority6_dino_delta_j_factorial_denstream_fitness",
 )
 
 
@@ -623,6 +640,21 @@ def parse_args():
         type=int,
         default=0,
         help="Extra observations appended only to the final plateau.",
+    )
+    parser.add_argument(
+        "--controlled-history-eviction-step",
+        type=int,
+        default=None,
+        help=(
+            "Evaluation-only intervention applied after this step. It "
+            "retires the configured expert before the next sample is scored."
+        ),
+    )
+    parser.add_argument(
+        "--controlled-history-eviction-expert-id",
+        type=int,
+        default=0,
+        help="Expert id retired by the controlled history eviction fixture.",
     )
     parser.add_argument("--lab-ewma-alpha", type=float, default=0.3)
     parser.add_argument("--lab-ewma-threshold-k", type=float, default=3.0)
